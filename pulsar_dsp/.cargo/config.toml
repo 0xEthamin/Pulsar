@@ -1,0 +1,8 @@
+# Build settings for the processing board.
+
+[build]
+target = "thumbv7em-none-eabihf"
+
+[target.thumbv7em-none-eabihf]
+runner = "probe-rs run --chip STM32H743VITx"
+rustflags = ["-C", "link-arg=-Tlink.x"]

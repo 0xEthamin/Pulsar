@@ -1,0 +1,41 @@
+# cargo-deny policy for the Pulsar firmware.
+[graph]
+targets = ["thumbv7em-none-eabihf", "xtensa-esp32-espidf"]
+
+[advisories]
+yanked = "deny"
+ignore = [
+    # Deprecated, not vulnerable. It arrives only through cortex-m 0.7.9, which
+    # the stm32h7 PAC pulls on its own, so dropping the four functions this
+    # firmware calls from cortex-m would not remove it. Closing this would mean
+    # dropping the PAC as well and writing every register access and the vector
+    # table by hand.
+    { id = "RUSTSEC-2026-0110", reason = "bare-metal 0.2.5 reaches us through the PAC, not through our own use of cortex-m" },
+]
+
+[licenses]
+unused-allowed-license = "allow"
+allow = [
+    # The firmware itself.
+    "GPL-3.0-or-later",
+    # The embedded ecosystem.
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+]
+
+[bans]
+# Duplicate versions are not reported. The ESP-IDF graph carries a hundred and
+# eighty crates and the ecosystem forces ten duplicates on it, none of which any
+# version choice here can remove. Reporting them buries the diagnostics that can
+# be acted on. `cargo tree -d` lists them whenever the question comes up.
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

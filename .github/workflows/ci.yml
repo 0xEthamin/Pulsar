@@ -1,0 +1,332 @@
+# CI pipeline for the Pulsar firmware.
+#
+# Reports for SonarQube (see sonar-project.properties):
+#   clippy-report.json   clippy lints of the three crates, raw cargo JSON
+#   lcov.info            line coverage of pulsar_lib from cargo-llvm-cov
+#   cargo-deny.sarif     advisories, licenses, bans and sources, native SARIF
+
+name: 'CI Pipeline Pulsar'
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  schedule:
+    - cron: '23 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lib:
+    name: Core (host)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: '-D warnings'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install the toolchain pinned by rust-toolchain.toml
+        working-directory: pulsar_lib
+        run: rustup show
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            pulsar_lib/target
+          key: ${{ runner.os }}-cargo-lib-${{ hashFiles('pulsar_lib/Cargo.lock') }}
+
+      - name: Check
+        working-directory: pulsar_lib
+        run: cargo check --locked --all-targets
+
+      - name: Test
+        working-directory: pulsar_lib
+        run: cargo test --locked
+
+      - name: Generate the clippy report
+        working-directory: pulsar_lib
+        run: cargo clippy --locked --all-targets --message-format=json > ../clippy-report-lib.json || true
+
+      - name: Clippy (strict)
+        working-directory: pulsar_lib
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Upload the clippy report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clippy-report-lib
+          path: clippy-report-lib.json
+
+  dsp:
+    name: Processing board (thumbv7em)
+    runs-on: ubuntu-latest
+    needs: lib
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install the toolchain pinned by rust-toolchain.toml
+        working-directory: pulsar_dsp
+        run: rustup show
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            pulsar_dsp/target
+          key: ${{ runner.os }}-cargo-dsp-${{ hashFiles('pulsar_dsp/Cargo.lock') }}
+
+      - name: Build (release)
+        working-directory: pulsar_dsp
+        run: cargo build --locked --release
+
+      - name: Generate the clippy report
+        working-directory: pulsar_dsp
+        run: cargo clippy --locked --all-targets --message-format=json > ../clippy-report-dsp.json || true
+
+      - name: Clippy (strict)
+        working-directory: pulsar_dsp
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      # Reads the image just built and asserts that every fault vector leads to
+      # the store that drives XSMT low, that the store comes before any other
+      # peripheral access, and that the interrupt mask follows it immediately.
+      - name: Assert the mute path (mute gate)
+        run: scripts/mute-gate.sh
+
+      - name: Upload the clippy report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clippy-report-dsp
+          path: clippy-report-dsp.json
+
+  # Job 3: the control board image
+  #
+  # This is the long job. esp-idf-sys builds the whole ESP-IDF on a cache miss,
+  # which takes about twenty minutes and leaves several gigabytes in
+  # pulsar_ctrl/.embuild. The cache key moves only when the IDF version in
+  # .cargo/config.toml or the lockfile moves. If that cache crowds the
+  # repository budget out, drop the step and pay the rebuild on every run.
+  ctrl:
+    name: Control board (xtensa, ESP-IDF)
+    runs-on: ubuntu-latest
+    needs: lib
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install the ESP-IDF build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git wget flex bison gperf ccache dfu-util \
+            libffi-dev libssl-dev libusb-1.0-0 \
+            python3 python3-pip python3-venv
+
+      # rust-toolchain.toml names the channel `esp`, which rustup cannot fetch
+      # on its own. Xtensa has no upstream LLVM backend, so the Espressif fork
+      # is the only toolchain that builds this crate.
+      - name: Install the Xtensa toolchain
+        uses: esp-rs/xtensa-toolchain@v1.5
+        with:
+          default: true
+          buildtargets: esp32
+          ldproxy: true
+
+      - name: Cache cargo and the ESP-IDF install
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            pulsar_ctrl/target
+            pulsar_ctrl/.embuild
+            !pulsar_ctrl/.embuild/espressif/dist
+          key: ${{ runner.os }}-cargo-ctrl-${{ hashFiles('pulsar_ctrl/Cargo.lock', 'pulsar_ctrl/.cargo/config.toml') }}
+
+      - name: Build (release)
+        working-directory: pulsar_ctrl
+        run: cargo build --locked --release
+
+      - name: Generate the clippy report
+        working-directory: pulsar_ctrl
+        run: cargo clippy --locked --release --message-format=json > ../clippy-report-ctrl.json || true
+
+      - name: Clippy (strict)
+        working-directory: pulsar_ctrl
+        run: cargo clippy --locked --release -- -D warnings
+
+      - name: Upload the clippy report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clippy-report-ctrl
+          path: clippy-report-ctrl.json
+
+  # Job 4: coverage of the core
+  #
+  # pulsar_lib holds every line the two boards share and it runs on the host, so
+  # it is the only crate a coverage number means anything for.
+  coverage:
+    name: Coverage (core)
+    runs-on: ubuntu-latest
+    needs: lib
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install the toolchain pinned by rust-toolchain.toml
+        working-directory: pulsar_lib
+        run: rustup show
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            pulsar_lib/target
+          key: ${{ runner.os }}-cargo-cov-${{ hashFiles('pulsar_lib/Cargo.lock') }}
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Run coverage
+        working-directory: pulsar_lib
+        run: cargo llvm-cov --locked --lcov --output-path ../lcov.info
+
+      - name: Enforce the coverage floor
+        working-directory: pulsar_lib
+        run: cargo llvm-cov report --fail-under-lines 95
+
+      - name: Upload the coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: lcov.info
+
+  # Job 5: dependency policy
+  #
+  # deny.toml sits at the repository root and covers both targets, so the three
+  # crates are checked against the one policy.
+  dependencies:
+    name: Dependency Policy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      # udeps resolves the dependency graph for the target it is asked about, so
+      # nightly needs the processing board target as well.
+      - name: Install Rust (nightly, for udeps)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: thumbv7em-none-eabihf
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-deps-${{ hashFiles('*/Cargo.lock') }}
+
+      - name: Install the dependency tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-udeps,cargo-outdated
+
+      - name: Cargo Deny (SARIF export for SonarQube)
+        run: |
+          for c in pulsar_lib pulsar_dsp pulsar_ctrl
+          do
+            cargo +stable deny --manifest-path "$c/Cargo.toml" --config deny.toml \
+              --format sarif check > "cargo-deny-$c.sarif" || true
+          done
+
+      - name: Cargo Deny (blocking gate)
+        run: |
+          set -euo pipefail
+          for c in pulsar_lib pulsar_dsp pulsar_ctrl
+          do
+            echo ">> deny $c"
+            cargo +stable deny --manifest-path "$c/Cargo.toml" --config deny.toml check \
+              -A advisory-not-detected
+          done
+
+      - name: Cargo Udeps (nightly)
+        run: |
+          set -euo pipefail
+          for c in pulsar_lib pulsar_dsp
+          do
+            echo ">> udeps $c"
+            (cd "$c" && cargo +nightly udeps --all-targets --locked)
+          done
+
+      - name: Cargo Outdated (informational)
+        continue-on-error: true
+        run: |
+          for c in pulsar_lib pulsar_dsp pulsar_ctrl
+          do
+            echo ">> outdated $c"
+            (cd "$c" && cargo +stable outdated --root-deps-only) || true
+          done
+
+      - name: Upload the deny report (SARIF)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deny-report
+          path: cargo-deny-*.sarif
+
+  # Job 6: SonarQube
+  sonarqube:
+    name: SonarQube Analysis
+    runs-on: ubuntu-latest
+    needs: [lib, dsp, ctrl, coverage, dependencies]
+    if: success()
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download the reports
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Merge the clippy reports
+        run: cat clippy-report-*.json > clippy-report.json
+
+      - name: SonarQube Scan
+        uses: sonarsource/sonarqube-scan-action@master
+        with:
+          args: >
+            -Dsonar.qualitygate.wait=true
+            -Dsonar.qualitygate.timeout=300
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}

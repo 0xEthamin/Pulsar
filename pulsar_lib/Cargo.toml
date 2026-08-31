@@ -1,0 +1,28 @@
+[package]
+name = "pulsar_lib"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.94"
+authors = ["Simon <perso@simontuloup.fr>"]
+license = "GPL-3.0-or-later"
+description = "Hardware independent core shared by both Pulsar firmwares"
+publish = false
+
+[dependencies]
+
+[lints.rust]
+missing_docs = "deny"
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+panic_in_result_fn = "deny"

@@ -1,0 +1,6 @@
+[toolchain]
+channel = "1.98"
+# clippy is the warning gate, llvm-tools is what scripts/mute-gate.sh reads the
+# linked image with.
+components = ["clippy", "llvm-tools"]
+targets = ["thumbv7em-none-eabihf"]

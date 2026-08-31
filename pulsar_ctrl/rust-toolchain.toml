@@ -1,0 +1,4 @@
+[toolchain]
+# Xtensa has no upstream LLVM backend, so this board builds with the Espressif
+# fork rather than with the toolchain the other two crates use.
+channel = "esp"
