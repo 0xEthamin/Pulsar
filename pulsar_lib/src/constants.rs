@@ -49,17 +49,11 @@ pub const LOW_MID_HZ: f32 = 300.0;
 
 /// Corner between the mid and high ways, in hertz.
 ///
-/// Linkwitz-Riley, fourth order, on both sides. The compression driver
-/// datasheet recommends this crossover.
-pub const MID_HIGH_HZ: f32 = 1_800.0;
-
-/// Corner splitting the low way into its two limiter bands, in hertz.
-///
-/// Excursion constrains the low driver below this point and much less above it.
-/// One threshold for both bands would cost 8 to 10 dB of headroom, so the way
-/// carries a limiter per band, split by a second order Linkwitz-Riley pair and
-/// recombined.
-pub const LOW_LIMITER_SPLIT_HZ: f32 = 110.0;
+/// Linkwitz-Riley, fourth order, on both sides. The spacing between the mid
+/// driver and the horn sets the frequency above which the two ways lobe. A
+/// lower corner narrows that lobing, a higher one spares the compression
+/// driver, and this is the point taken between them.
+pub const MID_HIGH_HZ: f32 = 1_400.0;
 
 /// Samples the converter takes to attenuate its data to zero once XSMT falls.
 ///
@@ -93,8 +87,9 @@ pub const MUTE_SEQUENCE_US: f32 = MUTE_SEQUENCE_US_TIMES_RATE as f32 / SAMPLE_RA
 
 /// Duration of a gain ramp, in milliseconds.
 ///
-/// Every gain change is ramped, because a step pops. `docs/DSP-CONSTRAINTS.md`
-/// point 6 places the ramp between 10 and 50 ms.
+/// Every gain change is ramped, because a step pops. The ramp is long enough
+/// to bury the step and short enough that a volume change still answers at
+/// once, which places it between 10 and 50 ms.
 pub const GAIN_RAMP_MS: u32 = 20;
 
 /// Returns the delay loop iterations covering the converter mute sequence.
@@ -134,14 +129,8 @@ const _: () = assert!
 
 const _: () = assert!
 (
-    SUBSONIC_HZ > 0.0 && SUBSONIC_HZ < LOW_LIMITER_SPLIT_HZ,
-    "the subsonic corner sits below the low way limiter split"
-);
-
-const _: () = assert!
-(
-    LOW_LIMITER_SPLIT_HZ < LOW_MID_HZ,
-    "the low way limiter split sits inside the low band"
+    SUBSONIC_HZ > 0.0 && SUBSONIC_HZ < LOW_MID_HZ,
+    "the subsonic corner sits inside the low band it protects"
 );
 
 const _: () = assert!
