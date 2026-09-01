@@ -2,8 +2,8 @@
 //!
 //! At 115200 baud the link carries roughly 1400 volume messages a second, and a
 //! chain applying each of them as a step would turn the control link into a
-//! full scale amplitude modulator aimed at the drivers. `docs/PRODUCT-SPEC.md`
-//! section 3 rule 7 answers it: no transition is abrupt.
+//! full scale amplitude modulator aimed at the drivers. No transition this
+//! type hands out is abrupt.
 //!
 //! `ControlState` bounds the RATE at which the applied setting moves, to one
 //! change per `GAIN_RAMP_MS`, and hands out the gain at both ends of a buffer
@@ -300,8 +300,8 @@ impl ControlState
     /// towards reporting the link dead, which costs a ramp down instead of a
     /// loud cabinet with no control.
     ///
-    /// Nothing here acts on the value. `docs/PRODUCT-SPEC.md` section 4.4 owns
-    /// the duration worth acting on, and the ramp and alarm behind it.
+    /// Nothing here acts on the value. The caller owns the duration worth
+    /// acting on, and the ramp down and the alarm behind it.
     #[must_use]
     pub fn heartbeat_silence_ms(&self, now_ms: u32) -> u32
     {

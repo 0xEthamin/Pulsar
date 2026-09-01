@@ -63,8 +63,8 @@ fn main() -> !
 /// the reset that returns the pin to its pull-down would never arrive. Masking
 /// also stops the faulted handler from raising XSMT again. `cpsid i` is the
 /// instruction that follows the store, and an interrupt can still land on that
-/// boundary and run to completion. `docs/PRODUCT-SPEC.md` section 3 rule 3 puts
-/// the mute line down before anything else, and that window is the price.
+/// boundary and run to completion. The mute line goes down before anything
+/// else, and that window is the price.
 ///
 /// An `isb` follows the mask. ARMv7-M B5.2.1 makes a `PRIMASK` write visible to
 /// later instructions only after a context synchronisation event, so without
