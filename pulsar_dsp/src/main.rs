@@ -7,17 +7,28 @@
 //! The converters come out of reset muted, held there by the pull-down on their
 //! XSMT pin. Nothing in this binary raises XSMT, so they stay muted.
 //!
-//! Three entry points lead back to silence: a Rust panic, a hard fault, and any
-//! exception or interrupt without a handler of its own. All three drive XSMT
-//! low and park the core, because a fault that mutes only sometimes is not a
-//! mute.
+//! A Rust panic, a hard fault, and any exception or interrupt without a handler
+//! of its own drive XSMT low and park the core, because a fault that mutes only
+//! sometimes is not a mute.
+//!
+//! A stack overflow does not. PM0253 section 2.5.3 makes a processor store
+//! fault asynchronous, so the overflowing push pends a `BusFault` rather than
+//! trapping at the instruction, and execution carries on with a corrupt stack
+//! pointer. A frame push, a peripheral read and a second frame push then stand
+//! between the `BusFault` vector and the mute store, and both pushes write
+//! through that same pointer. Section 2.5.2 exempts only the entry push, so
+//! nothing carries the second one, and whether XSMT goes low on this path is
+//! undetermined. Putting the mute in front of those pushes takes an entry that
+//! touches no stack, which this binary does not have.
 
 #![no_std]
 #![no_main]
 
 use core::panic::PanicInfo;
+use cortex_m::Peripherals;
 use cortex_m::asm;
 use cortex_m::interrupt;
+use cortex_m::peripheral::scb::Exception;
 use cortex_m_rt::{entry, exception};
 use pulsar_lib::constants::{MAX_CORE_CLOCK_HZ, mute_hold_iterations};
 use stm32h7::stm32h743v::{GPIOE, RCC};
@@ -40,9 +51,32 @@ const _: () = assert!
     "the register writers in the fault path name pin 7 directly"
 );
 
+/// Arms the `BusFault` handler, then parks the core.
+///
+/// PM0253 section 2.5.2 escalates a fault to `HardFault` when the handler for
+/// that fault is disabled, and exempts the stack push that enters an enabled
+/// `BusFault` handler from escalation. Arming `SHCSR.BUSFAULTENA` is what lets
+/// a faulted stack push reach a vector at all.
+///
+/// The read-back and the `None` arm both end in silence, because no state of
+/// this binary means "the guard is absent". Neither is reachable here, since
+/// `Peripherals::take` runs once and `SHCSR` holds the bit.
 #[entry]
 fn main() -> !
 {
+    let Some(mut peripherals) = Peripherals::take()
+    else
+    {
+        silence_and_park()
+    };
+
+    peripherals.SCB.enable(Exception::BusFault);
+
+    if !peripherals.SCB.is_enabled(Exception::BusFault)
+    {
+        silence_and_park()
+    }
+
     loop
     {
         asm::wfi();
@@ -136,18 +170,20 @@ fn panic(_info: &PanicInfo) -> !
 
 /// Silences the converters after a fault the core cannot return from.
 ///
-/// A bad pointer or an unaligned access arrives here and never reaches the
-/// panic handler, so this is the only thing between such a fault and a full
-/// level buffer replaying into the drivers.
+/// PM0253 section 2.5.2 escalates a fault whose own handler is disabled, and
+/// `main` enables `BusFault` alone, so every `MemManage` and every
+/// `UsageFault` lands here: an undefined instruction, an illegal unaligned
+/// access, a fetch from an Execute Never region. A bus error on a vector read
+/// arrives directly. None of them reach the panic handler, so this is the only
+/// thing between them and a full level buffer replaying into the drivers. A
+/// data bus error goes to the `BusFault` vector instead.
 ///
-/// A stack overflow reaches it only while the exception entry can still stack
-/// its frame. `trampoline = false` points the vector straight at this function
-/// and drops the `ExceptionFrame` argument, but the compiler still emits a
-/// frame push of its own, so the handler costs stack like any other. A stacking
-/// error taken during hard fault entry escalates to lockup, where no handler
-/// runs and the pin holds its reset high impedance state under the 10 k
-/// pull-down. An MPU region marking the bottom of the stack as no-access turns
-/// that case into a memory fault this handler catches.
+/// `trampoline = false` points the vector straight at this function and drops
+/// the `ExceptionFrame` argument, and the compiler still emits a frame push of
+/// its own, so the handler costs stack like any other. PM0253 section 2.5.5:
+/// once the core is in lockup it executes no instruction until a reset, an NMI
+/// or a debugger halt. Lockup leaves the port alone, so only a reset hands PE7
+/// back to the 10 k pull-down.
 #[expect
 (
     unsafe_code,
@@ -164,7 +200,8 @@ unsafe fn HardFault() -> !
 ///
 /// A peripheral left enabled by a half-finished initialisation raises its
 /// interrupt here, and parking without muting would leave the transfers
-/// running.
+/// running. `main` enables `BusFault` without giving it a handler of its own,
+/// so a data bus error lands here too.
 ///
 /// The interrupt number is discarded and no fault cause is latched, so
 /// `DspState::Faulted` and every `Fault` variant of the control protocol name
