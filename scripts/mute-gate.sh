@@ -7,7 +7,8 @@
 # nor the compiler checks:
 #
 #   1. every fault and interrupt vector points at a handler that mutes,
-#   2. the mute store is the first thing a handler does to a peripheral,
+#   2. the mute store is the first ldr or str family instruction of the routine
+#      that carries it,
 #   3. the interrupt mask and its barrier follow that store immediately.
 #
 # Each claim is checked here against the disassembly of the image that ships.
@@ -16,6 +17,18 @@
 # at the hard fault handler or at the default handler trips this gate, and the
 # way through it is to say what that handler does about the drivers, not to add
 # its address to the allowed set.
+#
+# Claim 2 is narrow twice over. It reads one routine and not the path to it: a
+# handler that only tail calls the shared mute is followed one level down, and
+# whatever it ran before that call goes unread, which is how the ICSR read of
+# the default handler passes unseen. And it matches a fixed list of mnemonics,
+# so push, pop, ldrsb, ldrsh, ldrex and vldr are invisible to it. The prologue
+# it accepts opens with a push, which is a store.
+#
+# What no claim here covers is the stack. This gate reads instructions and says
+# nothing about the stack pointer they run on. A handler entered on a corrupt
+# one faults on its own frame push, ahead of every instruction inspected below,
+# and a green gate says nothing about that case.
 #
 # Usage: scripts/mute-gate.sh
 
@@ -175,7 +188,7 @@ check_mute_path()
 
     if grep -qE '^(ldr|ldrb|ldrh|ldrd|ldm|str|strb|strh|strd|stm)[ .]' <<< "$prologue"
     then
-        fail "$label touches memory before the mute store"
+        fail "$label runs an ldr or str family instruction before the mute store"
         return 1
     fi
 
@@ -195,7 +208,7 @@ check_mute_path()
             ;;
     esac
 
-    echo "PASS: $label mutes first, then masks, then synchronises"
+    echo "PASS: the mute store is the first ldr or str family instruction of the mute routine of $label, and the mask and the barrier follow it"
 }
 
 status=0

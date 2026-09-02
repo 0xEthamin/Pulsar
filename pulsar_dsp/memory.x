@@ -5,8 +5,21 @@
  * instead, with 384 Kbytes of AXI SRAM and 32 of SRAM1, and does not apply
  * here.
  *
- * RAM is the DTCM, which the Cortex-M7 reaches with no wait state and no cache
- * in the way. That is what the audio path and the interrupt stack need.
+ * STACK and RAM are the two halves of the DTCM, which the Cortex-M7 reaches
+ * with no wait state and no cache in the way. That is what the audio path and
+ * the interrupt stack need.
+ *
+ * The call stack owns STACK alone and grows down from the boundary at
+ * 0x20004000, away from the statics that RAM holds, so an overflow leaves
+ * `.data` and `.bss` untouched. That much the split delivers on its own, and
+ * statics that outgrow RAM fail the link.
+ *
+ * What lies under the overflow is weaker. Table 7 of RM0433, the memory map,
+ * marks 0x1FF20000 to 0x1FFFFFFF, immediately below STACK, as Reserved, and
+ * attaches no access behaviour to it. The one bus error RM0433 states for a
+ * reserved area is footnote 1 of its table 8, which covers the peripheral
+ * region. A store below STACK is therefore EXPECTED to pend a bus fault, not
+ * known to.
  *
  * DMA buffers do NOT belong in RAM. RM0433 section 2.1.6 gives DMA1 and DMA2
  * every internal memory except ITCM and DTCM, which only the MDMA reaches
@@ -28,7 +41,8 @@ MEMORY
 {
   FLASH   (rx)  : ORIGIN = 0x08000000, LENGTH = 2048K
   ITCM    (rx)  : ORIGIN = 0x00000000, LENGTH = 64K
-  RAM     (rw)  : ORIGIN = 0x20000000, LENGTH = 128K
+  STACK   (rw)  : ORIGIN = 0x20000000, LENGTH = 16K
+  RAM     (rw)  : ORIGIN = 0x20004000, LENGTH = 112K
   AXISRAM (rw)  : ORIGIN = 0x24000000, LENGTH = 512K
   SRAM1   (rw)  : ORIGIN = 0x30000000, LENGTH = 128K
   SRAM2   (rw)  : ORIGIN = 0x30020000, LENGTH = 128K
@@ -36,6 +50,16 @@ MEMORY
   SRAM4   (rw)  : ORIGIN = 0x38000000, LENGTH = 64K
   BKPSRAM (rw)  : ORIGIN = 0x38800000, LENGTH = 4K
 }
+
+/* Word 0 of the vector table takes `_stack_start` as the initial main stack
+ * pointer, and link.x defaults it to the end of RAM with `_stack_end` after the
+ * statics. Both defaults put the stack and the statics in one region, so both
+ * are overridden here. The ASSERT of link.x requires `_stack_start` at or above
+ * `_stack_end`, which the default `_stack_end` breaks the moment `.bss` extends
+ * past the top of STACK.
+ */
+_stack_start = ORIGIN(STACK) + LENGTH(STACK);
+_stack_end = ORIGIN(STACK);
 
 /* Uninitialised placement for the memories outside the TCMs. Reset leaves their
  * contents undefined, so anything landing here is zeroed or filled by the code
