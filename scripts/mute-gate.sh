@@ -3,13 +3,18 @@
 #
 # The loudspeaker carries no analog filter and no analog mute, so the store that
 # drives XSMT low is the only thing between a fault and the drivers. The source
-# of pulsar_dsp claims three properties about that store which neither a test
-# nor the compiler checks:
+# of pulsar_dsp claims five properties which neither a test nor the compiler
+# checks:
 #
 #   1. every fault and interrupt vector points at a handler that mutes,
 #   2. the mute store is the first ldr or str family instruction of the routine
 #      that carries it,
-#   3. the interrupt mask and its barrier follow that store immediately.
+#   3. the interrupt mask and its barrier follow that store immediately,
+#   4. the post-mortem record is 32 bytes, lies inside .uninit, and falls
+#      outside the range the startup zero fill walks,
+#   5. once the routine that carries the mute has built the record address in a
+#      register, it makes eight word stores through that register, at the eight
+#      record offsets, in rising offset order.
 #
 # Each claim is checked here against the disassembly of the image that ships.
 #
@@ -24,6 +29,32 @@
 # the default handler passes unseen. And it matches a fixed list of mnemonics,
 # so push, pop, ldrsb, ldrsh, ldrex and vldr are invisible to it. The prologue
 # it accepts opens with a push, which is a store.
+#
+# Claims 4 and 5 exist because the record is written and never read, so nothing
+# else notices when it stops being written or starts being erased.
+#
+# Claim 4 resolves the two literals the startup zero fill loop actually loads,
+# rather than looking for a value that could be any of several symbols. It fails
+# on a memory.x that drags __ebss past the record, which the SECTIONS comment of
+# that file describes, on a placement that leaves .uninit, and on the
+# zero-init-ram feature of cortex-m-rt, which swaps the bounds of that loop for
+# _ram_start and _ram_end and so walks over the record.
+#
+# Claim 5 fails when the eight stores stop being eight separate word stores made
+# in rising offset order. Dropping the volatile qualifier does exactly that: the
+# compiler then merges neighbouring words into strd pairs and reorders them,
+# which costs the property the order carries, that the magic lands first and the
+# checksum last so an interrupted write fails validation rather than reading as
+# a record.
+#
+# Claim 5 reads a shape, and three things it does not read are worth naming. It
+# cannot see a volatile qualifier, so it catches the code shape a lost one
+# produces rather than the loss itself. It matches the eight offsets and the
+# order, never the value stored, so which status register reaches which record
+# word is checked by nothing here and by no host test. And it counts str and
+# str.w through one base register, so a strd, strb, stm, register offset or
+# pre-indexed store, or any store reaching the record through another register,
+# is invisible to it.
 #
 # What no claim here covers is the stack. This gate reads instructions and says
 # nothing about the stack pointer they run on. A handler entered on a corrupt
@@ -54,6 +85,13 @@ FIRST_HANDLER_WORD=2
 # fewer words than this has read the wrong section.
 MIN_HANDLER_WORDS=100
 
+# Shape of the post-mortem record, owned by pulsar_lib::postmortem. Eight words,
+# magic first, checksum last.
+RECORD_SYMBOL=FAULT_RECORD
+RECORD_SECTION=.uninit
+RECORD_WORDS=8
+RECORD_BYTES=32
+
 echo "==== building $CRATE (release) ===="
 (cd "$CRATE" && cargo build --release --locked)
 
@@ -75,12 +113,28 @@ then
 fi
 
 syms="$("$nm" --demangle "$BIN")"
+sized_syms="$("$nm" --demangle --print-size "$BIN")"
+sections="$("$objdump" -h "$BIN")"
 disasm="$("$objdump" -d --no-show-raw-insn "$BIN")"
 
 # Prints the 8 digit load address of one symbol, or nothing when it is absent.
 sym_addr()
 {
     awk -v want="$1" '$3 == want { print $1; exit }' <<< "$syms"
+}
+
+# Prints the hexadecimal size of one symbol, or nothing when it carries none.
+# The awk here stays POSIX: the runner does not always provide gawk, and
+# strtonum is a gawk extension. Every hexadecimal value is converted in bash.
+sym_size()
+{
+    awk -v want="$1" '$4 == want { print $2; exit }' <<< "$sized_syms"
+}
+
+# Prints the hexadecimal load address and size of one output section.
+section_bounds()
+{
+    awk -v want="$1" '$2 == want { print $4, $3; exit }' <<< "$sections"
 }
 
 # Prints the instructions of the function at one address, one per line, with the
@@ -101,6 +155,85 @@ body()
         }
         { inside = 0 }
     ' <<< "$disasm"
+}
+
+# Prints the instructions of the function at one address, each behind its own
+# load address, with the objdump annotation kept. A pc relative load therefore
+# still names the literal it reads, and a literal pool entry still shows its
+# value, which is what resolving the startup zero fill needs.
+annotated_body()
+{
+    awk -v want="$1" '
+        /^[0-9a-f]+ <.*>:$/ { inside = ($1 == want); next }
+        !inside { next }
+        /^[[:space:]]*[0-9a-f]+:/ {
+            at = $1
+            sub(/^[^\t]*\t/, "")
+            gsub(/[[:space:]]+/, " ")
+            sub(/^ /, "")
+            sub(/ $/, "")
+            print at " " $0
+            next
+        }
+        { inside = 0 }
+    ' <<< "$disasm"
+}
+
+# Prints the low and the high bound of the startup zero fill, read out of the
+# loop that performs it. cortex-m-rt writes that loop as a pointer register
+# walking up to a limit register, both loaded from the literal pool, and the
+# store is the only post-incrementing stm in the reset handler. Which symbols
+# the two literals came from does not matter here, and must not: the bounds move
+# with the build, and a value compared by name matches whatever else happens to
+# share it.
+zero_fill_bounds()
+{
+    local reset lines found at pointer limit lo_at hi_at lo hi
+
+    reset="$(sym_addr Reset)"
+    if [ -z "$reset" ]
+    then
+        return 1
+    fi
+    lines="$(annotated_body "$reset")"
+
+    found="$(grep -nE ' stm r[0-9]+!, \{r[0-9]+\}$' <<< "$lines" | head -1)"
+    if [ -z "$found" ]
+    then
+        return 1
+    fi
+    at="${found%%:*}"
+    pointer="$(sed -nE 's/^.* stm (r[0-9]+)!, \{r[0-9]+\}$/\1/p' \
+        <<< "${found#*:}")"
+
+    lines="$(sed -n "1,${at}p" <<< "$lines")"
+
+    # The loop exits when the limit register meets the pointer register.
+    limit="$(sed -nE "s/^.* cmp (r[0-9]+), ${pointer}\$/\1/p" <<< "$lines" \
+        | tail -1)"
+    if [ -z "$limit" ]
+    then
+        return 1
+    fi
+
+    lo_at="$(sed -nE "s/^.* ldr ${pointer}, \[pc, #0x[0-9a-f]+\] @ 0x([0-9a-f]+) .*\$/\1/p" \
+        <<< "$lines" | tail -1)"
+    hi_at="$(sed -nE "s/^.* ldr ${limit}, \[pc, #0x[0-9a-f]+\] @ 0x([0-9a-f]+) .*\$/\1/p" \
+        <<< "$lines" | tail -1)"
+    if [ -z "$lo_at" ] || [ -z "$hi_at" ]
+    then
+        return 1
+    fi
+
+    lines="$(annotated_body "$reset")"
+    lo="$(sed -nE "s/^${lo_at}: \.word 0x([0-9a-f]+)\$/\1/p" <<< "$lines")"
+    hi="$(sed -nE "s/^${hi_at}: \.word 0x([0-9a-f]+)\$/\1/p" <<< "$lines")"
+    if [ -z "$lo" ] || [ -z "$hi" ]
+    then
+        return 1
+    fi
+
+    printf '%s %s\n' "$lo" "$hi"
 }
 
 # Prints the instructions that carry the mute for the handler at one address. A
@@ -211,6 +344,160 @@ check_mute_path()
     echo "PASS: the mute store is the first ldr or str family instruction of the mute routine of $label, and the mask and the barrier follow it"
 }
 
+# Checks claim 4 against the symbol table, the section headers and the reset
+# handler.
+check_record_slot()
+{
+    local addr size fill fill_lo fill_hi bounds base length
+
+    addr="$(sym_addr "$RECORD_SYMBOL")"
+    if [ -z "$addr" ]
+    then
+        fail "the image has no $RECORD_SYMBOL symbol"
+        return 1
+    fi
+
+    size="$(sym_size "$RECORD_SYMBOL")"
+    if [ -z "$size" ] || [ "$((16#$size))" -ne "$RECORD_BYTES" ]
+    then
+        fail "$RECORD_SYMBOL spans ${size:-no} bytes, the record is" \
+            "$RECORD_BYTES"
+        return 1
+    fi
+
+    fill="$(zero_fill_bounds)"
+    if [ -z "$fill" ]
+    then
+        fail "the startup zero fill loop could not be read out of the" \
+            "reset handler"
+        return 1
+    fi
+    read -r fill_lo fill_hi <<< "$fill"
+
+    if [ "$((16#$addr))" -lt "$((16#$fill_hi))" ] \
+        && [ "$((16#$addr + RECORD_BYTES))" -gt "$((16#$fill_lo))" ]
+    then
+        fail "$RECORD_SYMBOL at 0x$addr lies in the startup zero fill," \
+            "which walks 0x$fill_lo to 0x$fill_hi"
+        return 1
+    fi
+
+    bounds="$(section_bounds "$RECORD_SECTION")"
+    if [ -z "$bounds" ]
+    then
+        fail "the image has no $RECORD_SECTION section"
+        return 1
+    fi
+    read -r base length <<< "$bounds"
+
+    if [ "$((16#$addr))" -lt "$((16#$base))" ] \
+        || [ "$((16#$addr + RECORD_BYTES))" -gt "$((16#$base + 16#$length))" ]
+    then
+        fail "$RECORD_SYMBOL at 0x$addr falls outside $RECORD_SECTION," \
+            "which runs 0x$length bytes from 0x$base"
+        return 1
+    fi
+
+    echo "PASS: $RECORD_SYMBOL is $RECORD_BYTES bytes at 0x$addr, inside" \
+        "$RECORD_SECTION and clear of the startup zero fill, which walks" \
+        "0x$fill_lo to 0x$fill_hi"
+}
+
+# Checks claim 5 on the routine that carries the mute for one handler.
+check_record_write()
+{
+    local label=$1 addr=$2
+    local lines record low high base index offset target stores
+    local line_no previous low_at high_at
+    # The compiler sources a record word from any allocatable register, and it
+    # reaches for lr and ip once the low ones are taken.
+    local source='(r[0-9]+|lr|ip)'
+
+    if ! lines="$(mute_body "$addr")" || [ -z "$lines" ]
+    then
+        fail "$label at 0x$addr has no reachable body"
+        return 1
+    fi
+
+    record="$(sym_addr "$RECORD_SYMBOL")"
+    if [ -z "$record" ]
+    then
+        fail "the image has no $RECORD_SYMBOL symbol"
+        return 1
+    fi
+
+    low="$(printf '#0x%x' "$((16#$record & 0xFFFF))")"
+    high="$(printf '#0x%x' "$((16#$record >> 16))")"
+
+    # Every RAM address in this image shares the high half, so the low half is
+    # what picks the register out. The two halves are then required in order,
+    # and the eight stores are required after them.
+    base="$(sed -nE "s/^movw (r[0-9]+), ${low}\$/\1/p" <<< "$lines" | head -1)"
+    if [ -z "$base" ]
+    then
+        fail "$label loads the low half of the record address 0x$record" \
+            "into no register"
+        return 1
+    fi
+
+    low_at="$(grep -nxF "movw $base, $low" <<< "$lines" \
+        | head -1 | cut -d: -f1)"
+    high_at="$(grep -nxF "movt $base, $high" <<< "$lines" \
+        | head -1 | cut -d: -f1)"
+    if [ -z "$high_at" ] || [ "$high_at" -le "$low_at" ]
+    then
+        fail "$label does not complete the record address 0x$record in" \
+            "$base after loading its low half"
+        return 1
+    fi
+
+    # Only what follows the completed address can be a record store. The mute
+    # sequence ahead of it stores through registers this one is free to reuse,
+    # and an unoffset store there wears the same shape as record word 0.
+    lines="$(sed -n "$((high_at + 1)),\$p" <<< "$lines")"
+
+    previous=0
+    for ((index = 0; index < RECORD_WORDS; index++))
+    do
+        offset=$((index * 4))
+        if [ "$offset" -eq 0 ]
+        then
+            target="\\[$base\\]"
+        else
+            target="$(printf '\\[%s, #0x%x\\]' "$base" "$offset")"
+        fi
+
+        line_no="$(grep -nE "^str(\.w)? ${source}, ${target}\$" <<< "$lines" \
+            | head -1 | cut -d: -f1)"
+        if [ -z "$line_no" ]
+        then
+            fail "$label stores no record word at offset $offset through $base"
+            return 1
+        fi
+
+        if [ "$line_no" -le "$previous" ]
+        then
+            fail "$label stores the record word at offset $offset ahead of" \
+                "the word before it"
+            return 1
+        fi
+        previous=$line_no
+    done
+
+    stores="$(grep -cE "^str(\.w)? ${source}, \\[${base}(, #0x[0-9a-f]+)?\\]\$" \
+        <<< "$lines" || true)"
+    if [ "$stores" -ne "$RECORD_WORDS" ]
+    then
+        fail "$label makes $stores stores through $base, the record is" \
+            "$RECORD_WORDS words"
+        return 1
+    fi
+
+    echo "PASS: the mute routine of $label builds the record address in" \
+        "$base, then makes $RECORD_WORDS word stores through it at the record" \
+        "offsets, in rising order"
+}
+
 status=0
 
 hard_fault="$(sym_addr HardFault)"
@@ -261,11 +548,15 @@ then
     echo "PASS: all $handlers fault and interrupt vectors lead to a muting handler"
 fi
 
+check_record_slot || status=1
+
 check_mute_path "the hard fault handler" "$hard_fault" || status=1
+check_record_write "the hard fault handler" "$hard_fault" || status=1
 
 if [ "$default_handler" != "$hard_fault" ]
 then
     check_mute_path "the default handler" "$default_handler" || status=1
+    check_record_write "the default handler" "$default_handler" || status=1
 fi
 
 # The panic handler is emitted only once something in the image can panic. While
@@ -277,6 +568,7 @@ panic_handler="$(awk '
 if [ -n "$panic_handler" ]
 then
     check_mute_path "the panic handler" "$panic_handler" || status=1
+    check_record_write "the panic handler" "$panic_handler" || status=1
 else
     echo "NOTE: no panic handler in the image, nothing in it can panic"
 fi
