@@ -20,17 +20,27 @@
 //! nothing carries the second one, and whether XSMT goes low on this path is
 //! undetermined. Putting the mute in front of those pushes takes an entry that
 //! touches no stack, which this binary does not have.
+//!
+//! Whichever path does reach the mute then latches the active exception number
+//! and the fault status registers into `FAULT_RECORD`, between the mute and the
+//! park. The module documentation of `pulsar_lib::postmortem` carries the
+//! offset by offset layout to read at that symbol. Nothing in this binary reads
+//! the record back, and no fault reaches the control link.
 
 #![no_std]
 #![no_main]
 
+use core::mem::MaybeUninit;
 use core::panic::PanicInfo;
+use core::ptr;
 use cortex_m::Peripherals;
 use cortex_m::asm;
 use cortex_m::interrupt;
 use cortex_m::peripheral::scb::Exception;
+use cortex_m::peripheral::{AC, SCB};
 use cortex_m_rt::{entry, exception};
 use pulsar_lib::constants::{MAX_CORE_CLOCK_HZ, mute_hold_iterations};
+use pulsar_lib::postmortem::{FaultRecord, FaultRegisters};
 use stm32h7::stm32h743v::{GPIOE, RCC};
 
 /// Port E pin wired to the XSMT input of both converter modules.
@@ -45,11 +55,43 @@ const XSMT_PIN: u8 = 7;
 /// the part can run, including the 64 MHz it boots on.
 const MUTE_HOLD_ITERATIONS: u32 = mute_hold_iterations(MAX_CORE_CLOCK_HZ);
 
+/// Bits of `ICSR` holding the exception the core is serving.
+///
+/// PM0253 section 4.3.3, `VECTACTIVE` occupies bits 8 to 0 and reads zero in
+/// thread mode.
+const VECTACTIVE_MASK: u32 = 0x1FF;
+
 const _: () = assert!
 (
     XSMT_PIN == 7,
     "the register writers in the fault path name pin 7 directly"
 );
+
+/// Post-mortem the fault path leaves at a fixed address.
+///
+/// `.uninit` is a `NOLOAD` output section in RAM that starts at `__ebss`, where
+/// the startup zero fill stops, so nothing writes the record but the fault
+/// path. RAM starts above STACK and an overflowing stack descends below STACK,
+/// so an overflow writes nowhere near the record. Cutting power loses it, and
+/// nothing reads it then.
+///
+/// Surviving a reset is an ASSUMPTION, not a datasheet guarantee. RM0433
+/// documents which domains retain their contents across the low-power modes and
+/// says nothing about a reset, so the case is settled on the board or not at
+/// all. Nothing in this binary depends on it: the reader is a probe attached to
+/// a core the fault path has already parked.
+///
+/// The name is unmangled so that one string identifies the record in
+/// `llvm-nm`, in a debugger and in the build gate, across rebuilds that would
+/// otherwise move the hash in a mangled symbol.
+#[expect
+(
+    unsafe_code,
+    reason = "the record is placed by section and named for a debugger"
+)]
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".uninit.FAULT_RECORD")]
+static mut FAULT_RECORD: MaybeUninit<FaultRecord> = MaybeUninit::uninit();
 
 /// Arms the `BusFault` handler, then parks the core.
 ///
@@ -111,14 +153,35 @@ fn main() -> !
 /// that point, where the pin is still high impedance and the 10 k pull-down is
 /// what holds XSMT low.
 ///
+/// The post-mortem comes fourth, once the mute is complete, and it is the whole
+/// diagnostic this binary produces. The exception number comes from `ICSR`
+/// rather than from the argument of the default handler, because the hard fault
+/// handler, the panic handler and the two guard arms of `main` are handed no
+/// argument and this routine is what all of them share. Latching a cause does
+/// not make it reportable: this routine masks interrupts and never returns, so
+/// no frame leaves the board after a fault, and `FAULT_RECORD` is read by a
+/// probe alone.
+///
+/// The record goes down one word at a time, so the fault path builds no copy of
+/// it on the stack. The magic lands first and the checksum last, which leaves
+/// an interrupted write failing validation rather than reading as a record.
+///
+/// Sealing it costs r4, r5 and r6. Exception entry stacks r0 to r3, r12, lr, pc
+/// and xpsr, and the prologue here pushes r7, so those three are the registers
+/// of the faulting context that nothing preserves. A probe on the parked core
+/// reads this routine's scratch in them. The record buys the fault status at
+/// that price.
+///
 /// The hold covers `MUTE_SEQUENCE_US`. Nothing in this binary starts or stops
 /// the audio clocks, so it becomes load bearing once a reset path exists, and
 /// the watchdog period is then derived from `MUTE_SEQUENCE_US` so its reset
-/// cannot land inside the converter ramp.
+/// cannot land inside the converter ramp. The record is written before the
+/// hold, so the hold costs the diagnostic nothing.
 #[expect
 (
     unsafe_code,
-    reason = "the fault path reaches the mute pin by raw register write"
+    reason = "the fault path reaches the mute pin, the fault status registers \
+              and the post-mortem by raw pointer"
 )]
 fn silence_and_park() -> !
 {
@@ -152,6 +215,36 @@ fn silence_and_park() -> !
         let _ = gpioe.moder().read().bits();
         gpioe.moder().modify(|_, w| w.moder7().output());
         gpioe.bsrr().write(|w| w.br7().set_bit());
+    }
+
+    // SAFETY: interrupts are masked and this function never returns, so nothing
+    // else can observe these register blocks or the record. The reads are
+    // volatile reads of status registers, which have no side effect, and the
+    // writes cover the eight words of the record and nothing beyond them, in a
+    // slot no other line of this binary touches. Volatile is what keeps those
+    // writes, since nothing here reads the record back.
+    unsafe
+    {
+        let scb = &*SCB::PTR;
+        let ac = &*AC::PTR;
+
+        let registers = FaultRegisters
+        {
+            exception: scb.icsr.read() & VECTACTIVE_MASK,
+            cfsr: scb.cfsr.read(),
+            hfsr: scb.hfsr.read(),
+            mmfar: scb.mmfar.read(),
+            bfar: scb.bfar.read(),
+            abfsr: ac.abfsr.read(),
+        };
+
+        let slot = (&raw mut FAULT_RECORD).cast::<u32>();
+        let record = FaultRecord::new(&registers).to_words();
+
+        for (index, word) in record.into_iter().enumerate()
+        {
+            ptr::write_volatile(slot.add(index), word);
+        }
     }
 
     asm::delay(MUTE_HOLD_ITERATIONS);
@@ -203,9 +296,13 @@ unsafe fn HardFault() -> !
 /// running. `main` enables `BusFault` without giving it a handler of its own,
 /// so a data bus error lands here too.
 ///
-/// The interrupt number is discarded and no fault cause is latched, so
-/// `DspState::Faulted` and every `Fault` variant of the control protocol name
-/// states this binary cannot report.
+/// The interrupt number handed to this function goes unused. `FAULT_RECORD`
+/// carries the active exception number, which `silence_and_park` reads from
+/// `ICSR` for every entry it has.
+///
+/// The record reaches a probe and nothing else. `DspState::Faulted` and every
+/// `Fault` variant of the control protocol name states this binary cannot
+/// report, because the fault path masks interrupts and never returns.
 #[allow
 (
     unsafe_code,

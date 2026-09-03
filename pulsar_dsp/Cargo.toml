@@ -14,7 +14,10 @@ test = false
 bench = false
 
 [dependencies]
-cortex-m ={ version = "0.7.9", features = ["critical-section-single-core"] }
+cortex-m = { version = "0.7.9", features = [
+    "cm7",
+    "critical-section-single-core",
+] }
 cortex-m-rt = "0.7.6"
 pulsar_lib = { version = "0.0.1", path = "../pulsar_lib" }
 stm32h7 = { version = "0.16.0", features = ["stm32h743v", "rt"] }
