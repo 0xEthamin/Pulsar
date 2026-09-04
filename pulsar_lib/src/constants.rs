@@ -19,6 +19,13 @@ pub const MICROSECONDS_PER_SECOND: u32 = 1_000_000;
 /// long enough at every slower one the part can run.
 pub const MAX_CORE_CLOCK_HZ: u32 = 480_000_000;
 
+/// Core clock the processing part runs on out of reset, in hertz.
+///
+/// RM0433 section 8.7.2 divides the internal oscillator by one after a reset
+/// and selects it as the system clock, which puts the core at 64 MHz. A timing
+/// sized for this clock is only long enough while nothing has raised it.
+pub const BOOT_CORE_CLOCK_HZ: u32 = 64_000_000;
+
 /// Sample rate of the whole chain, in hertz.
 ///
 /// SBC over A2DP delivers 44.1 kHz. Every stage runs at the source rate, so the
@@ -125,6 +132,12 @@ const _: () = assert!
 (
     SAMPLE_RATE_HZ > 0,
     "the sample rate divides into every derived timing"
+);
+
+const _: () = assert!
+(
+    BOOT_CORE_CLOCK_HZ > 0 && BOOT_CORE_CLOCK_HZ <= MAX_CORE_CLOCK_HZ,
+    "the boot clock is one the part runs at"
 );
 
 const _: () = assert!

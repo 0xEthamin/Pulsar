@@ -7,13 +7,13 @@
 # checks:
 #
 #   1. every fault and interrupt vector points at a handler that mutes,
-#   2. the mute store is the first ldr or str family instruction of the routine
-#      that carries it,
+#   2. the mute store is the first instruction of the routine that carries it
+#      that is not a frame push, a register move or an immediate constant,
 #   3. the interrupt mask and its barrier follow that store immediately,
-#   4. the post-mortem record is 32 bytes, lies inside .uninit, and falls
+#   4. the post-mortem record is 36 bytes, lies inside .uninit, and falls
 #      outside the range the startup zero fill walks,
 #   5. once the routine that carries the mute has built the record address in a
-#      register, it makes eight word stores through that register, at the eight
+#      register, it makes nine word stores through that register, at the nine
 #      record offsets, in rising offset order.
 #
 # Each claim is checked here against the disassembly of the image that ships.
@@ -23,12 +23,22 @@
 # way through it is to say what that handler does about the drivers, not to add
 # its address to the allowed set.
 #
-# Claim 2 is narrow twice over. It reads one routine and not the path to it: a
-# handler that only tail calls the shared mute is followed one level down, and
-# whatever it ran before that call goes unread, which is how the ICSR read of
-# the default handler passes unseen. And it matches a fixed list of mnemonics,
-# so push, pop, ldrsb, ldrsh, ldrex and vldr are invisible to it. The prologue
-# it accepts opens with a push, which is a store.
+# Claim 2 reads every instruction between the vector and the mute store. A
+# handler that only forwards to the shared mute holds no store of its own, so
+# the entry frame is read and the call it makes is followed one level down. One
+# level is the whole descent: both vectors of this image reach the mute in one
+# call, and a path that takes more frames is a path this gate has not read.
+#
+# What a frame may run ahead of the mute is a whitelist, BARE_INSTRUCTION, and
+# it applies to the entry frame as much as to the routine under it. A blacklist
+# of memory access mnemonics cannot be finished: strb, strd, stm, stmdb, ldmia,
+# ldrex, strex, ldrsb, ldrsh, vldr, vstr, push, pop, tbb and tbh all reach
+# memory, and a handler that stores to a peripheral before it forwards can
+# raise XSMT as easily as lower it. One memory access is exempt, and it is
+# named rather than waived: the ICSR read of the trampoline cortex-m-rt puts in
+# front of the default handler, matched as the three instruction sequence it
+# is, at that one address. The frame around it faces the whitelist like any
+# other.
 #
 # Claims 4 and 5 exist because the record is written and never read, so nothing
 # else notices when it stops being written or starts being erased.
@@ -40,7 +50,7 @@
 # zero-init-ram feature of cortex-m-rt, which swaps the bounds of that loop for
 # _ram_start and _ram_end and so walks over the record.
 #
-# Claim 5 fails when the eight stores stop being eight separate word stores made
+# Claim 5 fails when the nine stores stop being nine separate word stores made
 # in rising offset order. Dropping the volatile qualifier does exactly that: the
 # compiler then merges neighbouring words into strd pairs and reorders them,
 # which costs the property the order carries, that the magic lands first and the
@@ -49,7 +59,7 @@
 #
 # Claim 5 reads a shape, and three things it does not read are worth naming. It
 # cannot see a volatile qualifier, so it catches the code shape a lost one
-# produces rather than the loss itself. It matches the eight offsets and the
+# produces rather than the loss itself. It matches the nine offsets and the
 # order, never the value stored, so which status register reaches which record
 # word is checked by nothing here and by no host test. And it counts str and
 # str.w through one base register, so a strd, strb, stm, register offset or
@@ -85,12 +95,24 @@ FIRST_HANDLER_WORD=2
 # fewer words than this has read the wrong section.
 MIN_HANDLER_WORDS=100
 
-# Shape of the post-mortem record, owned by pulsar_lib::postmortem. Eight words,
+# Shape of the post-mortem record, owned by pulsar_lib::postmortem. Nine words,
 # magic first, checksum last.
 RECORD_SYMBOL=FAULT_RECORD
 RECORD_SECTION=.uninit
-RECORD_WORDS=8
-RECORD_BYTES=32
+RECORD_WORDS=9
+RECORD_BYTES=$((RECORD_WORDS * 4))
+
+# Instructions a frame may run ahead of the mute store, or ahead of the call
+# that reaches it: the frame push, a register move, an immediate constant, a
+# call. Anything else fails the gate, whatever it does, which is what makes the
+# check complete where a list of memory access mnemonics to refuse never is.
+BARE_INSTRUCTION='^(push \{[^}]*\}|movs?(w|t|\.w)? [^,]+, [^,]+|bl 0x[0-9a-f]+( <[^>]*>)?|nop)$'
+
+# The one memory access exempt from that list. PM0253 section 4.3.3 puts ICSR
+# at 0xE000ED04, and the trampoline cortex-m-rt places in front of the default
+# handler reads it to recover the interrupt number it hands on.
+ICSR_LOW='#0xed04'
+ICSR_HIGH='#0xe000'
 
 echo "==== building $CRATE (release) ===="
 (cd "$CRATE" && cargo build --release --locked)
@@ -236,26 +258,84 @@ zero_fill_bounds()
     printf '%s %s\n' "$lo" "$hi"
 }
 
-# Prints the instructions that carry the mute for the handler at one address. A
-# handler that only tail calls the shared routine holds no store of its own, so
-# the first call is followed one level down.
+# Drops the three instruction ICSR read of the default handler trampoline, and
+# nothing else. The three have to stand together, in this order, through one
+# register, at the ICSR address. A read that differs anywhere stays in the
+# stream and faces BARE_INSTRUCTION.
+without_icsr_read()
+{
+    awk -v low="$ICSR_LOW" -v high="$ICSR_HIGH" '
+        { line[NR] = $0 }
+        END {
+            for (i = 1; i <= NR; i++)
+            {
+                reg = ""
+                if (line[i] ~ ("^movw r[0-9]+, " low "$"))
+                {
+                    split(line[i], field, " ")
+                    reg = substr(field[2], 1, length(field[2]) - 1)
+                }
+                if (reg != "" && i + 2 <= NR \
+                    && line[i + 1] == "movt " reg ", " high \
+                    && line[i + 2] == "ldr " reg ", [" reg "]")
+                {
+                    i += 2
+                    continue
+                }
+                print line[i]
+            }
+        }
+    ' <<< "$1"
+}
+
+# Prints the line number of the first instruction of a frame that is not a bare
+# one, or nothing when the frame runs only bare instructions.
+first_foreign()
+{
+    grep -nvE "$BARE_INSTRUCTION" <<< "$1" | head -1 | cut -d: -f1
+}
+
+# Prints the instructions that carry the mute for the handler at one address.
+#
+# The entry frame is read first, and it is read, not skipped: everything it runs
+# up to its call has to be bare, so a handler that reaches memory on its way
+# down fails here rather than passing unseen. A frame that is bare all the way
+# to its call holds nothing to read, so the routine it calls is the one that
+# carries the mute, and the descent stops there. Anything else is handed back as
+# the mute routine, where the first instruction that is not bare has to be the
+# mute store.
+#
+# Only a bl is followed. A frame that reaches the shared routine by branching
+# rather than calling is handed back as the mute routine and fails on its own
+# branch, which is the safe way round: the gate goes red and the path gets read.
 mute_body()
 {
-    local lines callee
-    lines="$(body "$1")"
+    local addr=$1
+    local lines call_at callee
+
+    lines="$(body "$addr")"
     if [ -z "$lines" ]
     then
+        echo "FAIL: the frame at 0x$addr has no body in the disassembly" >&2
         return 1
     fi
-    if ! grep -qE '^str ' <<< "$lines"
+
+    call_at="$(grep -nE '^bl 0x[0-9a-f]+' <<< "$lines" | head -1 | cut -d: -f1)"
+
+    if [ -n "$call_at" ] \
+        && [ -z "$(first_foreign \
+            "$(without_icsr_read "$(sed -n "1,${call_at}p" <<< "$lines")")")" ]
     then
-        callee="$(grep -m1 -oE '^bl 0x[0-9a-f]+' <<< "$lines" | cut -d' ' -f2)"
-        if [ -z "$callee" ]
+        callee="$(sed -n "${call_at}p" <<< "$lines" | cut -d' ' -f2)"
+        lines="$(body "$(printf '%08x' "$callee")")"
+        if [ -z "$lines" ]
         then
+            echo "FAIL: the frame at 0x$addr forwards to $callee, which has no" \
+                "body in the disassembly" >&2
             return 1
         fi
-        lines="$(body "$(printf '%08x' "$callee")")"
     fi
+
     printf '%s\n' "$lines"
 }
 
@@ -277,7 +357,10 @@ check_mute_path()
         return 1
     fi
 
-    line_no="$(grep -nE '^str ' <<< "$lines" | head -1 | cut -d: -f1)"
+    # The mute store is the first instruction of the routine that is not a bare
+    # one. Reading it that way is what makes the check complete: whatever stands
+    # ahead of it, of whatever mnemonic, is the failure.
+    line_no="$(first_foreign "$lines")"
     if [ -z "$line_no" ]
     then
         fail "$label never stores to a peripheral"
@@ -291,7 +374,7 @@ check_mute_path()
         base="${BASH_REMATCH[2]}"
         off="${BASH_REMATCH[3]}"
     else
-        fail "$label opens with a store this gate cannot read: $store"
+        fail "$label runs \"$store\" ahead of the mute store"
         return 1
     fi
 
@@ -319,12 +402,6 @@ check_mute_path()
         return 1
     fi
 
-    if grep -qE '^(ldr|ldrb|ldrh|ldrd|ldm|str|strb|strh|strd|stm)[ .]' <<< "$prologue"
-    then
-        fail "$label runs an ldr or str family instruction before the mute store"
-        return 1
-    fi
-
     after="$(sed -n "$((line_no + 1))p" <<< "$lines")"
     if [ "$after" != "cpsid i" ]
     then
@@ -341,7 +418,8 @@ check_mute_path()
             ;;
     esac
 
-    echo "PASS: the mute store is the first ldr or str family instruction of the mute routine of $label, and the mask and the barrier follow it"
+    echo "PASS: only a frame push and register moves stand ahead of the mute" \
+        "store of $label, and the mask and the barrier follow it"
 }
 
 # Checks claim 4 against the symbol table, the section headers and the reset
@@ -431,7 +509,7 @@ check_record_write()
 
     # Every RAM address in this image shares the high half, so the low half is
     # what picks the register out. The two halves are then required in order,
-    # and the eight stores are required after them.
+    # and the nine stores are required after them.
     base="$(sed -nE "s/^movw (r[0-9]+), ${low}\$/\1/p" <<< "$lines" | head -1)"
     if [ -z "$base" ]
     then

@@ -21,26 +21,44 @@
 //! undetermined. Putting the mute in front of those pushes takes an entry that
 //! touches no stack, which this binary does not have.
 //!
-//! Whichever path does reach the mute then latches the active exception number
-//! and the fault status registers into `FAULT_RECORD`, between the mute and the
-//! park. The module documentation of `pulsar_lib::postmortem` carries the
-//! offset by offset layout to read at that symbol. Nothing in this binary reads
-//! the record back, and no fault reaches the control link.
+//! `main` brings the audio kernel clock up. That bring-up reads the register
+//! fields the output frequency depends on back and compares each against the
+//! plan, because a lock bit reports a PLL fed from the wrong oscillator as
+//! ready. A clock that does not verify takes the fault path. The crystal
+//! frequency is the one input no register reports, so what comes back is a
+//! witness that the part took the plan, not a proof of the frame rate.
+//!
+//! Whichever path does reach the mute then latches the active exception number,
+//! the fault status registers and the clock fault code into `FAULT_RECORD`,
+//! between the mute and the park. The module documentation of
+//! `pulsar_lib::postmortem` carries the offset by offset layout to read at that
+//! symbol. Nothing in this binary reads the record back, and no fault reaches
+//! the control link, so a probe on SWD is the only reader.
+//!
+//! Every path here parks in `wfi`, which is Sleep, and Sleep stops the
+//! processor clock unless `DBGMCU_CR.DBGSLEEP_D1` is set. `main` sets it ahead
+//! of everything else, so a parked core keeps answering the debug port. Without
+//! that bit the record, the thirty-four clock fault codes it can carry and the
+//! two guards that tell it from stale memory have no reader at all.
 
 #![no_std]
 #![no_main]
 
+mod clock;
+
 use core::mem::MaybeUninit;
 use core::panic::PanicInfo;
 use core::ptr;
+use core::sync::atomic::{AtomicU32, Ordering};
 use cortex_m::Peripherals;
 use cortex_m::asm;
 use cortex_m::interrupt;
 use cortex_m::peripheral::scb::Exception;
 use cortex_m::peripheral::{AC, SCB};
 use cortex_m_rt::{entry, exception};
-use pulsar_lib::constants::{MAX_CORE_CLOCK_HZ, mute_hold_iterations};
+use pulsar_lib::constants::{BOOT_CORE_CLOCK_HZ, MAX_CORE_CLOCK_HZ, mute_hold_iterations};
 use pulsar_lib::postmortem::{FaultRecord, FaultRegisters};
+use stm32h7::stm32h743v as device;
 use stm32h7::stm32h743v::{GPIOE, RCC};
 
 /// Port E pin wired to the XSMT input of both converter modules.
@@ -55,11 +73,42 @@ const XSMT_PIN: u8 = 7;
 /// the part can run, including the 64 MHz it boots on.
 const MUTE_HOLD_ITERATIONS: u32 = mute_hold_iterations(MAX_CORE_CLOCK_HZ);
 
+/// Address the processor reaches `DBGMCU_CR` at.
+///
+/// RM0433 section 60.5.8 maps the debug unit at `0x5C00_1000` for the processor
+/// and puts `CR` at offset `0x004`.
+const DBGMCU_CR: *mut u32 = 0x5C00_1004 as *mut u32;
+
+/// `DBGMCU_CR` bit keeping the processor clock running in Sleep mode.
+///
+/// RM0433 section 60.5.8, `DBGSLEEP_D1` at bit 0. It reads zero after a power
+/// on reset, where Sleep stops the processor clock and the debug port loses the
+/// core.
+const DBGSLEEP_D1: u32 = 1;
+
 /// Bits of `ICSR` holding the exception the core is serving.
 ///
 /// PM0253 section 4.3.3, `VECTACTIVE` occupies bits 8 to 0 and reads zero in
 /// thread mode.
 const VECTACTIVE_MASK: u32 = 0x1FF;
+
+/// Clock fault code a fault path that no clock bring-up refused carries.
+///
+/// `ClockFault::code` numbers no fault zero, so the record tells the two apart.
+const NO_CLOCK_FAULT: u32 = 0;
+
+/// Clock fault code the fault path latches into the record.
+///
+/// A refused clock raises no exception, so it is the one cause `ICSR` cannot
+/// carry. It travels here rather than in an argument, which leaves
+/// `silence_and_park` with a signature a forwarding frame folds into its
+/// caller, and keeps the mute store the first memory access of every vector.
+///
+/// The startup zero fill covers `.bss`, so the value out of reset is
+/// `NO_CLOCK_FAULT` and only the one arm of `main` that answers a refused clock
+/// writes it. `.bss` sits above STACK, where an overflowing stack does not
+/// reach, so the fault path reads it back on that route as well.
+static CLOCK_FAULT: AtomicU32 = AtomicU32::new(NO_CLOCK_FAULT);
 
 const _: () = assert!
 (
@@ -93,31 +142,98 @@ const _: () = assert!
 #[unsafe(link_section = ".uninit.FAULT_RECORD")]
 static mut FAULT_RECORD: MaybeUninit<FaultRecord> = MaybeUninit::uninit();
 
-/// Arms the `BusFault` handler, then parks the core.
+/// Sets `DBGMCU_CR.DBGSLEEP_D1`, which keeps a parked core on the debug port.
+///
+/// `wfi` is Sleep, and Sleep stops the processor clock while the bit is clear,
+/// which is what a power on reset leaves it at. Every path of this binary ends
+/// parked in `wfi`, and a probe is the only reader `FAULT_RECORD` has, so this
+/// bit is what carries the record, its clock fault code and its two guards off
+/// the board.
+///
+/// The other bits of the register are carried over rather than cleared. RM0433
+/// section 60.5.8 exempts this block from the system reset, so a debugger
+/// attached before this runs holds its own bits in it.
+///
+/// The block is reached by address rather than through the peripheral
+/// singleton, which lets this run ahead of every `take` and cover the arms of
+/// `main` that park when a `take` comes back empty.
+#[expect
+(
+    unsafe_code,
+    reason = "the debug unit is reached by raw pointer, ahead of the handle the \
+              peripheral singleton hands out"
+)]
+fn keep_core_visible_in_sleep()
+{
+    // SAFETY: a word wide read-modify-write of DBGMCU_CR, which the part maps
+    // at this address for the processor. It runs before any interrupt is
+    // enabled and nothing else in this binary reaches the block, so no other
+    // access falls between the read and the write.
+    unsafe
+    {
+        ptr::write_volatile(DBGMCU_CR, ptr::read_volatile(DBGMCU_CR) | DBGSLEEP_D1);
+    }
+}
+
+/// Keeps the parked core visible, arms `BusFault`, brings the audio clock up.
+///
+/// `keep_core_visible_in_sleep` runs first, ahead of every arm below that can
+/// park, so none of them takes the core off the debug port.
 ///
 /// PM0253 section 2.5.2 escalates a fault to `HardFault` when the handler for
 /// that fault is disabled, and exempts the stack push that enters an enabled
 /// `BusFault` handler from escalation. Arming `SHCSR.BUSFAULTENA` is what lets
-/// a faulted stack push reach a vector at all.
+/// a faulted stack push reach a vector at all. It goes up before the clock, so
+/// a fault in the bring-up reaches a vector rather than lockup.
 ///
-/// The read-back and the `None` arm both end in silence, because no state of
-/// this binary means "the guard is absent". Neither is reachable here, since
-/// `Peripherals::take` runs once and `SHCSR` holds the bit.
+/// Every arm below ends in silence, because no state of this binary means "the
+/// guard is absent" or "the clock is close enough". The waits are sized for the
+/// clock the part boots on, which is the one this function runs at, since
+/// nothing here moves the system clock off the internal oscillator.
+///
+/// A refused clock is the one arm that names its cause. It writes the
+/// `ClockFault` code to `CLOCK_FAULT` before it enters the fault path, so a
+/// board that parks silent on the bench says which of the thirty-four refusals
+/// it hit rather than only that it refused.
+///
+/// The witness the bring-up returns is bound and never read. It has no `Drop`
+/// and no register behind it, so binding it changes nothing the part does.
+/// Reaching the converters takes the audio interface and the port pins that
+/// carry it, neither of which this binary configures, so the master and bit
+/// clocks stay off the header.
 #[entry]
 fn main() -> !
 {
-    let Some(mut peripherals) = Peripherals::take()
+    keep_core_visible_in_sleep();
+
+    let Some(mut core) = Peripherals::take()
     else
     {
         silence_and_park()
     };
 
-    peripherals.SCB.enable(Exception::BusFault);
+    core.SCB.enable(Exception::BusFault);
 
-    if !peripherals.SCB.is_enabled(Exception::BusFault)
+    if !core.SCB.is_enabled(Exception::BusFault)
     {
         silence_and_park()
     }
+
+    let Some(part) = device::Peripherals::take()
+    else
+    {
+        silence_and_park()
+    };
+
+    let _audio_clock = match clock::start(part.RCC, BOOT_CORE_CLOCK_HZ)
+    {
+        Ok(witness) => witness,
+        Err(fault) =>
+        {
+            CLOCK_FAULT.store(fault.code(), Ordering::Relaxed);
+            silence_and_park()
+        }
+    };
 
     loop
     {
@@ -156,25 +272,34 @@ fn main() -> !
 /// The post-mortem comes fourth, once the mute is complete, and it is the whole
 /// diagnostic this binary produces. The exception number comes from `ICSR`
 /// rather than from the argument of the default handler, because the hard fault
-/// handler, the panic handler and the two guard arms of `main` are handed no
+/// handler, the panic handler and the guard arms of `main` are handed no
 /// argument and this routine is what all of them share. Latching a cause does
 /// not make it reportable: this routine masks interrupts and never returns, so
 /// no frame leaves the board after a fault, and `FAULT_RECORD` is read by a
 /// probe alone.
 ///
+/// `CLOCK_FAULT` is the one cause `ICSR` cannot carry, since a refused clock
+/// raises no exception. This routine takes no argument, which is what lets the
+/// compiler fold a forwarding handler into the trampoline above it and leaves
+/// one frame push on each side of the vector rather than two. The code is read
+/// from `.bss` here, after the mute store, so the mute stays the first memory
+/// access of the path.
+///
 /// The record goes down one word at a time, so the fault path builds no copy of
 /// it on the stack. The magic lands first and the checksum last, which leaves
 /// an interrupted write failing validation rather than reading as a record.
 ///
-/// Sealing it costs r4, r5 and r6. Exception entry stacks r0 to r3, r12, lr, pc
-/// and xpsr, and the prologue here pushes r7, so those three are the registers
-/// of the faulting context that nothing preserves. A probe on the parked core
-/// reads this routine's scratch in them. The record buys the fault status at
-/// that price.
+/// Sealing it costs r4, r5, r6 and r8, measured on the linked image. Exception
+/// entry stacks r0 to r3, r12, lr, pc and xpsr, and the prologue here pushes
+/// r7, so those four are the registers of the faulting context that nothing
+/// preserves. A probe on the parked core reads this routine's scratch in them.
+/// The record buys the fault status at that price.
 ///
-/// The hold covers `MUTE_SEQUENCE_US`. Nothing in this binary starts or stops
-/// the audio clocks, so it becomes load bearing once a reset path exists, and
-/// the watchdog period is then derived from `MUTE_SEQUENCE_US` so its reset
+/// The hold covers `MUTE_SEQUENCE_US`. Nothing in this binary drives the
+/// converter clocks: the audio interface is never enabled and PE2 to PE6 keep
+/// the high impedance a reset leaves them in, so the kernel clock the bring-up
+/// starts reaches no pin. The hold becomes load bearing once those clocks run,
+/// and the watchdog period is then derived from `MUTE_SEQUENCE_US` so its reset
 /// cannot land inside the converter ramp. The record is written before the
 /// hold, so the hold costs the diagnostic nothing.
 #[expect
@@ -220,7 +345,7 @@ fn silence_and_park() -> !
     // SAFETY: interrupts are masked and this function never returns, so nothing
     // else can observe these register blocks or the record. The reads are
     // volatile reads of status registers, which have no side effect, and the
-    // writes cover the eight words of the record and nothing beyond them, in a
+    // writes cover the nine words of the record and nothing beyond them, in a
     // slot no other line of this binary touches. Volatile is what keeps those
     // writes, since nothing here reads the record back.
     unsafe
@@ -239,7 +364,8 @@ fn silence_and_park() -> !
         };
 
         let slot = (&raw mut FAULT_RECORD).cast::<u32>();
-        let record = FaultRecord::new(&registers).to_words();
+        let record = FaultRecord::new(&registers, CLOCK_FAULT.load(Ordering::Relaxed))
+            .to_words();
 
         for (index, word) in record.into_iter().enumerate()
         {
