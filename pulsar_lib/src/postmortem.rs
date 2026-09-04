@@ -1,13 +1,14 @@
 //! Fault record the processing board leaves at a fixed address.
 //!
-//! The processing firmware writes one `FaultRecord` from its fault path and
-//! parks the core. Nothing on the board reads it back. The reader is a person
-//! with a probe on SWD, so the layout below is the interface, and the code here
-//! is the reference that produces it.
+//! The processing firmware writes one `FaultRecord` from its fault path, then
+//! parks the core in a Sleep it keeps clocked so a debug port still reaches it.
+//! Nothing on the board reads the record back. The reader is a person with a
+//! probe on SWD, so the layout below is the interface, and the code here is the
+//! reference that produces it.
 //!
 //! # Reading a record
 //!
-//! Take 32 bytes from the `FAULT_RECORD` symbol of the processing image, which
+//! Take 36 bytes from the `FAULT_RECORD` symbol of the processing image, which
 //! `llvm-nm` locates. Every word is little endian.
 //!
 //! ```text
@@ -25,7 +26,11 @@
 //! +0x14  BFAR       an address only while CFSR bit 15 is set.
 //! +0x18  ABFSR      0 ITCM, 1 DTCM, 2 AHBP, 3 AXIM, 4 EPPB, and 9 to 8 the
 //!                   AXI response type, which reads only while bit 3 is set.
-//! +0x1C  checksum   FNV-1a over the 24 bytes from +0x04 to +0x1B.
+//! +0x1C  clock      the `pulsar_lib::clock::ClockFault::code` the audio clock
+//!                   bring-up refused with. 0 means the path was entered from
+//!                   somewhere else, and bit 8 means a plan the part would not
+//!                   accept, whose bound the low byte names.
+//! +0x20  checksum   FNV-1a over the 28 bytes from +0x04 to +0x1F.
 //! ```
 //!
 //! Bit positions come from PM0253 tables 64, 65, 67 and 109. `HFSR` bit 30 says
@@ -40,8 +45,8 @@
 //!
 //! Memory no fault has written holds whatever the previous run left there, so a
 //! reader has to tell the two apart. Two guards cover the image between them
-//! and neither covers what the other does: word 0 is a fixed magic, and word 7
-//! is a checksum over the six words between them. Both must hold.
+//! and neither covers what the other does: word 0 is a fixed magic, and word 8
+//! is a checksum over the seven words between them. Both must hold.
 //!
 //! Nothing clears the record and nothing dates it, so a record that holds may
 //! predate the reset being examined.
@@ -56,7 +61,7 @@
 //! `FaultRegisters`.
 
 /// Words one record occupies. A reader takes this many from the record address.
-pub const WORD_COUNT: usize = 8;
+pub const WORD_COUNT: usize = 9;
 
 /// First word of a record.
 ///
@@ -128,8 +133,8 @@ pub struct FaultRegisters
     pub abfsr: u32,
 }
 
-/// One captured register set, sealed so a reader can tell it from stale
-/// memory.
+/// One captured register set and the clock fault that led to it, sealed so a
+/// reader can tell the record from stale memory.
 ///
 /// A record that holds says a fault path ran and sealed these words. It does
 /// not say a hardware fault occurred: a path entered from ordinary code seals
@@ -147,13 +152,18 @@ pub struct FaultRecord
     mmfar: u32,
     bfar: u32,
     abfsr: u32,
+    clock: u32,
     checksum: u32,
 }
 
 impl FaultRecord
 {
-    /// Seals `registers` into a record.
-    pub fn new(registers: &FaultRegisters) -> Self
+    /// Seals `registers` and `clock_fault` into a record.
+    ///
+    /// `clock_fault` is a `pulsar_lib::clock::ClockFault::code`, or zero on a
+    /// path no clock bring-up refused. That encoding numbers no fault zero, so
+    /// the two cases stay apart.
+    pub fn new(registers: &FaultRegisters, clock_fault: u32) -> Self
     {
         let mut record = Self
         {
@@ -164,6 +174,7 @@ impl FaultRecord
             mmfar: registers.mmfar,
             bfar: registers.bfar,
             abfsr: registers.abfsr,
+            clock: clock_fault,
             checksum: 0,
         };
 
@@ -178,7 +189,7 @@ impl FaultRecord
     #[must_use]
     pub fn from_words(words: &[u32; WORD_COUNT]) -> Option<Self>
     {
-        let [magic, exception, cfsr, hfsr, mmfar, bfar, abfsr, checksum] =
+        let [magic, exception, cfsr, hfsr, mmfar, bfar, abfsr, clock, checksum] =
             *words;
 
         if magic != MAGIC
@@ -195,6 +206,7 @@ impl FaultRecord
             mmfar,
             bfar,
             abfsr,
+            clock,
             checksum,
         };
 
@@ -218,8 +230,24 @@ impl FaultRecord
             self.mmfar,
             self.bfar,
             self.abfsr,
+            self.clock,
             self.checksum,
         ]
+    }
+
+    /// Returns the clock fault code the bring-up refused with.
+    ///
+    /// `None` on a record sealed by a path no clock bring-up refused, which is
+    /// every path but the one arm of `main` that answers a refused clock.
+    #[must_use]
+    pub fn clock_fault(self) -> Option<u32>
+    {
+        if self.clock == 0
+        {
+            return None;
+        }
+
+        Some(self.clock)
     }
 
     /// Returns the registers the fault path captured.
@@ -290,7 +318,7 @@ impl FaultRecord
         self.hfsr & FORCED != 0
     }
 
-    /// Returns the checksum of the six register words.
+    /// Returns the checksum of the seven words between the two guards.
     ///
     /// The magic is left out so the two guards stay independent. One of them
     /// covering the other would leave the covered one free to be wrong.
@@ -304,6 +332,7 @@ impl FaultRecord
             self.mmfar,
             self.bfar,
             self.abfsr,
+            self.clock,
         ];
 
         let mut hash = FNV_OFFSET_BASIS;
@@ -327,6 +356,11 @@ mod tests
     #![allow(clippy::indexing_slicing)]
 
     use super::*;
+    use crate::clock::{ClockFault, ClockPlanError};
+
+    /// A clock fault code distinct from every register value of `sample`, so a
+    /// word landing in the wrong slot cannot pass a round trip.
+    const SAMPLE_CLOCK_FAULT: u32 = 0x0000_0109;
 
     /// A register set with a distinct value in every field, so a swapped pair
     /// cannot pass a round trip.
@@ -346,7 +380,7 @@ mod tests
     #[test]
     fn a_sealed_record_reopens_to_the_same_registers()
     {
-        let record = FaultRecord::new(&sample());
+        let record = FaultRecord::new(&sample(), SAMPLE_CLOCK_FAULT);
         let reopened = FaultRecord::from_words(&record.to_words());
 
         assert_eq!(reopened, Some(record));
@@ -362,7 +396,7 @@ mod tests
     #[test]
     fn the_word_image_starts_with_the_magic_and_holds_the_registers()
     {
-        let words = FaultRecord::new(&sample()).to_words();
+        let words = FaultRecord::new(&sample(), SAMPLE_CLOCK_FAULT).to_words();
 
         assert_eq!(words[0], MAGIC);
         assert_eq!(words[1], sample().exception);
@@ -371,6 +405,7 @@ mod tests
         assert_eq!(words[4], sample().mmfar);
         assert_eq!(words[5], sample().bfar);
         assert_eq!(words[6], sample().abfsr);
+        assert_eq!(words[7], SAMPLE_CLOCK_FAULT);
     }
 
     #[test]
@@ -393,7 +428,7 @@ mod tests
     #[test]
     fn a_record_missing_its_magic_is_rejected()
     {
-        let mut words = FaultRecord::new(&sample()).to_words();
+        let mut words = FaultRecord::new(&sample(), SAMPLE_CLOCK_FAULT).to_words();
         words[0] = MAGIC ^ 1;
 
         assert_eq!(FaultRecord::from_words(&words), None);
@@ -402,7 +437,7 @@ mod tests
     #[test]
     fn one_flipped_bit_anywhere_in_a_record_is_rejected()
     {
-        let sealed = FaultRecord::new(&sample()).to_words();
+        let sealed = FaultRecord::new(&sample(), SAMPLE_CLOCK_FAULT).to_words();
 
         for index in 1..WORD_COUNT
         {
@@ -426,18 +461,18 @@ mod tests
     {
         let mut registers = sample();
         registers.cfsr = 0;
-        let record = FaultRecord::new(&registers);
+        let record = FaultRecord::new(&registers, SAMPLE_CLOCK_FAULT);
 
         assert_eq!(record.memmanage_address(), None);
         assert_eq!(record.bus_address(), None);
 
         registers.cfsr = MMARVALID;
-        let record = FaultRecord::new(&registers);
+        let record = FaultRecord::new(&registers, SAMPLE_CLOCK_FAULT);
         assert_eq!(record.memmanage_address(), Some(registers.mmfar));
         assert_eq!(record.bus_address(), None);
 
         registers.cfsr = BFARVALID;
-        let record = FaultRecord::new(&registers);
+        let record = FaultRecord::new(&registers, SAMPLE_CLOCK_FAULT);
         assert_eq!(record.memmanage_address(), None);
         assert_eq!(record.bus_address(), Some(registers.bfar));
     }
@@ -448,19 +483,19 @@ mod tests
         let mut registers = sample();
 
         registers.cfsr = 0;
-        assert!(!FaultRecord::new(&registers).stacking_failed());
+        assert!(!FaultRecord::new(&registers, SAMPLE_CLOCK_FAULT).stacking_failed());
 
         // MSTKERR, the MemManage half.
         registers.cfsr = 1 << 4;
-        assert!(FaultRecord::new(&registers).stacking_failed());
+        assert!(FaultRecord::new(&registers, SAMPLE_CLOCK_FAULT).stacking_failed());
 
         // STKERR, bit 4 of the BusFault half.
         registers.cfsr = 1 << 12;
-        assert!(FaultRecord::new(&registers).stacking_failed());
+        assert!(FaultRecord::new(&registers, SAMPLE_CLOCK_FAULT).stacking_failed());
 
         // The two neighbouring bits are unstacking errors, not entry pushes.
         registers.cfsr = (1 << 3) | (1 << 11);
-        assert!(!FaultRecord::new(&registers).stacking_failed());
+        assert!(!FaultRecord::new(&registers, SAMPLE_CLOCK_FAULT).stacking_failed());
     }
 
     #[test]
@@ -469,28 +504,46 @@ mod tests
         let mut registers = sample();
 
         registers.hfsr = 0;
-        assert!(!FaultRecord::new(&registers).escalated());
+        assert!(!FaultRecord::new(&registers, SAMPLE_CLOCK_FAULT).escalated());
 
         // VECTTBL at bit 1 and DEBUGEVT at bit 31 are not escalation.
         registers.hfsr = (1 << 1) | (1 << 31);
-        assert!(!FaultRecord::new(&registers).escalated());
+        assert!(!FaultRecord::new(&registers, SAMPLE_CLOCK_FAULT).escalated());
 
         registers.hfsr = FORCED;
-        assert!(FaultRecord::new(&registers).escalated());
+        assert!(FaultRecord::new(&registers, SAMPLE_CLOCK_FAULT).escalated());
+    }
+
+    #[test]
+    fn the_clock_word_carries_the_fault_code_and_zero_means_none()
+    {
+        let none = FaultRecord::new(&sample(), 0);
+
+        assert_eq!(none.clock_fault(), None);
+        assert_eq!(none.to_words()[7], 0);
+
+        let refused = ClockFault::PlanRejected(ClockPlanError::VcoOutsideBand);
+        let record = FaultRecord::new(&sample(), refused.code());
+
+        assert_eq!(record.clock_fault(), Some(refused.code()));
+        assert_eq!(record.to_words()[7], refused.code());
+
+        // The two records differ in one word, and the seal moves with it.
+        assert_ne!(record.to_words()[8], none.to_words()[8]);
     }
 
     #[test]
     fn two_register_sets_that_differ_seal_differently()
     {
-        let first = FaultRecord::new(&sample());
+        let first = FaultRecord::new(&sample(), SAMPLE_CLOCK_FAULT);
 
         let mut registers = sample();
         registers.mmfar = sample().bfar;
         registers.bfar = sample().mmfar;
 
-        let swapped = FaultRecord::new(&registers);
+        let swapped = FaultRecord::new(&registers, SAMPLE_CLOCK_FAULT);
 
         assert_ne!(swapped, first);
-        assert_ne!(swapped.to_words()[7], first.to_words()[7]);
+        assert_ne!(swapped.to_words()[8], first.to_words()[8]);
     }
 }

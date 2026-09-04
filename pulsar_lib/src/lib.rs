@@ -7,6 +7,7 @@
 
 #![no_std]
 
+pub mod clock;
 pub mod constants;
 pub mod control;
 pub mod filter;
