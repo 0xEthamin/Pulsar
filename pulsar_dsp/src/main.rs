@@ -21,12 +21,26 @@
 //! undetermined. Putting the mute in front of those pushes takes an entry that
 //! touches no stack, which this binary does not have.
 //!
-//! `main` brings the audio kernel clock up. That bring-up reads the register
-//! fields the output frequency depends on back and compares each against the
-//! plan, because a lock bit reports a PLL fed from the wrong oscillator as
-//! ready. A clock that does not verify takes the fault path. The crystal
-//! frequency is the one input no register reports, so what comes back is a
-//! witness that the part took the plan, not a proof of the frame rate.
+//! `main` brings the audio kernel clock up, then the output transport that
+//! carries it to the header. The clock bring-up reads the register fields the
+//! output frequency depends on back and compares each against the plan, because
+//! a lock bit reports a PLL fed from the wrong oscillator as ready. The
+//! transport bring-up does the same for every field it drives off its reset
+//! value in the two sub-blocks and the two transfer streams, because the
+//! interface reports no bit meaning "configured as asked". Either one failing
+//! to verify takes the fault path.
+//!
+//! Two inputs stay outside both read-backs. The crystal frequency is the one
+//! the clock depends on and no register reports, and the port that carries the
+//! frame to the header is written and read by nothing. So what comes back is a
+//! witness that the part took the plan, not a proof of the frame rate and not a
+//! proof that a pin moves.
+//!
+//! Once both are up, PE2 to PE6 carry a master clock, a bit clock, a frame
+//! clock and two data lines, and a 1 kHz tone repeats on the four channels of
+//! the frame with no further work from the core. PE7 is named by nothing but
+//! the fault path, so it keeps the analog mode a reset leaves it in and the
+//! 10 k pull-down on it holds the converters muted through all of this.
 //!
 //! Whichever path does reach the mute then latches the active exception number,
 //! the fault status registers and the clock fault code into `FAULT_RECORD`,
@@ -45,6 +59,7 @@
 #![no_main]
 
 mod clock;
+mod transport;
 
 use core::mem::MaybeUninit;
 use core::panic::PanicInfo;
@@ -175,7 +190,8 @@ fn keep_core_visible_in_sleep()
     }
 }
 
-/// Keeps the parked core visible, arms `BusFault`, brings the audio clock up.
+/// Keeps the parked core visible, arms `BusFault`, starts the clock and the
+/// output transport.
 ///
 /// `keep_core_visible_in_sleep` runs first, ahead of every arm below that can
 /// park, so none of them takes the core off the debug port.
@@ -196,11 +212,19 @@ fn keep_core_visible_in_sleep()
 /// board that parks silent on the bench says which of the thirty-four refusals
 /// it hit rather than only that it refused.
 ///
-/// The witness the bring-up returns is bound and never read. It has no `Drop`
-/// and no register behind it, so binding it changes nothing the part does.
-/// Reaching the converters takes the audio interface and the port pins that
-/// carry it, neither of which this binary configures, so the master and bit
-/// clocks stay off the header.
+/// The transport takes the witness the clock bring-up returns by reference,
+/// which is what leaves the start order to the compiler: RM0433 requires the
+/// kernel clock present on the interface before its enable bit is set, and a
+/// refused clock builds no witness to hand over.
+///
+/// The transport is what puts the master clock, the bit clock, the frame clock
+/// and the two data lines on the header. It configures PE2 to PE6 and leaves
+/// PE7 alone, so the converter mute keeps the pull-down that holds it.
+///
+/// A refused transport carries no code into the record. `FAULT_RECORD` names
+/// one clock fault and a refusal here is not one, and the interface and stream
+/// registers a refusal leaves behind say more than a code would: they are read
+/// over the debug port, in place, by the probe that measures the frame.
 #[entry]
 fn main() -> !
 {
@@ -225,7 +249,7 @@ fn main() -> !
         silence_and_park()
     };
 
-    let _audio_clock = match clock::start(part.RCC, BOOT_CORE_CLOCK_HZ)
+    let audio_clock = match clock::start(&part.RCC, BOOT_CORE_CLOCK_HZ)
     {
         Ok(witness) => witness,
         Err(fault) =>
@@ -234,6 +258,22 @@ fn main() -> !
             silence_and_park()
         }
     };
+
+    let transport = transport::start
+    (
+        &audio_clock,
+        &part.RCC,
+        &part.SAI1,
+        &part.DMA1,
+        &part.DMAMUX1,
+        &part.GPIOE,
+        BOOT_CORE_CLOCK_HZ
+    );
+
+    if transport.is_err()
+    {
+        silence_and_park()
+    }
 
     loop
     {
@@ -263,11 +303,13 @@ fn main() -> !
 /// the barrier an interrupt already recognised can still be taken.
 ///
 /// The port clock and the pin direction come third, so the mute never waits on
-/// a read-modify-write. Configuring PE2 to PE6 as SAI alternate functions
-/// already requires `GPIOEEN`, so on any path where the converters could have
-/// been unmuted the first store has landed. This step covers a fault before
-/// that point, where the pin is still high impedance and the 10 k pull-down is
-/// what holds XSMT low.
+/// a read-modify-write. RM0433 resets every pin of this port to analog mode and
+/// nothing else in this binary names PE7, so the pad is high impedance until
+/// this step and the 10 k pull-down is what holds XSMT low there. This step is
+/// therefore what drives the pin, and the store above is what fixes the order:
+/// the transport sets `GPIOEEN`, so on every path where the converter clocks
+/// are running that store reaches `BSRR` rather than being dropped, ahead of
+/// the read this step performs.
 ///
 /// The post-mortem comes fourth, once the mute is complete, and it is the whole
 /// diagnostic this binary produces. The exception number comes from `ICSR`
@@ -295,13 +337,22 @@ fn main() -> !
 /// preserves. A probe on the parked core reads this routine's scratch in them.
 /// The record buys the fault status at that price.
 ///
-/// The hold covers `MUTE_SEQUENCE_US`. Nothing in this binary drives the
-/// converter clocks: the audio interface is never enabled and PE2 to PE6 keep
-/// the high impedance a reset leaves them in, so the kernel clock the bring-up
-/// starts reaches no pin. The hold becomes load bearing once those clocks run,
-/// and the watchdog period is then derived from `MUTE_SEQUENCE_US` so its reset
-/// cannot land inside the converter ramp. The record is written before the
-/// hold, so the hold costs the diagnostic nothing.
+/// The hold covers `MUTE_SEQUENCE_US`, and it is load bearing. The converter
+/// clocks run once the transport is up, and pulling XSMT low starts an
+/// attenuation ramp the converter counts in its own sample periods, so the
+/// clocks have to keep running for the length of that ramp. What a converter
+/// left part way through one does is not something this firmware measures, and
+/// the hold is what makes the question moot.
+///
+/// Nothing on this path stops those clocks: the mask above reaches interrupts
+/// alone, and neither the interface enable nor the transfer streams are touched
+/// here, so the frame keeps going out to a converter that is muting. The count
+/// is sized for the highest clock the part runs at, so at the 64 MHz this
+/// binary stays on it covers the sequence seven times over. The record is
+/// written before the hold, so the hold costs the diagnostic nothing.
+///
+/// A watchdog would put a reset inside that window, so its period is derived
+/// from `MUTE_SEQUENCE_US` when it arrives. This binary has none.
 #[expect
 (
     unsafe_code,
@@ -334,7 +385,8 @@ fn silence_and_park() -> !
         // back, then performs a dummy read of the peripheral. Both are
         // volatile, so neither is optimised away, and without them the
         // read-modify-write below can carry invalid data into the bits that
-        // also select the alternate function of PE2 to PE6.
+        // also hold PE2 to PE6 on the alternate function carrying the
+        // converter clocks.
         let _ = rcc.ahb4enr().read().gpioeen().bit_is_set();
         let gpioe = GPIOE::steal();
         let _ = gpioe.moder().read().bits();
