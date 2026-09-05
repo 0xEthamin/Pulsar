@@ -7,9 +7,10 @@
 //! It touches no port pin. XSMT stays where the pull-down on it leaves it,
 //! whichever way a bring-up ends.
 //!
-//! The audio interface is not enabled here and PE2 to PE6 are not configured,
-//! so the kernel clock a run starts reaches no pin. That holds whichever way
-//! the run ends, and a refusal can leave the PLL running.
+//! What carries this clock to a pin is the output transport, which enables the
+//! audio interface and puts PE2 to PE6 on their alternate function. It runs
+//! only on the witness returned here, so a run that ends in a refusal leaves
+//! the kernel clock reaching nothing, even though the PLL can be left going.
 
 use pulsar_lib::clock::
 {
@@ -68,22 +69,29 @@ const _: () = assert!
 pub(crate) struct AudioClock
 {
     /// The plan the read-back was compared against.
-    #[expect
-    (
-        dead_code,
-        reason = "the witness carries the plan for a stage that reads its \
-                  dividers off it, and nothing in this binary reads it"
-    )]
     plan: ClockPlan,
 }
 
-/// The clock tree of the part, seen through its register block.
-struct Tree
+impl AudioClock
 {
-    rcc: RCC,
+    /// Returns the plan the read-back was compared against.
+    ///
+    /// The output transport takes its frame length and its master clock
+    /// divider off this, so the interface writes the chain that was validated
+    /// rather than a second copy of the same figures.
+    pub(crate) const fn plan(&self) -> ClockPlan
+    {
+        self.plan
+    }
 }
 
-impl ClockTree for Tree
+/// The clock tree of the part, seen through its register block.
+struct Tree<'a>
+{
+    rcc: &'a RCC,
+}
+
+impl ClockTree for Tree<'_>
 {
     fn stop_pll(&mut self)
     {
@@ -196,15 +204,16 @@ impl ClockTree for Tree
 /// `core_clock_hz` sizes the two waits, and naming a clock above the one the
 /// core runs at only lengthens them.
 ///
-/// The interface clock and the pins it drives are not touched here, so a
-/// kernel clock on its own reaches no converter.
+/// The interface clock and the pins it drives are not touched here, so this
+/// leaves the kernel clock ending inside the part.
 ///
 /// # Errors
 ///
 /// Every variant of `ClockFault`. A refusal reached after the PLL started
-/// leaves it running, and nothing carries its output to a pin either way, so
-/// a caller that answers a refusal by staying silent is silent.
-pub(crate) fn start(rcc: RCC, core_clock_hz: u32) -> Result<AudioClock, ClockFault>
+/// leaves it running, and it builds no witness, so the stage that would carry
+/// the output to a pin cannot be reached and a caller that answers a refusal
+/// by staying silent is silent.
+pub(crate) fn start(rcc: &RCC, core_clock_hz: u32) -> Result<AudioClock, ClockFault>
 {
     let mut tree = Tree { rcc };
 
