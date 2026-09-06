@@ -743,9 +743,11 @@ fn fill_buffer(buffer: *mut [u32; BUFFER_WORDS])
 ///
 /// # Errors
 ///
-/// Every variant of `TransportFault`. A refusal reached after the interface
-/// started leaves the clocks running, which is what the converter mute sequence
-/// needs, and the caller answers by staying silent.
+/// A `TransportFault` naming where the bring-up refused, the sequence, the
+/// plan, one of the two sub-blocks or one of the two streams, and what that
+/// place refused with. A refusal reached after the interface started leaves the
+/// clocks running, which is what the converter mute sequence needs, and the
+/// caller answers by staying silent.
 pub(crate) fn start
 (
     clock: &AudioClock,

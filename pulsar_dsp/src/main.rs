@@ -43,17 +43,26 @@
 //! 10 k pull-down on it holds the converters muted through all of this.
 //!
 //! Whichever path does reach the mute then latches the active exception number,
-//! the fault status registers and the clock fault code into `FAULT_RECORD`,
-//! between the mute and the park. The module documentation of
-//! `pulsar_lib::postmortem` carries the offset by offset layout to read at that
-//! symbol. Nothing in this binary reads the record back, and no fault reaches
-//! the control link, so a probe on SWD is the only reader.
+//! the fault status registers and the refusal code into `FAULT_RECORD`, between
+//! the mute and the park. The module documentation of `pulsar_lib::postmortem`
+//! carries the offset by offset layout to read at that symbol. Nothing in this
+//! binary reads the record back, and no fault reaches the control link, so a
+//! probe on SWD is the only reader.
+//!
+//! Those two fields say between them how a parked board got there. Every arm of
+//! `main` that parks writes a refusal code first, and each of them names one
+//! guard, one clock refusal or one transport refusal. A vector writes none and
+//! is named by its exception number instead. The one entry that would set
+//! neither is the panic handler, which runs in thread mode and refuses nothing,
+//! and the compiler emits it only once something in the image can panic. While
+//! nothing can, no path of this binary seals a record with zero in both fields,
+//! so one that holds both came off a different image than the one on the bench.
 //!
 //! Every path here parks in `wfi`, which is Sleep, and Sleep stops the
 //! processor clock unless `DBGMCU_CR.DBGSLEEP_D1` is set. `main` sets it ahead
 //! of everything else, so a parked core keeps answering the debug port. Without
-//! that bit the record, the thirty-four clock fault codes it can carry and the
-//! two guards that tell it from stale memory have no reader at all.
+//! that bit the record, the refusal code it carries and the two guards that
+//! tell it from stale memory have no reader at all.
 
 #![no_std]
 #![no_main]
@@ -72,7 +81,7 @@ use cortex_m::peripheral::scb::Exception;
 use cortex_m::peripheral::{AC, SCB};
 use cortex_m_rt::{entry, exception};
 use pulsar_lib::constants::{BOOT_CORE_CLOCK_HZ, MAX_CORE_CLOCK_HZ, mute_hold_iterations};
-use pulsar_lib::postmortem::{FaultRecord, FaultRegisters};
+use pulsar_lib::postmortem::{self, FaultRecord, FaultRegisters, StartupFault};
 use stm32h7::stm32h743v as device;
 use stm32h7::stm32h743v::{GPIOE, RCC};
 
@@ -107,23 +116,29 @@ const DBGSLEEP_D1: u32 = 1;
 /// thread mode.
 const VECTACTIVE_MASK: u32 = 0x1FF;
 
-/// Clock fault code a fault path that no clock bring-up refused carries.
+/// Refusal code a fault path no arm of `main` reached carries.
 ///
-/// `ClockFault::code` numbers no fault zero, so the record tells the two apart.
-const NO_CLOCK_FAULT: u32 = 0;
+/// Every domain of the encoding is numbered from 1, so a zero word says no arm
+/// of `main` wrote one and the path was entered from somewhere else.
+const NO_REFUSAL: u32 = 0;
 
-/// Clock fault code the fault path latches into the record.
+/// Refusal code the fault path latches into the record.
 ///
-/// A refused clock raises no exception, so it is the one cause `ICSR` cannot
+/// A refused start-up raises no exception, so it is the one cause `ICSR` cannot
 /// carry. It travels here rather than in an argument, which leaves
 /// `silence_and_park` with a signature a forwarding frame folds into its
 /// caller, and keeps the mute store the first memory access of every vector.
 ///
+/// One word carries every arm of `main`. The arms run one after another and
+/// each parks, so no two can write it. The domain field of the word says which
+/// stage refused, and the three guards below share one domain, so under it the
+/// cause byte is what says which guard.
+///
 /// The startup zero fill covers `.bss`, so the value out of reset is
-/// `NO_CLOCK_FAULT` and only the one arm of `main` that answers a refused clock
-/// writes it. `.bss` sits above STACK, where an overflowing stack does not
-/// reach, so the fault path reads it back on that route as well.
-static CLOCK_FAULT: AtomicU32 = AtomicU32::new(NO_CLOCK_FAULT);
+/// `NO_REFUSAL` and only the arms of `main` that park write it. `.bss` sits
+/// above STACK, where an overflowing stack does not reach, so the fault path
+/// reads it back on that route as well.
+static REFUSAL: AtomicU32 = AtomicU32::new(NO_REFUSAL);
 
 const _: () = assert!
 (
@@ -162,8 +177,8 @@ static mut FAULT_RECORD: MaybeUninit<FaultRecord> = MaybeUninit::uninit();
 /// `wfi` is Sleep, and Sleep stops the processor clock while the bit is clear,
 /// which is what a power on reset leaves it at. Every path of this binary ends
 /// parked in `wfi`, and a probe is the only reader `FAULT_RECORD` has, so this
-/// bit is what carries the record, its clock fault code and its two guards off
-/// the board.
+/// bit is what carries the record, its refusal code and its two guards off the
+/// board.
 ///
 /// The other bits of the register are carried over rather than cleared. RM0433
 /// section 60.5.8 exempts this block from the system reset, so a debugger
@@ -197,20 +212,27 @@ fn keep_core_visible_in_sleep()
 /// park, so none of them takes the core off the debug port.
 ///
 /// PM0253 section 2.5.2 escalates a fault to `HardFault` when the handler for
-/// that fault is disabled, and exempts the stack push that enters an enabled
-/// `BusFault` handler from escalation. Arming `SHCSR.BUSFAULTENA` is what lets
-/// a faulted stack push reach a vector at all. It goes up before the clock, so
-/// a fault in the bring-up reaches a vector rather than lockup.
+/// that fault is disabled, and both vectors of this binary mute, so a bus error
+/// reaches the mute armed or not. What arming `SHCSR.BUSFAULTENA` buys is the
+/// escalation left over the handler that runs. The same section exempts the
+/// stack push that enters an enabled `BusFault` handler from escalation and
+/// sends a fault raised inside that handler on to `HardFault`, which mutes as
+/// well, while section 2.5.5 locks the core up on a fault taken inside the
+/// `HardFault` handler. So the mute gets two attempts armed and one disabled.
+/// It goes up before the clock, so the bring-up runs with the second one in
+/// place.
 ///
 /// Every arm below ends in silence, because no state of this binary means "the
 /// guard is absent" or "the clock is close enough". The waits are sized for the
 /// clock the part boots on, which is the one this function runs at, since
 /// nothing here moves the system clock off the internal oscillator.
 ///
-/// A refused clock is the one arm that names its cause. It writes the
-/// `ClockFault` code to `CLOCK_FAULT` before it enters the fault path, so a
-/// board that parks silent on the bench says which of the thirty-four refusals
-/// it hit rather than only that it refused.
+/// Every arm below names its cause. Each writes its code to `REFUSAL` before it
+/// enters the fault path, so a board that parks silent on the bench says which
+/// stage refused and what it refused on, rather than only that it refused. The
+/// three guards here carry a domain of their own, because a handle that comes
+/// back taken and a `BUSFAULTENA` that does not read back armed leave the same
+/// registers behind as a panic does.
 ///
 /// The transport takes the witness the clock bring-up returns by reference,
 /// which is what leaves the start order to the compiler: RM0433 requires the
@@ -221,10 +243,11 @@ fn keep_core_visible_in_sleep()
 /// and the two data lines on the header. It configures PE2 to PE6 and leaves
 /// PE7 alone, so the converter mute keeps the pull-down that holds it.
 ///
-/// A refused transport carries no code into the record. `FAULT_RECORD` names
-/// one clock fault and a refusal here is not one, and the interface and stream
-/// registers a refusal leaves behind say more than a code would: they are read
-/// over the debug port, in place, by the probe that measures the frame.
+/// A refused transport names where it refused, the bring-up sequence, the plan,
+/// one of the two sub-blocks or one of the two streams, and what that place
+/// refused with. The registers it leaves behind say more still, and a probe
+/// reads them in place, but only once a person knows a stage refused and which
+/// one.
 #[entry]
 fn main() -> !
 {
@@ -233,6 +256,11 @@ fn main() -> !
     let Some(mut core) = Peripherals::take()
     else
     {
+        REFUSAL.store
+        (
+            postmortem::startup_refusal(StartupFault::CoreHandleTaken),
+            Ordering::Relaxed
+        );
         silence_and_park()
     };
 
@@ -240,12 +268,22 @@ fn main() -> !
 
     if !core.SCB.is_enabled(Exception::BusFault)
     {
+        REFUSAL.store
+        (
+            postmortem::startup_refusal(StartupFault::BusFaultNotArmed),
+            Ordering::Relaxed
+        );
         silence_and_park()
     }
 
     let Some(part) = device::Peripherals::take()
     else
     {
+        REFUSAL.store
+        (
+            postmortem::startup_refusal(StartupFault::DeviceHandleTaken),
+            Ordering::Relaxed
+        );
         silence_and_park()
     };
 
@@ -254,7 +292,7 @@ fn main() -> !
         Ok(witness) => witness,
         Err(fault) =>
         {
-            CLOCK_FAULT.store(fault.code(), Ordering::Relaxed);
+            REFUSAL.store(postmortem::clock_refusal(fault), Ordering::Relaxed);
             silence_and_park()
         }
     };
@@ -270,8 +308,9 @@ fn main() -> !
         BOOT_CORE_CLOCK_HZ
     );
 
-    if transport.is_err()
+    if let Err(fault) = transport
     {
+        REFUSAL.store(postmortem::transport_refusal(fault), Ordering::Relaxed);
         silence_and_park()
     }
 
@@ -320,12 +359,12 @@ fn main() -> !
 /// no frame leaves the board after a fault, and `FAULT_RECORD` is read by a
 /// probe alone.
 ///
-/// `CLOCK_FAULT` is the one cause `ICSR` cannot carry, since a refused clock
-/// raises no exception. This routine takes no argument, which is what lets the
-/// compiler fold a forwarding handler into the trampoline above it and leaves
-/// one frame push on each side of the vector rather than two. The code is read
-/// from `.bss` here, after the mute store, so the mute stays the first memory
-/// access of the path.
+/// `REFUSAL` is the one cause `ICSR` cannot carry, since a refused start-up
+/// raises no exception. This routine takes no argument, which is what
+/// lets the compiler fold a forwarding handler into the trampoline above it and
+/// leaves one frame push on each side of the vector rather than two. The code
+/// is read from `.bss` here, after the mute store, so the mute stays the first
+/// memory access of the path.
 ///
 /// The record goes down one word at a time, so the fault path builds no copy of
 /// it on the stack. The magic lands first and the checksum last, which leaves
@@ -416,7 +455,7 @@ fn silence_and_park() -> !
         };
 
         let slot = (&raw mut FAULT_RECORD).cast::<u32>();
-        let record = FaultRecord::new(&registers, CLOCK_FAULT.load(Ordering::Relaxed))
+        let record = FaultRecord::new(&registers, REFUSAL.load(Ordering::Relaxed))
             .to_words();
 
         for (index, word) in record.into_iter().enumerate()

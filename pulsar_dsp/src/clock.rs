@@ -209,10 +209,12 @@ impl ClockTree for Tree<'_>
 ///
 /// # Errors
 ///
-/// Every variant of `ClockFault`. A refusal reached after the PLL started
-/// leaves it running, and it builds no witness, so the stage that would carry
-/// the output to a pin cannot be reached and a caller that answers a refusal
-/// by staying silent is silent.
+/// `PlanRejected` when the plan is one the part does not accept, `PartRefused`
+/// when the tree did not come up to a plan it does, each carrying the bound or
+/// the field that refused. A refusal reached after the PLL started leaves it
+/// running, and it builds no witness, so the stage that would carry the output
+/// to a pin cannot be reached and a caller that answers a refusal by staying
+/// silent is silent.
 pub(crate) fn start(rcc: &RCC, core_clock_hz: u32) -> Result<AudioClock, ClockFault>
 {
     let mut tree = Tree { rcc };
