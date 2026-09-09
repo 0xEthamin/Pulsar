@@ -52,12 +52,42 @@
 # zero-init-ram feature of cortex-m-rt, which swaps the bounds of that loop for
 # _ram_start and _ram_end and so walks over the record.
 #
+# Which loop that is has to be read, not assumed, and two different readings
+# separate it from the two other loops cortex-m-rt can emit ahead of main.
+#
+# The SHAPE separates it from the .data copy. Both walk a pointer up to a limit
+# and store through a post-incrementing stm, but the copy loads each word first,
+# so its body is ldm then stm and the loop runs five instructions where the zero
+# fill runs four. The copy is refused on that count before any value is read,
+# and taking the first loop of the shape, which is what position does, is what
+# reads the copy as the zero fill the day the two are emitted the other way
+# round.
+#
+# The VALUE separates it from paint-stack, which is the only other four
+# instruction loop of that shape and the only place the shape alone decides
+# nothing. It stores 0xcccccccc where the zero fill stores 0, so the loop is
+# picked by the value its store carries.
+#
+# Reading that value has three outcomes and not two. A value read as something
+# other than zero paints memory rather than clearing it, and putting that loop
+# aside is a reading. A value the walk cannot read is not a reading, and putting
+# that loop aside would rule out a loop whose bounds this gate has never seen,
+# so it turns the claim red. Two loops carrying zero, or none, turn it red the
+# same way. Nothing here falls back on position.
+#
 # Claim 5 fails when the nine stores stop being nine separate word stores made
 # in rising offset order. Dropping the volatile qualifier does exactly that: the
 # compiler then merges neighbouring words into strd pairs and reorders them,
 # which costs the property the order carries, that the magic lands first and the
 # checksum last so an interrupted write fails validation rather than reading as
 # a record.
+#
+# Rising line numbers are the order the compiler emitted those stores in, not
+# the order they run, and the two agree only on a straight line. So the run from
+# the completed record address to the last store is required to be one: every
+# instruction in it hands control to the next, and none of them is entered from
+# elsewhere. Without that, a store the routine reaches by a branch, or skips by
+# one, reads here as a store it always makes.
 #
 # Claim 5 reads a shape, and three things it does not read are worth naming. It
 # cannot see a volatile qualifier, so it catches the code shape a lost one
@@ -90,9 +120,51 @@
 # reads the store backwards over the instructions that build the stored
 # register. A movw, a mov or a movs ends that walk with a value, a movt or a two
 # operand add carries it on, and anything else naming the register ends the walk
-# with nothing. So a word this claim reports was built by the instructions
-# between it and its store, and an arm whose word it cannot read is counted as
-# unread rather than guessed at.
+# with nothing.
+#
+# That walk stops at every control flow boundary rather than reading through
+# one, and the two boundaries stop it for two different reasons. A call DESTROYS
+# the value: AAPCS leaves r0 to r3, ip and lr unpreserved across one, so after a
+# bl the register holds what the callee returned and not what a move ahead of it
+# put there, and the bl names none of the six. A branch makes the path
+# UNCERTAIN: what stands textually ahead of one is not what ran ahead of it.
+#
+# So what the walk may cross is a whitelist, WALKABLE_INSTRUCTION, of forms that
+# fall through to the next instruction and write no general register they do not
+# name. Several of them write the condition flags without naming them, which is
+# outside what any walk here tracks: a walk follows one general register from a
+# store back to the instruction that built it, and no claim reads a flag.
+# A list of call and branch mnemonics to refuse cannot be finished, and this one
+# would have to hold bl, blx, b, bx, cbz, cbnz, tbb, tbh and every conditional
+# branch of the fifteen condition codes at two widths. A mnemonic missing from a
+# whitelist ends a walk with nothing and turns this claim red, and a mnemonic
+# missing from a blacklist is crossed in silence.
+#
+# A block boundary is neither an instruction nor a mnemonic, and llvm-objdump
+# marks none in the stream, so the walk reads the boundaries off the operands:
+# every address the function names is taken as a place control can arrive at,
+# and the walk refuses to move past one. That names more addresses than the
+# branches alone do, which ends a walk early rather than letting one through.
+#
+# Where a walk may BEGIN is a separate question from what it may cross, and each
+# caller answers it. Refusing to move past a boundary says nothing about the
+# instruction the walk starts on, so a start that is itself entered from
+# elsewhere is reached on a path the walk never read, and the value it resolves
+# belongs to whichever predecessor happens to sit above. Claim 6 starts on the
+# store of an arm and requires that nothing names it. Claim 4 starts on the
+# compare of a loop, which its own back branch always names, so it counts the
+# namers and requires exactly one. Neither is a stronger reading than the other,
+# they are the same reading of two different shapes.
+#
+# Claims 4 and 5 read the same way, over their own function: one walk finds the
+# loop bounds of the startup zero fill and the zero it stores, the other
+# requires the record stores to stand on one line. Three claims of this gate
+# therefore rest on one reading of what a line of disassembly lets a reader
+# assume about the line above it, and it is written once.
+#
+# So a word this claim reports was built by the instructions between it and its
+# store, on the one path that reaches that store, and an arm whose word it
+# cannot read is counted as unread rather than guessed at.
 #
 # Where that store lands is read apart from the walk. The base register has to
 # be one the entry function loads with a single address, and that address plus
@@ -184,8 +256,31 @@ COMPUTED_REFUSALS=(
 # Instructions a frame may run ahead of the mute store, or ahead of the call
 # that reaches it: the frame push, a register move, an immediate constant, a
 # call. Anything else fails the gate, whatever it does, which is what makes the
-# check complete where a list of memory access mnemonics to refuse never is.
+# REFUSAL complete where a list of memory access mnemonics to refuse never is.
+# What the list admits is not read that far. A call is on it, and only the call
+# an entry frame makes is followed, so a bl standing in the routine that carries
+# the mute, ahead of its store, passes here with its callee unread.
 BARE_INSTRUCTION='^(push \{[^}]*\}|movs?(w|t|\.w)? [^,]+, [^,]+|bl 0x[0-9a-f]+( <[^>]*>)?|nop)$'
+
+# Instructions the backward walk of park_arms may cross. Every form here writes
+# only the registers it names and falls through to the one after it, so crossing
+# one leaves the register a store reads untouched and the path straight. A
+# whitelist for the same reason BARE_INSTRUCTION is one: a mnemonic missing here
+# ends a walk with nothing and turns claim 6 red, where a mnemonic missing from
+# a list of calls and branches to refuse is crossed in silence.
+WALK_MNEMONIC='movw|movt|mov|mvn|addw|add|adc|subw|sub|sbc|rsb'
+WALK_MNEMONIC="$WALK_MNEMONIC|and|orn|orr|eor|bic|lsl|lsr|asr|ror"
+WALK_MNEMONIC="$WALK_MNEMONIC|cmp|cmn|tst|teq|clz|rev16|revsh|rev"
+WALK_MNEMONIC="$WALK_MNEMONIC|uxtb|uxth|sxtb|sxth|ubfx|sbfx|bfi|bfc"
+WALK_MNEMONIC="$WALK_MNEMONIC|mul|mla|mls|umull|smull|udiv|sdiv"
+WALK_MNEMONIC="$WALK_MNEMONIC|ldrsb|ldrsh|ldrb|ldrh|ldrd|ldr"
+WALK_MNEMONIC="$WALK_MNEMONIC|strb|strh|strd|str|mrs|msr"
+
+# Condition codes the assembler writes between a mnemonic and its width suffix.
+# A conditional data processing form still writes only what it names.
+WALK_CONDITION='(eq|ne|cs|hs|cc|lo|mi|pl|vs|vc|hi|ls|ge|lt|gt|le)?'
+
+WALKABLE_INSTRUCTION="^(($WALK_MNEMONIC)s?$WALK_CONDITION(\\.w)? |nop\$)"
 
 # The one memory access exempt from that list. PM0253 section 4.3.3 puts ICSR
 # at 0xE000ED04, and the trampoline cortex-m-rt places in front of the default
@@ -280,16 +375,273 @@ annotated_body()
     ' <<< "$disasm"
 }
 
+# Reads one annotated function body into the four forms the backward walk needs.
+# WALK_INSN holds the instruction of each line, WALK_NOTE the objdump annotation
+# behind it, WALK_SPOT its load address, and WALK_ENTERED how many times the
+# function names each address in an operand.
+#
+# A block boundary is neither an instruction nor a mnemonic, and llvm-objdump
+# marks none in the stream, so WALK_ENTERED is what stands in for one: every
+# address the function names is taken as a place control can arrive at. That
+# names more addresses than the branches alone do, which ends a walk early
+# rather than letting one through.
+#
+# It is a count and not a set because one namer and two are different answers
+# where the walk starts on a branch target on purpose. A loop header is named by
+# its own back branch, so asking whether it is named at all says nothing there,
+# and asking how many name it says whether anything else reaches it.
+read_walk()
+{
+    local -a raw
+    local index line key
+
+    unset WALK_INSN WALK_NOTE WALK_SPOT WALK_ENTERED
+    declare -ga WALK_INSN WALK_NOTE WALK_SPOT
+    declare -gA WALK_ENTERED
+
+    mapfile -t raw <<< "$1"
+
+    for index in "${!raw[@]}"
+    do
+        line="${raw[index]}"
+        printf -v key '%x' "$((16#${line%%:*}))"
+        WALK_SPOT[index]="$key"
+        line="${line#* }"
+        WALK_INSN[index]="${line%% @ *}"
+        WALK_NOTE[index]=""
+        if [[ "$line" == *" @ "* ]]
+        then
+            WALK_NOTE[index]="${line#* @ }"
+        fi
+    done
+
+    for index in "${!WALK_INSN[@]}"
+    do
+        line="${WALK_INSN[index]}"
+        while [[ "$line" =~ 0x[0-9a-f]+ ]]
+        do
+            printf -v key '%x' "$((BASH_REMATCH[0]))"
+            WALK_ENTERED["$key"]=$((${WALK_ENTERED["$key"]-0} + 1))
+            line="${line#*"${BASH_REMATCH[0]}"}"
+        done
+    done
+}
+
+# Succeeds when the instruction at one index hands control to the one after it
+# and writes no general register it does not name. That is the whole of what a
+# reader of this disassembly may assume about a line it did not stop on, and the
+# two halves of it fail for two different reasons. The condition flags are
+# outside it: several whitelisted forms write them without naming them, and no
+# walk here follows anything but one general register.
+#
+# A call DESTROYS a value: AAPCS leaves r0 to r3, ip and lr unpreserved across
+# one, so after a bl a register holds what the callee returned and not what a
+# move ahead of it put there, and the bl names none of the six. A branch makes
+# the path UNCERTAIN: what stands textually ahead of one is not what ran ahead
+# of it.
+#
+# So the form has to be on the WALKABLE_INSTRUCTION whitelist. One thing that
+# list alone lets through is a write to pc, which is a branch wearing an
+# ordinary mnemonic, so a destination of pc is refused on its own.
+falls_through()
+{
+    [[ "${WALK_INSN[$1]-}" =~ $WALKABLE_INSTRUCTION ]] \
+        && [[ ! "${WALK_INSN[$1]-}" =~ ^[a-z0-9.]+\ pc(,|$) ]]
+}
+
+# Succeeds when the function names the address of the instruction at one index,
+# which is where control can arrive from somewhere other than the line above it.
+enters_here()
+{
+    [ -n "${WALK_ENTERED[${WALK_SPOT[$1]-}]-}" ]
+}
+
+# Prints the index of the last instruction ahead of one index that names one
+# register, or nothing when a control flow boundary stands in the way first.
+# read_walk fills the arrays it reads.
+walk_back_to()
+{
+    local src=$1
+    local at=$(($2 - 1))
+    local padded
+
+    while [ "$at" -ge 0 ]
+    do
+        padded=" ${WALK_INSN[at]//[,\[\]\{\}]/ } "
+
+        if [[ "$padded" == *" $src "* ]]
+        then
+            printf '%s' "$at"
+            return 0
+        fi
+
+        if ! falls_through "$at" || enters_here "$at"
+        then
+            return 1
+        fi
+
+        at=$((at - 1))
+    done
+
+    return 1
+}
+
+# Succeeds when control reaches the instruction at the second index from the one
+# at the first without leaving the straight line: everything between them hands
+# control on, and nothing past the first is entered from elsewhere.
+straight_line()
+{
+    local at
+
+    for ((at = $1; at < $2; at++))
+    do
+        if ! falls_through "$at" || enters_here "$((at + 1))"
+        then
+            return 1
+        fi
+    done
+}
+
+# Prints the immediate one register holds where the instruction at one index
+# runs, or nothing when the walk cannot read it.
+#
+# A movw, a mov or a movs ends the walk with a value, a movt or a two operand
+# add carries it on, and anything else naming the register ends it with nothing.
+# So a value printed here was built by the instructions between it and that
+# index, on the one path that reaches it, and by nothing else.
+walk_immediate()
+{
+    local src=$1
+    local at=$2
+    local -a chain
+    local line value step part
+
+    chain=()
+
+    while at="$(walk_back_to "$src" "$at")"
+    do
+        line="${WALK_INSN[at]}"
+
+        if [[ "$line" =~ ^(movw|movs|mov|mov\.w)\ $src,\ \#(0x[0-9a-f]+)$ ]]
+        then
+            value=$((${BASH_REMATCH[2]}))
+
+            for step in ${chain[@]+"${chain[@]}"}
+            do
+                if [[ "$step" =~ ^movt\ $src,\ \#(0x[0-9a-f]+)$ ]]
+                then
+                    part=$((${BASH_REMATCH[1]}))
+                    value=$(((value & 0xFFFF) | (part << 16)))
+                elif [[ "$step" =~ ^adds?\ $src,\ \#(0x[0-9a-f]+)$ ]]
+                then
+                    part=$((${BASH_REMATCH[1]}))
+                    value=$((value + part))
+                fi
+            done
+
+            printf '%08x' "$value"
+            return 0
+        fi
+
+        if [[ ! "$line" =~ ^(movt|adds?)\ $src,\ \#(0x[0-9a-f]+)$ ]] \
+            || [ -n "${WALK_ENTERED[${WALK_SPOT[at]}]-}" ]
+        then
+            return 1
+        fi
+
+        chain=("$line" ${chain[@]+"${chain[@]}"})
+    done
+
+    return 1
+}
+
+# Prints the pointer, the limit and the stored register of the cortex-m-rt
+# startup loop whose compare stands at one index, or nothing when no loop stands
+# there.
+#
+# The four instructions are required in order and both branch targets have to
+# close the loop, so the whole body is read rather than sampled: the compare,
+# the exit branch over the store, the store, and the branch back to the compare.
+# That pins the three registers, and it proves the body writes neither the limit
+# nor the stored register.
+#
+# The shape is all this reads. Whether the compare is reached from anywhere but
+# the line above it is the caller's question, because the two answers to it are
+# not the two answers to this one: a shape that does not match means no loop
+# stands here, and a loop whose header something else names is a loop that
+# stands here and cannot be read. Answering both with the same silence is what
+# lets one of them disappear.
+startup_loop()
+{
+    local at=$1
+    local pointer limit stored exit_at back_at
+
+    if [[ ! "${WALK_INSN[at + 2]-}" =~ ^stm\ (r[0-9]+)!,\ \{(r[0-9]+)\}$ ]] \
+        || [ -z "${WALK_SPOT[at + 4]-}" ]
+    then
+        return 1
+    fi
+    pointer="${BASH_REMATCH[1]}"
+    stored="${BASH_REMATCH[2]}"
+
+    # The compare is symmetric, so either operand may be the pointer.
+    if [[ "${WALK_INSN[at]-}" =~ ^cmp\ (r[0-9]+),\ ${pointer}$ ]] \
+        || [[ "${WALK_INSN[at]-}" =~ ^cmp\ ${pointer},\ (r[0-9]+)$ ]]
+    then
+        limit="${BASH_REMATCH[1]}"
+    else
+        return 1
+    fi
+
+    if [[ ! "${WALK_INSN[at + 1]-}" =~ ^beq(\.w)?\ 0x([0-9a-f]+)( |$) ]]
+    then
+        return 1
+    fi
+    printf -v exit_at '%x' "$((16#${BASH_REMATCH[2]}))"
+
+    if [[ ! "${WALK_INSN[at + 3]-}" =~ ^b(\.w)?\ 0x([0-9a-f]+)( |$) ]]
+    then
+        return 1
+    fi
+    printf -v back_at '%x' "$((16#${BASH_REMATCH[2]}))"
+
+    if [ "$exit_at" != "${WALK_SPOT[at + 4]}" ] \
+        || [ "$back_at" != "${WALK_SPOT[at]}" ]
+    then
+        return 1
+    fi
+
+    printf '%s %s %s' "$pointer" "$limit" "$stored"
+}
+
 # Prints the low and the high bound of the startup zero fill, read out of the
-# loop that performs it. cortex-m-rt writes that loop as a pointer register
-# walking up to a limit register, both loaded from the literal pool, and the
-# store is the only post-incrementing stm in the reset handler. Which symbols
-# the two literals came from does not matter here, and must not: the bounds move
-# with the build, and a value compared by name matches whatever else happens to
-# share it.
+# loop that performs it.
+#
+# The zero fill is not simply the first loop a search finds, and two readings
+# separate it from the other loops cortex-m-rt emits ahead of main. startup_loop
+# takes the shape: the .data copy loads each word before storing it, so it runs
+# five instructions where this loop runs four, and it is refused on that count.
+# The value the store carries takes the rest: paint-stack wears the same four
+# instruction shape and stores 0xcccccccc, where the zero fill stores 0.
+#
+# The classification fails closed on every uncertainty. No loop carrying zero,
+# two carrying it, or one of the shape whose stored value the walk cannot read
+# at all, and this comes back with nothing so claim 4 turns red and a person
+# reads it. It never falls back on position. The unreadable case is the one that
+# costs a build: paint-stack materialises its value with an ldr of a literal,
+# which the assembler renders as a move only while 0xcccccccc stays an encodable
+# immediate, so turning that feature on can turn this claim red rather than let
+# it pick between two loops it has not both read.
+#
+# Which symbols the two literals came from does not matter here, and must not:
+# the bounds move with the build, and a value compared by name matches whatever
+# else happens to share it.
 zero_fill_bounds()
 {
-    local reset lines found at pointer limit lo_at hi_at lo hi
+    local reset lines index registers found
+    local at pointer limit stored painted lo_at hi_at lo hi
+    # objdump names the literal a pc relative load reads in its annotation.
+    local pool='\[pc,\ \#0x[0-9a-f]+\]$'
 
     reset="$(sym_addr Reset)"
     if [ -z "$reset" ]
@@ -297,36 +649,83 @@ zero_fill_bounds()
         return 1
     fi
     lines="$(annotated_body "$reset")"
+    if [ -z "$lines" ]
+    then
+        return 1
+    fi
+    read_walk "$lines"
 
-    found="$(grep -nE ' stm r[0-9]+!, \{r[0-9]+\}$' <<< "$lines" | head -1)"
+    found=""
+    for index in "${!WALK_INSN[@]}"
+    do
+        if ! registers="$(startup_loop "$index")"
+        then
+            continue
+        fi
+        read -r pointer limit stored <<< "$registers"
+
+        # The walk below starts on this compare, which its own back branch
+        # names, so one namer is what says no other block reaches it and the
+        # setup on the line above is what every pass sees. A second namer is a
+        # loop of the shape this walk cannot read, not a loop of another kind,
+        # so it ends the classification here rather than dropping out of the
+        # count the way a painting loop does.
+        if [ "${WALK_ENTERED[${WALK_SPOT[index]}]-0}" -ne 1 ]
+        then
+            return 1
+        fi
+
+        # The setup reaches the compare in a straight line, so what it leaves in
+        # the stored register is what the first pass of the loop stores, and the
+        # loop body writes that register on no pass.
+        #
+        # Three outcomes, not two. A loop that stores a value this walk reads as
+        # something other than zero paints memory rather than clearing it, and
+        # dropping it is a reading. A loop whose value the walk cannot read at
+        # all is not a reading, and dropping it would rule out a loop this gate
+        # has never seen the bounds of, so it ends the classification instead.
+        if ! painted="$(walk_immediate "$stored" "$index")"
+        then
+            return 1
+        fi
+
+        if [ "$painted" != "00000000" ]
+        then
+            continue
+        fi
+
+        if [ -n "$found" ]
+        then
+            return 1
+        fi
+        found="$index $pointer $limit"
+    done
+
     if [ -z "$found" ]
     then
         return 1
     fi
-    at="${found%%:*}"
-    pointer="$(sed -nE 's/^.* stm (r[0-9]+)!, \{r[0-9]+\}$/\1/p' \
-        <<< "${found#*:}")"
+    read -r index pointer limit <<< "$found"
 
-    lines="$(sed -n "1,${at}p" <<< "$lines")"
-
-    # The loop exits when the limit register meets the pointer register.
-    limit="$(sed -nE "s/^.* cmp (r[0-9]+), ${pointer}\$/\1/p" <<< "$lines" \
-        | tail -1)"
-    if [ -z "$limit" ]
+    # Both bounds come from the literal pool, and objdump names the entry each
+    # load reads. The loads are found by the same walk, so a bound built on a
+    # path this gate has not read is refused rather than resolved.
+    if ! at="$(walk_back_to "$pointer" "$index")" \
+        || [[ ! "${WALK_INSN[at]}" =~ ^ldr\ ${pointer},\ $pool ]] \
+        || [[ ! "${WALK_NOTE[at]}" =~ ^0x([0-9a-f]+) ]]
     then
         return 1
     fi
+    lo_at="${BASH_REMATCH[1]}"
 
-    lo_at="$(sed -nE "s/^.* ldr ${pointer}, \[pc, #0x[0-9a-f]+\] @ 0x([0-9a-f]+) .*\$/\1/p" \
-        <<< "$lines" | tail -1)"
-    hi_at="$(sed -nE "s/^.* ldr ${limit}, \[pc, #0x[0-9a-f]+\] @ 0x([0-9a-f]+) .*\$/\1/p" \
-        <<< "$lines" | tail -1)"
-    if [ -z "$lo_at" ] || [ -z "$hi_at" ]
+    if ! at="$(walk_back_to "$limit" "$index")" \
+        || [[ ! "${WALK_INSN[at]}" =~ ^ldr\ ${limit},\ $pool ]] \
+        || [[ ! "${WALK_NOTE[at]}" =~ ^0x([0-9a-f]+) ]]
     then
         return 1
     fi
+    hi_at="${BASH_REMATCH[1]}"
 
-    lines="$(annotated_body "$reset")"
     lo="$(sed -nE "s/^${lo_at}: \.word 0x([0-9a-f]+)\$/\1/p" <<< "$lines")"
     hi="$(sed -nE "s/^${hi_at}: \.word 0x([0-9a-f]+)\$/\1/p" <<< "$lines")"
     if [ -z "$lo" ] || [ -z "$hi" ]
@@ -374,7 +773,10 @@ first_foreign()
     grep -nvE "$BARE_INSTRUCTION" <<< "$1" | head -1 | cut -d: -f1
 }
 
-# Prints the instructions that carry the mute for the handler at one address.
+# Prints the instructions that carry the mute for the handler at one address,
+# through the body printer named as the first argument. Which frame carries the
+# mute is decided on the plain body either way, so the two printers always land
+# on the same frame.
 #
 # The entry frame is read first, and it is read, not skipped: everything it runs
 # up to its call has to be bare, so a handler that reaches memory on its way
@@ -389,8 +791,8 @@ first_foreign()
 # branch, which is the safe way round: the gate goes red and the path gets read.
 mute_body()
 {
-    local addr=$1
-    local lines call_at callee
+    local printer=$1 addr=$2
+    local lines call_at callee carrier
 
     lines="$(body "$addr")"
     if [ -z "$lines" ]
@@ -399,6 +801,7 @@ mute_body()
         return 1
     fi
 
+    carrier="$addr"
     call_at="$(grep -nE '^bl 0x[0-9a-f]+' <<< "$lines" | head -1 | cut -d: -f1)"
 
     if [ -n "$call_at" ] \
@@ -406,8 +809,8 @@ mute_body()
             "$(without_icsr_read "$(sed -n "1,${call_at}p" <<< "$lines")")")" ]
     then
         callee="$(sed -n "${call_at}p" <<< "$lines" | cut -d' ' -f2)"
-        lines="$(body "$(printf '%08x' "$callee")")"
-        if [ -z "$lines" ]
+        carrier="$(printf '%08x' "$callee")"
+        if [ -z "$(body "$carrier")" ]
         then
             echo "FAIL: the frame at 0x$addr forwards to $callee, which has no" \
                 "body in the disassembly" >&2
@@ -415,7 +818,7 @@ mute_body()
         fi
     fi
 
-    printf '%s\n' "$lines"
+    "$printer" "$carrier"
 }
 
 fail()
@@ -441,14 +844,15 @@ forwarded_to()
     printf '%08x' "$(sed -n "${call_at}p" <<< "$lines" | cut -d' ' -f2)"
 }
 
-# Prints the instructions of the function the entry attribute wraps.
+# Prints the instructions of the function the entry attribute wraps, through the
+# body printer named as the argument.
 #
 # cortex-m-rt emits main as a frame that forwards to it, the same shape a
 # forwarding fault handler wears, so the descent is the same one mute_body makes
 # and stops at the same depth.
 entry_body()
 {
-    local addr callee
+    local printer=$1 addr callee
 
     addr="$(sym_addr main)"
     if [ -z "$addr" ]
@@ -463,7 +867,7 @@ entry_body()
         return 1
     fi
 
-    body "$callee"
+    "$printer" "$callee"
 }
 
 # Prints the address of the routine that carries the mute, read out of the hard
@@ -485,30 +889,37 @@ mute_routine()
 # Prints one line per call the entry function makes to the routine that carries
 # the mute: the refusal word the store ahead of that call carries, then the base
 # register and the offset that store reaches memory through. A word the walk
-# cannot read comes back as a dash.
+# cannot read comes back as a dash. It reads the annotated body, because the
+# addresses are what the block boundaries are read off.
 #
 # The word is read backwards from the store, over the instructions that build
 # the stored register. A movw, a mov or a movs ends the walk with a value, a
 # movt or a two operand add carries it on, and anything else naming that
-# register ends the walk with a dash. So a word printed here was built by the
-# instructions between it and its store, and by nothing else.
+# register ends the walk with a dash.
+#
+# The walk stops at every control flow boundary rather than reading through it.
+# It crosses only WALKABLE_INSTRUCTION forms, so a call ends it rather than
+# being stepped over as an instruction that names no register, and so does a
+# branch of any mnemonic. It refuses to move past an address the function names
+# in an operand, so a block entered from elsewhere ends it too. So a word
+# printed here was built by the instructions between it and its store, on the
+# one path that reaches that store, and by nothing else.
 park_arms()
 {
     local mute=$1
-    local -a insn chain
-    local index at line padded store src base off value known step
+    local index store src base off value
 
-    mapfile -t insn <<< "$2"
+    read_walk "$2"
 
-    for index in "${!insn[@]}"
+    for index in "${!WALK_INSN[@]}"
     do
-        if [ "${insn[index]%% *}" != "bl" ] \
-            || [ "$(cut -d' ' -f2 <<< "${insn[index]}")" != "$mute" ]
+        if [ "${WALK_INSN[index]%% *}" != "bl" ] \
+            || [ "$(cut -d' ' -f2 <<< "${WALK_INSN[index]}")" != "$mute" ]
         then
             continue
         fi
 
-        store="${insn[index - 1]-}"
+        store="${WALK_INSN[index - 1]-}"
         if [[ ! "$store" =~ ^str(\.w)?\ (r[0-9]+|lr|ip),\ \[(r[0-9]+)(,\ \#(0x[0-9a-f]+))?\]$ ]]
         then
             echo "FAIL: the arm calling the mute routine at line $((index + 1))" \
@@ -520,54 +931,16 @@ park_arms()
         base="${BASH_REMATCH[3]}"
         off=$((${BASH_REMATCH[5]:-0}))
 
-        known=0
-        value=0
-        chain=()
-        at=$((index - 2))
-
-        while [ "$at" -ge 0 ]
-        do
-            line="${insn[at]}"
-            padded=" ${line//[,\[\]\{\}]/ } "
-
-            if [[ "$padded" != *" $src "* ]]
-            then
-                at=$((at - 1))
-                continue
-            fi
-
-            if [[ "$line" =~ ^(movw|movs|mov|mov\.w)\ $src,\ \#(0x[0-9a-f]+)$ ]]
-            then
-                value=$((${BASH_REMATCH[2]}))
-                known=1
-            elif [[ "$line" =~ ^(movt|adds?)\ $src,\ \#(0x[0-9a-f]+)$ ]]
-            then
-                chain=("$line" ${chain[@]+"${chain[@]}"})
-                at=$((at - 1))
-                continue
-            fi
-
-            break
-        done
-
-        if [ "$known" -ne 1 ]
+        # A store the function enters from elsewhere is reached on a path this
+        # walk has not read, whatever stands textually ahead of it.
+        if [ -n "${WALK_ENTERED[${WALK_SPOT[index - 1]}]-}" ] \
+            || ! value="$(walk_immediate "$src" "$((index - 1))")"
         then
             printf -- '- %s %s\n' "$base" "$off"
             continue
         fi
 
-        for step in ${chain[@]+"${chain[@]}"}
-        do
-            if [[ "$step" =~ ^movt\ $src,\ \#(0x[0-9a-f]+)$ ]]
-            then
-                value=$(((value & 0xFFFF) | ($((${BASH_REMATCH[1]})) << 16)))
-            elif [[ "$step" =~ ^adds?\ $src,\ \#(0x[0-9a-f]+)$ ]]
-            then
-                value=$((value + $((${BASH_REMATCH[1]}))))
-            fi
-        done
-
-        printf '%08x %s %s\n' "$value" "$base" "$off"
+        printf '%s %s %s\n' "$value" "$base" "$off"
     done
 }
 
@@ -596,10 +969,15 @@ loaded_address()
 # Checks claim 6 against the entry function.
 check_startup_refusals()
 {
-    local lines mute arms slot index expected label word base off carried
+    local lines walk mute arms slot index expected label word base off carried
     local -a resolved unread
 
-    if ! lines="$(entry_body)" || [ -z "$lines" ]
+    if ! lines="$(entry_body body)" || [ -z "$lines" ]
+    then
+        return 1
+    fi
+
+    if ! walk="$(entry_body annotated_body)" || [ -z "$walk" ]
     then
         return 1
     fi
@@ -616,7 +994,7 @@ check_startup_refusals()
         return 1
     fi
 
-    if ! arms="$(park_arms "0x$(printf '%x' "$((16#$mute))")" "$lines")" \
+    if ! arms="$(park_arms "0x$(printf '%x' "$((16#$mute))")" "$walk")" \
         || [ -z "$arms" ]
     then
         fail "no arm of the entry function calls the routine that carries the" \
@@ -690,7 +1068,7 @@ check_mute_path()
     local label=$1 addr=$2
     local lines line_no store prologue src base off after mask
 
-    if ! lines="$(mute_body "$addr")" || [ -z "$lines" ]
+    if ! lines="$(mute_body body "$addr")" || [ -z "$lines" ]
     then
         fail "$label at 0x$addr has no reachable body"
         return 1
@@ -757,8 +1135,9 @@ check_mute_path()
             ;;
     esac
 
-    echo "PASS: only a frame push and register moves stand ahead of the mute" \
-        "store of $label, and the mask and the barrier follow it"
+    echo "PASS: nothing but a frame push, a register move, an immediate" \
+        "constant or a call stands ahead of the mute store of $label, and the" \
+        "mask and the barrier follow it"
 }
 
 # Checks claim 4 against the symbol table, the section headers and the reset
@@ -824,17 +1203,19 @@ check_record_slot()
 check_record_write()
 {
     local label=$1 addr=$2
-    local lines record low high base index offset target stores
+    local lines walk record low high base index offset target stores
     local line_no previous low_at high_at
     # The compiler sources a record word from any allocatable register, and it
     # reaches for lr and ip once the low ones are taken.
     local source='(r[0-9]+|lr|ip)'
 
-    if ! lines="$(mute_body "$addr")" || [ -z "$lines" ]
+    if ! lines="$(mute_body body "$addr")" || [ -z "$lines" ] \
+        || ! walk="$(mute_body annotated_body "$addr")" || [ -z "$walk" ]
     then
         fail "$label at 0x$addr has no reachable body"
         return 1
     fi
+    read_walk "$walk"
 
     record="$(sym_addr "$RECORD_SYMBOL")"
     if [ -z "$record" ]
@@ -910,9 +1291,21 @@ check_record_write()
         return 1
     fi
 
+    # Rising line numbers are the order the compiler emitted the stores in, not
+    # the order they run. The two agree only on a straight line, so the run from
+    # the completed address to the last store is required to be one: a store the
+    # routine reaches by a branch, or skips by one, counts here as a store the
+    # routine always makes.
+    if ! straight_line "$((high_at - 1))" "$((high_at + previous - 1))"
+    then
+        fail "$label does not reach its $RECORD_WORDS record stores from the" \
+            "address it builds in $base on one straight line"
+        return 1
+    fi
+
     echo "PASS: the mute routine of $label builds the record address in" \
         "$base, then makes $RECORD_WORDS word stores through it at the record" \
-        "offsets, in rising order"
+        "offsets, in rising order, on one straight line"
 }
 
 status=0
