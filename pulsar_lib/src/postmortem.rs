@@ -43,15 +43,16 @@
 //!
 //! The domains run in the order the start-up does. 1 is the guards the
 //! processing firmware runs before it starts anything, 2 the audio clock, 3 the
-//! output transport. The field is wider than the domains named here, and a word
-//! carrying one they do not name comes back as `Refusal::Unnamed` rather than
-//! being read as one of them.
+//! output transport, 4 the gate that raises the converter mute line. The field
+//! is wider than the domains named here, and a word carrying one they do not
+//! name comes back as `Refusal::Unnamed` rather than being read as one of them.
 //!
-//! A clock code and a transport code are a place byte over a cause byte. The
-//! place says where the stage refused, the cause what that place refused with,
-//! and the enums that carry them are `pulsar_lib::clock::ClockFault` and
-//! `pulsar_lib::transport::TransportFault`. The guards refuse in one place, so
-//! a domain 1 code is a cause byte alone, and the table shows the place byte it
+//! A clock, a transport and a release code are a place byte over a cause byte.
+//! The place says where the stage refused, the cause what that place refused
+//! with, and the enums that carry them are `pulsar_lib::clock::ClockFault`,
+//! `pulsar_lib::transport::TransportFault` and
+//! `pulsar_lib::release::ReleaseFault`. The guards refuse in one place, so a
+//! domain 1 code is a cause byte alone, and the table shows the place byte it
 //! always reads as.
 //!
 //! ```text
@@ -62,12 +63,23 @@
 //!           place 1 the plan           cause transport::TransportPlanError
 //!           place 2, 3 the sub-blocks  cause transport::BlockFault
 //!           place 4, 5 their streams   cause transport::StreamFault
+//! domain 4  place 0 the gate sequence  cause release::SequenceRefusal
+//!           place 1, 2 the sub-blocks  cause release::BlockAlarm
+//!           place 3, 4 their streams   cause release::StreamAlarm
+//!           place 0x11 to 0x14         the same four sites, the same causes,
+//!                                      seen with the mute line already high
 //! ```
 //!
+//! The place byte of domain 4 splits once more, into a phase over a site. A
+//! high nibble of 0 says the mute line was still low when the gate refused, so
+//! nothing was ever audible, and a high nibble of 1 says the line had been
+//! raised and the gate drove it back down.
+//!
 //! The domains number their causes apart from one another, so one code reads
-//! several ways and the domain is what settles it. Code `0x0002` is a clock
-//! that found a second PLL running, a transport whose sub-block never stopped,
-//! and a start-up that found the device handle already taken.
+//! several ways and the domain is what settles it. Code `0x0001` is a clock
+//! whose PLL never stopped, a transport whose stream never stopped, a release
+//! whose transfer counters never lapped, and a start-up that found the core
+//! handle already taken.
 //!
 //! The `CFSR` and `ABFSR` bits are sticky. PM0253 clears them on a write or a
 //! reset and this firmware writes neither, so a record shows what has faulted
@@ -86,15 +98,17 @@
 //! # What this module is
 //!
 //! `FaultRecord::new` is the encoder the processing firmware calls, and
-//! `startup_refusal`, `clock_refusal` and `transport_refusal` are what tag a
-//! code with the domain it belongs to before it gets there. The decoding half,
-//! `from_words` and the accessors, is the reference that pins the encoding down
-//! and the tests exercise. No shipped code decodes a record.
+//! `startup_refusal`, `clock_refusal`, `transport_refusal` and
+//! `release_refusal` are what tag a code with the domain it belongs to before
+//! it gets there. The decoding half, `from_words` and the accessors, is the
+//! reference that pins the encoding down and the tests exercise. No shipped
+//! code decodes a record.
 //!
 //! No register is read here. The processing firmware reads them and fills
 //! `FaultRegisters`.
 
 use crate::clock::{CLOCK_CODE_CEILING, ClockFault};
+use crate::release::{RELEASE_CODE_CEILING, ReleaseFault};
 use crate::transport::{TRANSPORT_CODE_CEILING, TransportFault};
 
 /// Words one record occupies. A reader takes this many from the record address.
@@ -212,6 +226,11 @@ refusal_domains!
     /// The output transport, whose codes
     /// `pulsar_lib::transport::TransportFault::code` numbers.
     Transport = 0x0003, codes to TRANSPORT_CODE_CEILING,
+    /// The gate that raises the converter mute line, whose codes
+    /// `pulsar_lib::release::ReleaseFault::code` numbers. Its place byte
+    /// carries a phase as well as a site, so a word of this domain says
+    /// whether the line had gone high when the gate refused.
+    ReleaseGate = 0x0004, codes to RELEASE_CODE_CEILING,
 }
 
 impl RefusalDomain
@@ -287,11 +306,18 @@ pub enum Refusal
     },
 }
 
+// The four below tag a code with its domain, and each is one `or` of two
+// values. They are inlined so that the instructions building a refusal word
+// stand in the arm that stores it: a disassembly of that arm then carries the
+// domain immediate, and which stage a parked board refused at reads off the arm
+// rather than off a call it makes.
+
 /// Returns the refusal word a refused start-up guard leaves.
 ///
 /// The guards run in one place, so the place byte of the code is zero and the
 /// cause byte carries the whole of it.
 #[must_use]
+#[inline]
 pub const fn startup_refusal(fault: StartupFault) -> u32
 {
     RefusalDomain::Startup.field() | fault as u32
@@ -299,6 +325,7 @@ pub const fn startup_refusal(fault: StartupFault) -> u32
 
 /// Returns the refusal word a refused audio clock bring-up leaves.
 #[must_use]
+#[inline]
 pub const fn clock_refusal(fault: ClockFault) -> u32
 {
     RefusalDomain::Clock.field() | fault.code()
@@ -306,16 +333,26 @@ pub const fn clock_refusal(fault: ClockFault) -> u32
 
 /// Returns the refusal word a refused output transport bring-up leaves.
 #[must_use]
+#[inline]
 pub const fn transport_refusal(fault: TransportFault) -> u32
 {
     RefusalDomain::Transport.field() | fault.code()
+}
+
+/// Returns the refusal word a refused converter mute release leaves.
+#[must_use]
+#[inline]
+pub const fn release_refusal(fault: ReleaseFault) -> u32
+{
+    RefusalDomain::ReleaseGate.field() | fault.code()
 }
 
 const _: () = assert!
 (
     STARTUP_CODE_CEILING <= CODE_MASK
         && CLOCK_CODE_CEILING <= CODE_MASK
-        && TRANSPORT_CODE_CEILING <= CODE_MASK,
+        && TRANSPORT_CODE_CEILING <= CODE_MASK
+        && RELEASE_CODE_CEILING <= CODE_MASK,
     "no encoding reaches the domain field, so tagging a code leaves it bit for \
      bit and the field says which stage refused alone"
 );
@@ -598,6 +635,7 @@ mod tests
 
     use super::*;
     use crate::clock::{ClockPlanError, TreeFault};
+    use crate::release::{BlockAlarm, Phase, SequenceRefusal};
     use crate::transport::{SequenceFault, TransportFault};
 
     /// A refusal word distinct from every register value of `sample`, so a
@@ -828,6 +866,7 @@ mod tests
                 (RefusalDomain::Startup, STARTUP_CODE_CEILING),
                 (RefusalDomain::Clock, CLOCK_CODE_CEILING),
                 (RefusalDomain::Transport, TRANSPORT_CODE_CEILING),
+                (RefusalDomain::ReleaseGate, RELEASE_CODE_CEILING),
             ]
         );
 
@@ -861,23 +900,32 @@ mod tests
     }
 
     #[test]
-    fn the_three_tagging_functions_agree_with_the_domains_they_name()
+    fn the_tagging_functions_agree_with_the_domains_they_name()
     {
-        let clock = ClockFault::PartRefused(TreeFault::OtherPllRunning);
-        let transport = TransportFault::Sequence(SequenceFault::BlockNeverStopped);
-        let startup = StartupFault::DeviceHandleTaken;
+        let clock = ClockFault::PartRefused(TreeFault::PllNeverStopped);
+        let transport = TransportFault::Sequence(SequenceFault::StreamNeverStopped);
+        let release = ReleaseFault::Sequence(SequenceRefusal::TransfersNeverLapped);
+        let startup = StartupFault::CoreHandleTaken;
 
-        // The module documentation names this trio as the reason the domain
+        // The module documentation names this set as the reason the domain
         // field has to be read before the code.
-        assert_eq!(clock.code(), 0x0002);
-        assert_eq!(transport.code(), 0x0002);
-        assert_eq!(startup as u32, 0x0002);
+        assert_eq!(clock.code(), 0x0001);
+        assert_eq!(transport.code(), 0x0001);
+        assert_eq!(release.code(), 0x0001);
+        assert_eq!(startup as u32, 0x0001);
 
-        assert_eq!(clock_refusal(clock), RefusalDomain::Clock.field() | 0x0002);
-        assert_eq!(transport_refusal(transport), RefusalDomain::Transport.field() | 0x0002);
-        assert_eq!(startup_refusal(startup), RefusalDomain::Startup.field() | 0x0002);
+        assert_eq!(clock_refusal(clock), RefusalDomain::Clock.field() | 0x0001);
+        assert_eq!(transport_refusal(transport), RefusalDomain::Transport.field() | 0x0001);
+        assert_eq!(release_refusal(release), RefusalDomain::ReleaseGate.field() | 0x0001);
+        assert_eq!(startup_refusal(startup), RefusalDomain::Startup.field() | 0x0001);
 
-        let words = [clock_refusal(clock), transport_refusal(transport), startup_refusal(startup)];
+        let words =
+        [
+            clock_refusal(clock),
+            transport_refusal(transport),
+            release_refusal(release),
+            startup_refusal(startup),
+        ];
 
         for (index, word) in words.into_iter().enumerate()
         {
@@ -888,6 +936,30 @@ mod tests
                 "word {index} is shared by two domains"
             );
         }
+    }
+
+    #[test]
+    fn a_release_word_carries_the_phase_the_mute_line_was_in()
+    {
+        // The place byte of domain 4 splits into a phase over a site, and
+        // whether the line had gone high is the one thing a reader of a parked
+        // board most needs off it. The tagging leaves both halves of the code
+        // bit for bit, so the phase survives into the record.
+        let low = ReleaseFault::MasterBlock(Phase::Muted, BlockAlarm::Underrun);
+        let high = ReleaseFault::MasterBlock(Phase::Unmuted, BlockAlarm::Underrun);
+
+        let sealed = |fault| FaultRecord::new(&sample(), release_refusal(fault)).refusal();
+
+        assert_eq!
+        (
+            sealed(low),
+            Some(Refusal::Named { domain: RefusalDomain::ReleaseGate, code: 0x0101 })
+        );
+        assert_eq!
+        (
+            sealed(high),
+            Some(Refusal::Named { domain: RefusalDomain::ReleaseGate, code: 0x1101 })
+        );
     }
 
     #[test]

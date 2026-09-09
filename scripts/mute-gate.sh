@@ -105,9 +105,16 @@
 # cold blocks turns it red and the path gets read. Nothing here proves the base
 # register still holds that address where the store runs, only that the function
 # builds no other address in it. And an arm whose word is not built from
-# immediates is unread: the clock arm and the transport arm compute theirs from
-# the fault they carry, so the count of read arms is what pins this claim to the
-# three start-up guards, and a fourth guard turns it red.
+# immediates is unread: the clock arm, the transport arm and the release arm
+# compute theirs from the fault they carry, so no claim here says what value any
+# of the three writes. Where each of them writes it is read on the terms above,
+# the same ones a guard arm faces.
+#
+# Both counts are read, which is what makes an arm added to main a decision
+# rather than a silence. A guard whose word is immediate joins STARTUP_REFUSALS
+# or the read count is wrong, and a stage that computes its word joins
+# COMPUTED_REFUSALS or the unread count is. Reading only the first count leaves
+# a stage free to park with an unread word and be named nowhere.
 #
 # What no claim here covers is the stack. This gate reads instructions and says
 # nothing about the stack pointer they run on. A handler entered on a corrupt
@@ -158,6 +165,20 @@ STARTUP_REFUSALS=(
     "00010001 the core peripheral handle guard"
     "00010003 the BusFault arming read-back"
     "00010002 the device peripheral handle guard"
+)
+
+# Arms of main whose refusal word this gate does not read, in the order they are
+# emitted. Each builds its word out of the fault it carries, so the backward walk
+# ends with nothing rather than a value. Where the store lands is read all the
+# same: an unread arm faces the base register and offset check a read one faces,
+# so a computed word still has to reach the refusal word and nowhere else. What
+# is checked on top of that is that there are this many of them: a stage that
+# parks with a computed word and is named on no line below turns claim 6 red, so
+# a new one is read by a person before it ships.
+COMPUTED_REFUSALS=(
+    "the audio clock bring-up"
+    "the output transport bring-up"
+    "the converter mute release gate"
 )
 
 # Instructions a frame may run ahead of the mute store, or ahead of the call
@@ -576,7 +597,7 @@ loaded_address()
 check_startup_refusals()
 {
     local lines mute arms slot index expected label word base off carried
-    local -a resolved
+    local -a resolved unread
 
     if ! lines="$(entry_body)" || [ -z "$lines" ]
     then
@@ -604,6 +625,7 @@ check_startup_refusals()
     fi
 
     resolved=()
+    unread=()
 
     while read -r word base off
     do
@@ -624,6 +646,8 @@ check_startup_refusals()
         if [ "$word" != "-" ]
         then
             resolved+=("$word")
+        else
+            unread+=("$base")
         fi
     done <<< "$arms"
 
@@ -632,6 +656,13 @@ check_startup_refusals()
         fail "${#resolved[@]} arms of the entry function build their refusal" \
             "word from immediates, the start-up has ${#STARTUP_REFUSALS[@]}" \
             "guards"
+        return 1
+    fi
+
+    if [ "${#unread[@]}" -ne "${#COMPUTED_REFUSALS[@]}" ]
+    then
+        fail "${#unread[@]} arms of the entry function compute their refusal" \
+            "word, this gate names ${#COMPUTED_REFUSALS[@]} stages that do"
         return 1
     fi
 
@@ -649,7 +680,8 @@ check_startup_refusals()
     done
 
     echo "PASS: the ${#resolved[@]} start-up guards write their own cause into" \
-        "0x$slot, in the order they run, and park on the next instruction"
+        "0x$slot, in the order they run, and park on the next instruction," \
+        "beside the ${#unread[@]} stages that compute their word"
 }
 
 # Checks claims 2 and 3 on one handler.

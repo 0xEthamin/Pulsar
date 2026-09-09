@@ -34,6 +34,11 @@
 //! off its reset value in the two sub-blocks and the two streams is read back
 //! and compared against the plan.
 //!
+//! `StreamReadback` also carries the three error flags of a stream. The
+//! bring-up clears them and does not compare them, because what they report is
+//! a stream that has already run rather than a stream that is configured. They
+//! are here for a stage that watches the transfers over a window.
+//!
 //! # What the read-back does not reach
 //!
 //! The port. `AudioInterface::open_pins` puts five pins on the alternate
@@ -756,7 +761,7 @@ pub struct BlockReadback
 }
 
 /// Every field of one transfer stream the register block drives off its reset
-/// value, and the two addresses.
+/// value, the two addresses, and the three error flags of the stream.
 ///
 /// Closed against the same boundary as `BlockReadback`, and ranging over the
 /// stream and its multiplexer channel alone. RM0433 section 15.5.5 resets
@@ -764,6 +769,13 @@ pub struct BlockReadback
 /// `0x0000_0021`, so `PFCTRL`, `MBURST`, `PBURST` and `DMDIS` come up carrying
 /// what this transport wants and the bring-up writes none of them to anything
 /// else.
+///
+/// The three error flags are outside that boundary and are read for a
+/// different reason. They are not fields a bring-up writes, they are what the
+/// controller raises while a stream runs, and a stage that watches the
+/// transfers over a window needs them. `bring_up` clears them before it starts
+/// the streams and does not compare them, so a flag read here belongs to the
+/// run the reader is looking at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[expect
 (
@@ -803,6 +815,32 @@ pub struct StreamReadback
     pub items: u32,
     /// `EN`.
     pub enabled: bool,
+    /// `TEIF` of this stream, in the interrupt status register of its
+    /// controller. RM0433 section 15.5.1 raises it on a bus error taken by a
+    /// transfer.
+    pub transfer_error: bool,
+    /// `DMEIF` of this stream.
+    ///
+    /// RM0433 section 15.3.20 confines the flag to a peripheral to memory
+    /// stream in direct mode with `MINC` clear. Both streams of this transport
+    /// are memory to peripheral with `MINC` set, so the part raises this on
+    /// neither of them, and it is read rather than reasoned away: a set bit
+    /// says the stream is not the one the plan armed or the part is not the
+    /// one the manual describes, and either answer belongs to a reader.
+    pub direct_mode_error: bool,
+    /// `FEIF` of this stream.
+    ///
+    /// RM0433 section 15.3.20 raises it in direct mode when the memory bus is
+    /// not granted before a peripheral request, which is a memory to
+    /// peripheral stream running out of data. It is reachable here, unlike
+    /// `DMEIF`.
+    ///
+    /// That reading holds while `DMDIS` is clear, which is the value the same
+    /// section resets it to and the value the register block writes. Nothing
+    /// reads it back, so a run with it set would leave this flag reporting a
+    /// burst against a FIFO threshold instead. Either way it is a stream not
+    /// carrying its plan, so the flag is read rather than interpreted.
+    pub fifo_error: bool,
 }
 
 /// Everything a bring-up reads back off the interface and its two streams.
@@ -1601,7 +1639,9 @@ impl TransportWaits
 /// "configured as asked", so a bring-up that skipped a write ends here rather
 /// than at a flag. What it compares is every field the register block drives
 /// off its reset value in the two sub-blocks and the two streams, which
-/// `BlockReadback` and `StreamReadback` set out. The port is outside it.
+/// `BlockReadback` and `StreamReadback` set out. The port is outside it, and so
+/// are the three stream error flags, which this sequence clears rather than
+/// compares.
 ///
 /// # Errors
 ///
@@ -1772,6 +1812,20 @@ mod tests
     /// reference together.
     const TABLE_TOLERANCE: i64 = 1;
 
+    /// `FEIF`, `DMEIF` and `TEIF` of stream 0 in `DMA_LISR`.
+    ///
+    /// RM0433 section 15.5.1 puts them at bits 0, 2 and 3. The mock holds the
+    /// register word and the read takes the flags out of it, so a bit that
+    /// moves in the word moves in the read-back and nothing in the double
+    /// states what a bit is supposed to say.
+    const MASTER_FLAG_MASKS: (u32, u32, u32) = (1 << 0, 1 << 2, 1 << 3);
+
+    /// The same three flags of stream 1, at bits 6, 8 and 9.
+    const SLAVE_FLAG_MASKS: (u32, u32, u32) = (1 << 6, 1 << 8, 1 << 9);
+
+    /// Both sets, in the order the read-back carries the two streams.
+    const STREAM_FLAG_MASKS: [(u32, u32, u32); 2] = [MASTER_FLAG_MASKS, SLAVE_FLAG_MASKS];
+
     /// One broken field of a read-back, and the fault it must produce.
     type Mutation = (fn(&mut TransportReadback), TransportFault);
 
@@ -1807,6 +1861,7 @@ mod tests
     struct MockInterface
     {
         image: TransportReadback,
+        status: u32,
         polls: Cell<u32>,
         streams_started: bool,
         fifo_filled_after: u32,
@@ -1842,6 +1897,7 @@ mod tests
                     master_stream: reset_stream(),
                     slave_stream: reset_stream(),
                 },
+                status: 0,
                 polls: Cell::new(0),
                 streams_started: false,
                 fifo_filled_after: 2,
@@ -1922,7 +1978,20 @@ mod tests
             memory_address: 0,
             items: 0,
             enabled: false,
+            transfer_error: false,
+            direct_mode_error: false,
+            fifo_error: false,
         }
+    }
+
+    /// Takes the three error flags of one stream out of a `DMA_LISR` word.
+    fn apply_stream_flags(stream: &mut StreamReadback, status: u32, masks: (u32, u32, u32))
+    {
+        let (fifo, direct, transfer) = masks;
+
+        stream.fifo_error = status & fifo != 0;
+        stream.direct_mode_error = status & direct != 0;
+        stream.transfer_error = status & transfer != 0;
     }
 
     /// Writes one sub-block the way the register block does.
@@ -2050,6 +2119,10 @@ mod tests
             self.polls.set(polls);
 
             let mut seen = self.image;
+
+            apply_stream_flags(&mut seen.master_stream, self.status, MASTER_FLAG_MASKS);
+            apply_stream_flags(&mut seen.slave_stream, self.status, SLAVE_FLAG_MASKS);
+
             let filled = self.streams_started
                 && !self.fifo_stays_empty
                 && polls >= self.fifo_filled_after;
@@ -2731,6 +2804,64 @@ mod tests
         ];
 
         run_mutations(&mutations);
+    }
+
+    #[test]
+    fn each_stream_error_flag_reads_back_on_its_own_stream()
+    {
+        // The two streams share one status register and sit at different bits
+        // in it, so a read that mixed the two sets would report a fault of the
+        // master on the slave. One bit is armed at a time and the whole
+        // read-back is swept for it.
+        for (armed, masks) in STREAM_FLAG_MASKS.iter().enumerate()
+        {
+            for (which, mask) in [masks.0, masks.1, masks.2].into_iter().enumerate()
+            {
+                let mut interface = MockInterface::healthy();
+                interface.status = mask;
+
+                let seen = interface.read();
+                let streams = [seen.master_stream, seen.slave_stream];
+
+                for (stream_index, stream) in streams.into_iter().enumerate()
+                {
+                    let flags =
+                        [stream.fifo_error, stream.direct_mode_error, stream.transfer_error];
+
+                    for (flag_index, raised) in flags.into_iter().enumerate()
+                    {
+                        let wanted = stream_index == armed && flag_index == which;
+
+                        assert_eq!
+                        (
+                            raised,
+                            wanted,
+                            "mask {mask:#x} raised flag {flag_index} of stream \
+                             {stream_index}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_stream_error_flag_does_not_refuse_the_bring_up()
+    {
+        // The bring-up clears these flags and compares none of them, because
+        // what they report is a stream that has already run. A stage that
+        // watches the transfers over a window is what reads them, and this
+        // says which of the two owns them.
+        let mut interface = MockInterface::healthy();
+        interface.status = u32::MAX;
+
+        assert_eq!(bring_up(&mut interface, &plan(), &waits()), Ok(()));
+
+        let seen = interface.read();
+
+        assert!(seen.master_stream.transfer_error);
+        assert!(seen.slave_stream.fifo_error);
+        assert_eq!(plan().verify(&seen), Ok(()));
     }
 
     #[test]
