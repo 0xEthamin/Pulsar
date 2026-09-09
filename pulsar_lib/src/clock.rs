@@ -859,13 +859,13 @@ impl ClockPlan
     ///
     /// # Errors
     ///
-    /// One variant of `ClockFault` per field, in a fixed order that runs from
+    /// One variant of `TreeFault` per field, in a fixed order that runs from
     /// the oscillator outwards: the source first, then the divider chain, then
     /// the declared bands, the enables and what the kernel clock feeds. That
     /// order is not the order the bring-up writes the fields in, so the variant
     /// returned names the earliest disagreement in the chain rather than the
     /// earliest write that did not take.
-    pub fn verify(self, seen: &ClockReadback) -> Result<(), ClockFault>
+    pub fn verify(self, seen: &ClockReadback) -> Result<(), TreeFault>
     {
         verify_source(seen)?;
         self.verify_dividers(seen)?;
@@ -873,67 +873,67 @@ impl ClockPlan
     }
 
     /// Checks the four divider fields against the plan.
-    fn verify_dividers(self, seen: &ClockReadback) -> Result<(), ClockFault>
+    fn verify_dividers(self, seen: &ClockReadback) -> Result<(), TreeFault>
     {
         if seen.reference_divider_field != self.pll.reference_divider_field()
         {
-            return Err(ClockFault::ReferenceDividerWrong);
+            return Err(TreeFault::ReferenceDividerWrong);
         }
 
         if seen.multiplier_field != self.pll.multiplier_field()
         {
-            return Err(ClockFault::MultiplierWrong);
+            return Err(TreeFault::MultiplierWrong);
         }
 
         if seen.fraction_field != self.pll.fraction_field()
         {
-            return Err(ClockFault::FractionWrong);
+            return Err(TreeFault::FractionWrong);
         }
 
         if seen.output_divider_field != self.pll.output_divider_field()
         {
-            return Err(ClockFault::OutputDividerWrong);
+            return Err(TreeFault::OutputDividerWrong);
         }
 
         Ok(())
     }
 
     /// Checks the declared bands, the latch, and what the kernel clock feeds.
-    fn verify_configuration(self, seen: &ClockReadback) -> Result<(), ClockFault>
+    fn verify_configuration(self, seen: &ClockReadback) -> Result<(), TreeFault>
     {
         if seen.reference_range_bits != self.pll.range.bits()
         {
-            return Err(ClockFault::ReferenceRangeWrong);
+            return Err(TreeFault::ReferenceRangeWrong);
         }
 
         if seen.vco_band_bit != self.pll.band.selection_bit()
         {
-            return Err(ClockFault::VcoBandWrong);
+            return Err(TreeFault::VcoBandWrong);
         }
 
         if !seen.fraction_latched
         {
-            return Err(ClockFault::FractionNotLatched);
+            return Err(TreeFault::FractionNotLatched);
         }
 
         if !seen.output_enabled
         {
-            return Err(ClockFault::OutputDisabled);
+            return Err(TreeFault::OutputDisabled);
         }
 
         if !seen.pll_on
         {
-            return Err(ClockFault::PllNotEnabled);
+            return Err(TreeFault::PllNotEnabled);
         }
 
         if !seen.pll_ready
         {
-            return Err(ClockFault::PllNotLocked);
+            return Err(TreeFault::PllNotLocked);
         }
 
         if seen.audio_kernel_bits != AUDIO_KERNEL_PLL3_P
         {
-            return Err(ClockFault::AudioKernelSourceWrong);
+            return Err(TreeFault::AudioKernelSourceWrong);
         }
 
         Ok(())
@@ -945,100 +945,153 @@ impl ClockPlan
 /// The plan names no source of its own. Only the external oscillator drives
 /// this board, and a plan that could name another would make the field a
 /// setting rather than a requirement.
-fn verify_source(seen: &ClockReadback) -> Result<(), ClockFault>
+fn verify_source(seen: &ClockReadback) -> Result<(), TreeFault>
 {
     if seen.source_bits != PLL_SOURCE_EXTERNAL
     {
-        return Err(ClockFault::SourceNotSelected);
+        return Err(TreeFault::SourceNotSelected);
     }
 
     if seen.source_bypassed
     {
-        return Err(ClockFault::SourceBypassed);
+        return Err(TreeFault::SourceBypassed);
     }
 
     if !seen.source_ready
     {
-        return Err(ClockFault::SourceNotReady);
+        return Err(TreeFault::SourceNotReady);
     }
 
     Ok(())
 }
 
 /// Reason the part would not accept a plan.
+///
+/// The discriminant of a variant is the cause byte a fault record carries for
+/// it, which is the number a person with a probe looks up. Two variants that
+/// carried one number would not compile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum ClockPlanError
 {
     /// The source sits outside the 4 to 48 MHz the oscillator drives.
-    SourceOutOfRange,
+    SourceOutOfRange = 0x01,
     /// `DIVMx` carries 1 to 63.
-    ReferenceDividerOutOfRange,
+    ReferenceDividerOutOfRange = 0x02,
     /// `DIVNx` carries 4 to 512.
-    MultiplierOutOfRange,
+    MultiplierOutOfRange = 0x03,
     /// `FRACNx` carries 0 to 8191.
-    FractionOutOfRange,
+    FractionOutOfRange = 0x04,
     /// `DIVPx` carries 1 to 128.
-    OutputDividerOutOfRange,
+    OutputDividerOutOfRange = 0x05,
     /// A non-zero fraction asks for a modulator the declared band forbids.
-    FractionForbiddenInBand,
+    FractionForbiddenInBand = 0x06,
     /// The reference falls outside the range the declared band accepts.
-    ReferenceOutsideBand,
+    ReferenceOutsideBand = 0x07,
     /// The reference falls outside the window `PLLxRGE` declares.
-    ReferenceOutsideDeclaredRange,
+    ReferenceOutsideDeclaredRange = 0x08,
     /// The VCO falls outside the declared band.
-    VcoOutsideBand,
+    VcoOutsideBand = 0x09,
     /// The VCO sits inside the band but too close to one of its edges.
-    VcoMarginTooSmall,
+    VcoMarginTooSmall = 0x0A,
     /// The kernel clock passes what the audio interface takes at the voltage
     /// scale the part boots on.
-    KernelAboveMaximum,
+    KernelAboveMaximum = 0x0B,
     /// `MCKDIV` carries 1 to 63.
-    MasterDividerOutOfRange,
+    MasterDividerOutOfRange = 0x0C,
     /// An odd master divider leaves the master clock off a 50 per cent duty
     /// cycle.
-    MasterDividerOdd,
+    MasterDividerOdd = 0x0D,
     /// The frame runs from 8 to 256 bits.
-    FrameOutOfRange,
+    FrameOutOfRange = 0x0E,
     /// The frame length is not a power of two, which the master clock requires.
-    FrameNotPowerOfTwo,
+    FrameNotPowerOfTwo = 0x0F,
 }
 
-impl ClockPlanError
-{
-    /// Returns the code a fault record carries for this bound.
-    ///
-    /// The numbering is an interface a person reads off a probe, so it is
-    /// written out rather than taken from the order of the variants. Zero is
-    /// left free, which is what lets `ClockFault::code` mean no fault by it.
-    #[must_use]
-    pub const fn code(self) -> u32
-    {
-        match self
-        {
-            Self::SourceOutOfRange => 0x01,
-            Self::ReferenceDividerOutOfRange => 0x02,
-            Self::MultiplierOutOfRange => 0x03,
-            Self::FractionOutOfRange => 0x04,
-            Self::OutputDividerOutOfRange => 0x05,
-            Self::FractionForbiddenInBand => 0x06,
-            Self::ReferenceOutsideBand => 0x07,
-            Self::ReferenceOutsideDeclaredRange => 0x08,
-            Self::VcoOutsideBand => 0x09,
-            Self::VcoMarginTooSmall => 0x0A,
-            Self::KernelAboveMaximum => 0x0B,
-            Self::MasterDividerOutOfRange => 0x0C,
-            Self::MasterDividerOdd => 0x0D,
-            Self::FrameOutOfRange => 0x0E,
-            Self::FrameNotPowerOfTwo => 0x0F,
-        }
-    }
-}
-
-/// Bit a fault code carries when a plan was refused before any register moved.
+/// Reason the clock tree did not come up to a plan the part accepts.
 ///
-/// The low byte then holds the `ClockPlanError` code, so one word names both
-/// halves of the refusal.
-const PLAN_REJECTED_FLAG: u32 = 0x0100;
+/// The discriminant of a variant is the cause byte a fault record carries for
+/// it, which is the number a person with a probe looks up. Two variants that
+/// carried one number would not compile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TreeFault
+{
+    /// The PLL still reported ready after it was told to stop, so the divider
+    /// fields would not have taken.
+    PllNeverStopped = 0x01,
+    /// A PLL is on, and RM0433 section 8.7.11 accepts a `PLLSRC` write only
+    /// while every PLL is off, so the write would be dropped and the dividers
+    /// would keep running off the internal oscillator. All three enables are
+    /// read, the one this bring-up drives included, because the manual names
+    /// them all and stopping one says nothing about the other two.
+    OtherPllRunning = 0x02,
+    /// The fractional latch still stood after it was cleared, so setting it
+    /// makes no edge and the modulator keeps its old value.
+    FractionLatchNotCleared = 0x03,
+    /// The oscillator never reported ready.
+    SourceNeverReady = 0x04,
+    /// The PLL never reported locked.
+    PllNeverLocked = 0x05,
+    /// `PLLSRC` does not name the external oscillator.
+    SourceNotSelected = 0x06,
+    /// `HSEBYP` is set, so the input is an external clock and not the crystal.
+    SourceBypassed = 0x07,
+    /// `HSERDY` is clear.
+    SourceNotReady = 0x08,
+    /// `DIVMx` does not carry the reference divider of the plan.
+    ReferenceDividerWrong = 0x09,
+    /// `DIVNx` does not carry the multiplier of the plan.
+    MultiplierWrong = 0x0A,
+    /// `FRACNx` does not carry the fraction of the plan.
+    FractionWrong = 0x0B,
+    /// `DIVPx` does not carry the output divider of the plan.
+    OutputDividerWrong = 0x0C,
+    /// `PLLxRGE` does not carry the declared reference range.
+    ReferenceRangeWrong = 0x0D,
+    /// `PLLxVCOSEL` does not carry the declared band.
+    VcoBandWrong = 0x0E,
+    /// `PLLxFRACEN` is clear, so the modulator holds no fraction.
+    FractionNotLatched = 0x0F,
+    /// `DIVPxEN` is clear, so the P output is stopped.
+    ///
+    /// RM0433 section 8.7.12 sets the bit out of reset, so a bring-up that
+    /// skipped the write that sets it would still pass. Reaching this takes a
+    /// write that cleared the bit, or a part that refused the write.
+    OutputDisabled = 0x10,
+    /// `PLLxON` is clear.
+    PllNotEnabled = 0x11,
+    /// `PLLxRDY` is clear.
+    PllNotLocked = 0x12,
+    /// The audio interface takes its kernel clock from somewhere else.
+    AudioKernelSourceWrong = 0x13,
+}
+
+/// Where the audio clock bring-up refused.
+///
+/// The discriminant is the place byte of a fault code. Two places that carried
+/// one number would not compile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum ClockPlace
+{
+    /// The part, before or after the plan was applied to it.
+    Part = 0x00,
+    /// The plan, refused before any register moved.
+    Plan = 0x01,
+}
+
+/// Widest word the clock encoding can carry.
+///
+/// A code is a place byte over a cause byte, so the two types bound it. Nothing
+/// here numbers a place or a cause past its byte, so no variant added to either
+/// enum can pass this, and a fault record therefore keeps the code out of the
+/// domain field it sits beside. The bound is not a value the encoding reaches.
+///
+/// It is the width of the pair and not the highest place declared today, so
+/// adding a place cannot lower it and cannot narrow what a sweep over the code
+/// space covers.
+pub(crate) const CLOCK_CODE_CEILING: u32 = u16::MAX as u32;
 
 /// Reason the audio clock is not running to plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1046,89 +1099,41 @@ pub enum ClockFault
 {
     /// The plan itself is not one the part accepts.
     PlanRejected(ClockPlanError),
-    /// The PLL still reported ready after it was told to stop, so the divider
-    /// fields would not have taken.
-    PllNeverStopped,
-    /// A PLL is on, and RM0433 section 8.7.11 accepts a `PLLSRC` write only
-    /// while every PLL is off, so the write would be dropped and the dividers
-    /// would keep running off the internal oscillator. All three enables are
-    /// read, the one this bring-up drives included, because the manual names
-    /// them all and stopping one says nothing about the other two.
-    OtherPllRunning,
-    /// The fractional latch still stood after it was cleared, so setting it
-    /// makes no edge and the modulator keeps its old value.
-    FractionLatchNotCleared,
-    /// The oscillator never reported ready.
-    SourceNeverReady,
-    /// The PLL never reported locked.
-    PllNeverLocked,
-    /// `PLLSRC` does not name the external oscillator.
-    SourceNotSelected,
-    /// `HSEBYP` is set, so the input is an external clock and not the crystal.
-    SourceBypassed,
-    /// `HSERDY` is clear.
-    SourceNotReady,
-    /// `DIVMx` does not carry the reference divider of the plan.
-    ReferenceDividerWrong,
-    /// `DIVNx` does not carry the multiplier of the plan.
-    MultiplierWrong,
-    /// `FRACNx` does not carry the fraction of the plan.
-    FractionWrong,
-    /// `DIVPx` does not carry the output divider of the plan.
-    OutputDividerWrong,
-    /// `PLLxRGE` does not carry the declared reference range.
-    ReferenceRangeWrong,
-    /// `PLLxVCOSEL` does not carry the declared band.
-    VcoBandWrong,
-    /// `PLLxFRACEN` is clear, so the modulator holds no fraction.
-    FractionNotLatched,
-    /// `DIVPxEN` is clear, so the P output is stopped.
-    ///
-    /// RM0433 section 8.7.12 sets the bit out of reset, so a bring-up that
-    /// skipped the write that sets it would still pass. Reaching this takes a
-    /// write that cleared the bit, or a part that refused the write.
-    OutputDisabled,
-    /// `PLLxON` is clear.
-    PllNotEnabled,
-    /// `PLLxRDY` is clear.
-    PllNotLocked,
-    /// The audio interface takes its kernel clock from somewhere else.
-    AudioKernelSourceWrong,
+    /// The part did not come up to a plan it accepts.
+    PartRefused(TreeFault),
 }
 
 impl ClockFault
 {
     /// Returns the code a fault record carries for this fault.
     ///
-    /// A probe reads the word and looks the value up here, so the numbering is
-    /// written out rather than taken from the order of the variants. Zero names
-    /// no fault, and a plan refusal sets `PLAN_REJECTED_FLAG` over the code of
-    /// the bound it broke.
+    /// A probe reads the word and looks the value up here. The code is a place
+    /// byte over a cause byte: the place says WHERE the bring-up refused, the
+    /// cause what that place refused with, and one word therefore names both.
     #[must_use]
     pub const fn code(self) -> u32
     {
+        u16::from_be_bytes([self.place() as u8, self.cause()]) as u32
+    }
+
+    /// Returns the place byte of the code.
+    const fn place(self) -> ClockPlace
+    {
         match self
         {
-            Self::PlanRejected(error) => PLAN_REJECTED_FLAG | error.code(),
-            Self::PllNeverStopped => 0x01,
-            Self::OtherPllRunning => 0x02,
-            Self::FractionLatchNotCleared => 0x03,
-            Self::SourceNeverReady => 0x04,
-            Self::PllNeverLocked => 0x05,
-            Self::SourceNotSelected => 0x06,
-            Self::SourceBypassed => 0x07,
-            Self::SourceNotReady => 0x08,
-            Self::ReferenceDividerWrong => 0x09,
-            Self::MultiplierWrong => 0x0A,
-            Self::FractionWrong => 0x0B,
-            Self::OutputDividerWrong => 0x0C,
-            Self::ReferenceRangeWrong => 0x0D,
-            Self::VcoBandWrong => 0x0E,
-            Self::FractionNotLatched => 0x0F,
-            Self::OutputDisabled => 0x10,
-            Self::PllNotEnabled => 0x11,
-            Self::PllNotLocked => 0x12,
-            Self::AudioKernelSourceWrong => 0x13,
+            Self::PlanRejected(_) => ClockPlace::Plan,
+            Self::PartRefused(_) => ClockPlace::Part,
+        }
+    }
+
+    /// Returns the cause byte of the code, which is the discriminant of the
+    /// fault the place carries.
+    const fn cause(self) -> u8
+    {
+        match self
+        {
+            Self::PlanRejected(error) => error as u8,
+            Self::PartRefused(fault) => fault as u8,
         }
     }
 }
@@ -1328,12 +1333,12 @@ const fn wait_polls_wide(core_clock_hz: u32, microseconds: u32) -> u64
 ///
 /// # Errors
 ///
-/// `PlanRejected` before any register is touched, then one variant per step
-/// that did not take. A refusal reached after `start_pll` leaves the PLL
-/// running on whatever the writes did land, because putting the tree back
-/// where a reset left it is not something a half-applied plan can do. Nothing
-/// downstream of the PLL is enabled here, so the caller decides what a running
-/// output is worth.
+/// `PlanRejected` before any register is touched, then `PartRefused` carrying
+/// one `TreeFault` per step that did not take. A refusal reached after
+/// `start_pll` leaves the PLL running on whatever the writes did land, because
+/// putting the tree back where a reset left it is not something a half-applied
+/// plan can do. Nothing downstream of the PLL is enabled here, so the caller
+/// decides what a running output is worth.
 pub fn bring_up<T>
 (
     tree: &mut T,
@@ -1352,21 +1357,21 @@ where
 
     if !poll_until(tree, waits.pll_polls, |seen| !seen.pll_ready && !seen.pll_on)
     {
-        return Err(ClockFault::PllNeverStopped);
+        return Err(ClockFault::PartRefused(TreeFault::PllNeverStopped));
     }
 
     tree.start_source();
 
     if !poll_until(tree, waits.source_polls, |seen| seen.source_ready)
     {
-        return Err(ClockFault::SourceNeverReady);
+        return Err(ClockFault::PartRefused(TreeFault::SourceNeverReady));
     }
 
     let armed = tree.read();
 
     if armed.pll_on || armed.pll1_on || armed.pll2_on
     {
-        return Err(ClockFault::OtherPllRunning);
+        return Err(ClockFault::PartRefused(TreeFault::OtherPllRunning));
     }
 
     tree.write_source_and_reference(plan);
@@ -1374,7 +1379,7 @@ where
 
     if tree.read().fraction_latched
     {
-        return Err(ClockFault::FractionLatchNotCleared);
+        return Err(ClockFault::PartRefused(TreeFault::FractionLatchNotCleared));
     }
 
     tree.write_fraction(plan);
@@ -1384,12 +1389,12 @@ where
 
     if !poll_until(tree, waits.pll_polls, |seen| seen.pll_ready)
     {
-        return Err(ClockFault::PllNeverLocked);
+        return Err(ClockFault::PartRefused(TreeFault::PllNeverLocked));
     }
 
     tree.select_audio_kernel();
 
-    plan.verify(&tree.read())
+    plan.verify(&tree.read()).map_err(ClockFault::PartRefused)
 }
 
 /// Polls `tree` until `ready` holds, or `polls` more reads have gone by.
@@ -1493,7 +1498,6 @@ const _: () = assert!
     "a zero fraction would open the medium band, whose modulator is forbidden"
 );
 
-
 #[cfg(test)]
 mod tests
 {
@@ -1504,7 +1508,7 @@ mod tests
     const EPSILON_HZ: f64 = 1e-3;
 
     /// One broken field of a readback, and the fault it must produce.
-    type Mutation = (fn(&mut ClockReadback), ClockFault);
+    type Mutation = (fn(&mut ClockReadback), TreeFault);
 
     /// A clock tree whose registers answer the way the part does.
     ///
@@ -2103,7 +2107,7 @@ mod tests
         assert_eq!
         (
             bring_up(&mut tree, &AUDIO_PLAN, &ClockWaits { source_polls: 4, pll_polls: 4 }),
-            Err(ClockFault::SourceNeverReady)
+            Err(ClockFault::PartRefused(TreeFault::SourceNeverReady))
         );
     }
 
@@ -2116,7 +2120,7 @@ mod tests
         assert_eq!
         (
             bring_up(&mut tree, &AUDIO_PLAN, &ClockWaits { source_polls: 4, pll_polls: 4 }),
-            Err(ClockFault::PllNeverLocked)
+            Err(ClockFault::PartRefused(TreeFault::PllNeverLocked))
         );
     }
 
@@ -2131,7 +2135,7 @@ mod tests
         assert_eq!
         (
             bring_up(&mut tree, &AUDIO_PLAN, &ClockWaits { source_polls: 4, pll_polls: 4 }),
-            Err(ClockFault::PllNeverStopped)
+            Err(ClockFault::PartRefused(TreeFault::PllNeverStopped))
         );
     }
 
@@ -2145,7 +2149,7 @@ mod tests
         assert_eq!
         (
             bring_up(&mut tree, &AUDIO_PLAN, &waits()),
-            Err(ClockFault::FractionLatchNotCleared)
+            Err(ClockFault::PartRefused(TreeFault::FractionLatchNotCleared))
         );
     }
 
@@ -2161,7 +2165,7 @@ mod tests
             assert_eq!
             (
                 bring_up(&mut tree, &AUDIO_PLAN, &waits()),
-                Err(ClockFault::OtherPllRunning)
+                Err(ClockFault::PartRefused(TreeFault::OtherPllRunning))
             );
 
             // The refusal lands before the write the part would have dropped.
@@ -2179,92 +2183,55 @@ mod tests
         assert_eq!
         (
             bring_up(&mut tree, &AUDIO_PLAN, &waits()),
-            Err(ClockFault::OtherPllRunning)
+            Err(ClockFault::PartRefused(TreeFault::OtherPllRunning))
         );
 
         assert_eq!(tree.image.source_bits, 0);
     }
 
     #[test]
-    fn every_fault_names_itself_with_a_code_of_its_own()
+    fn a_code_names_the_place_and_the_cause_apart()
     {
-        let bounds =
-        [
-            ClockPlanError::SourceOutOfRange,
-            ClockPlanError::ReferenceDividerOutOfRange,
-            ClockPlanError::MultiplierOutOfRange,
-            ClockPlanError::FractionOutOfRange,
-            ClockPlanError::OutputDividerOutOfRange,
-            ClockPlanError::FractionForbiddenInBand,
-            ClockPlanError::ReferenceOutsideBand,
-            ClockPlanError::ReferenceOutsideDeclaredRange,
-            ClockPlanError::VcoOutsideBand,
-            ClockPlanError::VcoMarginTooSmall,
-            ClockPlanError::KernelAboveMaximum,
-            ClockPlanError::MasterDividerOutOfRange,
-            ClockPlanError::MasterDividerOdd,
-            ClockPlanError::FrameOutOfRange,
-            ClockPlanError::FrameNotPowerOfTwo,
-        ];
-
-        let faults =
-        [
-            ClockFault::PllNeverStopped,
-            ClockFault::OtherPllRunning,
-            ClockFault::FractionLatchNotCleared,
-            ClockFault::SourceNeverReady,
-            ClockFault::PllNeverLocked,
-            ClockFault::SourceNotSelected,
-            ClockFault::SourceBypassed,
-            ClockFault::SourceNotReady,
-            ClockFault::ReferenceDividerWrong,
-            ClockFault::MultiplierWrong,
-            ClockFault::FractionWrong,
-            ClockFault::OutputDividerWrong,
-            ClockFault::ReferenceRangeWrong,
-            ClockFault::VcoBandWrong,
-            ClockFault::FractionNotLatched,
-            ClockFault::OutputDisabled,
-            ClockFault::PllNotEnabled,
-            ClockFault::PllNotLocked,
-            ClockFault::AudioKernelSourceWrong,
-        ];
-
-        let mut codes = [0_u32; 34];
-
-        // A zip stops at the shorter side, so a variant added to either list
-        // above would go unread rather than unnumbered.
-        assert_eq!(bounds.len() + faults.len(), codes.len());
-
-        let seen = bounds
-            .into_iter()
-            .map(|bound| ClockFault::PlanRejected(bound).code())
-            .chain(faults.into_iter().map(ClockFault::code));
-
-        for (slot, code) in codes.iter_mut().zip(seen)
-        {
-            *slot = code;
-        }
-
-        for (index, code) in codes.into_iter().enumerate()
-        {
-            assert_ne!(code, 0, "fault {index} carries no code");
-            assert_eq!
-            (
-                codes.iter().filter(|other| **other == code).count(),
-                1,
-                "code {code:#06x} is carried by more than one fault"
-            );
-        }
-
-        // A refusal names both halves in one word.
+        // The cause byte is the discriminant of the fault the place carries,
+        // so rustc is what keeps two causes of one place apart. What is left
+        // to read here is that the place byte separates the two halves and
+        // that the numbers a probe looks up are the ones documented.
         assert_eq!
         (
             ClockFault::PlanRejected(ClockPlanError::VcoOutsideBand).code(),
-            PLAN_REJECTED_FLAG | ClockPlanError::VcoOutsideBand.code()
+            0x0109
         );
-        assert_eq!(ClockFault::PlanRejected(ClockPlanError::VcoOutsideBand).code(), 0x0109);
-        assert_eq!(ClockFault::AudioKernelSourceWrong.code(), 0x0013);
+        assert_eq!
+        (
+            ClockFault::PartRefused(TreeFault::AudioKernelSourceWrong).code(),
+            0x0013
+        );
+
+        // One cause byte under the two places reads as two codes, which is
+        // what makes the place the answer to where the bring-up refused.
+        let plan = ClockFault::PlanRejected(ClockPlanError::SourceOutOfRange).code();
+        let part = ClockFault::PartRefused(TreeFault::PllNeverStopped).code();
+
+        assert_eq!(plan & 0xFF, part & 0xFF);
+        assert_ne!(plan, part);
+        assert_eq!(plan >> 8, u32::from(ClockPlace::Plan as u8));
+        assert_eq!(part >> 8, u32::from(ClockPlace::Part as u8));
+    }
+
+    #[test]
+    fn the_widest_code_the_encoding_can_carry_stays_under_the_ceiling()
+    {
+        // The ceiling bounds the whole encoding, not the values it reaches.
+        // The widest code reached today is the last plan bound.
+        let widest = ClockFault::PlanRejected(ClockPlanError::FrameNotPowerOfTwo).code();
+
+        assert_eq!(widest, 0x010F);
+        assert!(widest < CLOCK_CODE_CEILING);
+
+        // The ceiling is the width of a place byte over a cause byte. Reading
+        // it off the places declared today would let a place added later
+        // shrink the sweep that runs to it.
+        assert_eq!(CLOCK_CODE_CEILING, 0xFFFF);
     }
 
     #[test]
@@ -2276,7 +2243,7 @@ mod tests
         assert_eq!
         (
             bring_up(&mut tree, &AUDIO_PLAN, &waits()),
-            Err(ClockFault::SourceNotSelected)
+            Err(ClockFault::PartRefused(TreeFault::SourceNotSelected))
         );
     }
 
@@ -2287,20 +2254,20 @@ mod tests
 
         let cases: [Mutation; 14] =
         [
-            (|seen| seen.source_bits = 0, ClockFault::SourceNotSelected),
-            (|seen| seen.source_bypassed = true, ClockFault::SourceBypassed),
-            (|seen| seen.source_ready = false, ClockFault::SourceNotReady),
-            (|seen| seen.reference_divider_field = 4, ClockFault::ReferenceDividerWrong),
-            (|seen| seen.multiplier_field = 94, ClockFault::MultiplierWrong),
-            (|seen| seen.fraction_field = 0, ClockFault::FractionWrong),
-            (|seen| seen.output_divider_field = 21, ClockFault::OutputDividerWrong),
-            (|seen| seen.reference_range_bits = 3, ClockFault::ReferenceRangeWrong),
-            (|seen| seen.vco_band_bit = true, ClockFault::VcoBandWrong),
-            (|seen| seen.fraction_latched = false, ClockFault::FractionNotLatched),
-            (|seen| seen.output_enabled = false, ClockFault::OutputDisabled),
-            (|seen| seen.pll_on = false, ClockFault::PllNotEnabled),
-            (|seen| seen.pll_ready = false, ClockFault::PllNotLocked),
-            (|seen| seen.audio_kernel_bits = 0, ClockFault::AudioKernelSourceWrong),
+            (|seen| seen.source_bits = 0, TreeFault::SourceNotSelected),
+            (|seen| seen.source_bypassed = true, TreeFault::SourceBypassed),
+            (|seen| seen.source_ready = false, TreeFault::SourceNotReady),
+            (|seen| seen.reference_divider_field = 4, TreeFault::ReferenceDividerWrong),
+            (|seen| seen.multiplier_field = 94, TreeFault::MultiplierWrong),
+            (|seen| seen.fraction_field = 0, TreeFault::FractionWrong),
+            (|seen| seen.output_divider_field = 21, TreeFault::OutputDividerWrong),
+            (|seen| seen.reference_range_bits = 3, TreeFault::ReferenceRangeWrong),
+            (|seen| seen.vco_band_bit = true, TreeFault::VcoBandWrong),
+            (|seen| seen.fraction_latched = false, TreeFault::FractionNotLatched),
+            (|seen| seen.output_enabled = false, TreeFault::OutputDisabled),
+            (|seen| seen.pll_on = false, TreeFault::PllNotEnabled),
+            (|seen| seen.pll_ready = false, TreeFault::PllNotLocked),
+            (|seen| seen.audio_kernel_bits = 0, TreeFault::AudioKernelSourceWrong),
         ];
 
         assert_eq!(AUDIO_PLAN.verify(&sound), Ok(()));
@@ -2322,7 +2289,7 @@ mod tests
         seen.source_bits = 0;
 
         assert!(seen.pll_ready);
-        assert_eq!(AUDIO_PLAN.verify(&seen), Err(ClockFault::SourceNotSelected));
+        assert_eq!(AUDIO_PLAN.verify(&seen), Err(TreeFault::SourceNotSelected));
     }
 
     #[test]
@@ -2333,12 +2300,12 @@ mod tests
         let mut seen = verified_readback();
         seen.multiplier_field = AUDIO_PLAN.pll().multiplier();
 
-        assert_eq!(AUDIO_PLAN.verify(&seen), Err(ClockFault::MultiplierWrong));
+        assert_eq!(AUDIO_PLAN.verify(&seen), Err(TreeFault::MultiplierWrong));
 
         let mut seen = verified_readback();
         seen.output_divider_field = AUDIO_PLAN.pll().output_divider();
 
-        assert_eq!(AUDIO_PLAN.verify(&seen), Err(ClockFault::OutputDividerWrong));
+        assert_eq!(AUDIO_PLAN.verify(&seen), Err(TreeFault::OutputDividerWrong));
     }
 
     #[test]

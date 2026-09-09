@@ -4,13 +4,15 @@
 //! is the register block that sequence runs on, and nothing more: it writes
 //! `RCC`, reads it back, and hands the plan the fields it read.
 //!
-//! It touches no port pin. XSMT stays where the pull-down on it leaves it,
-//! whichever way a bring-up ends.
+//! It touches no port pin. XSMT stays where it is, whichever way a bring-up
+//! ends.
 //!
 //! What carries this clock to a pin is the output transport, which enables the
 //! audio interface and puts PE2 to PE6 on their alternate function. It runs
-//! only on the witness returned here, so a run that ends in a refusal leaves
-//! the kernel clock reaching nothing, even though the PLL can be left going.
+//! only on the witness returned here, and so does the gate that raises the
+//! converter mute line, so a run that ends in a refusal leaves the kernel
+//! clock reaching nothing and the converters where they were, even though the
+//! PLL can be left going.
 
 use pulsar_lib::clock::
 {
@@ -25,6 +27,7 @@ use pulsar_lib::clock::
     ReferenceRange,
     bring_up,
 };
+use pulsar_lib::release::VerifiedClock;
 use stm32h7::stm32h743v::RCC;
 use stm32h7::stm32h743v::rcc::d2ccip1r::SAI1SEL;
 use stm32h7::stm32h743v::rcc::pllcfgr::PLL1RGE;
@@ -70,6 +73,13 @@ pub(crate) struct AudioClock
 {
     /// The plan the read-back was compared against.
     plan: ClockPlan,
+}
+
+/// The release gate takes one of these and reads nothing out of it. What it
+/// needs is that one exists, since `start` is the only thing that builds one
+/// and it builds one only after the read-back agreed with the plan.
+impl VerifiedClock for AudioClock
+{
 }
 
 impl AudioClock
@@ -209,10 +219,12 @@ impl ClockTree for Tree<'_>
 ///
 /// # Errors
 ///
-/// Every variant of `ClockFault`. A refusal reached after the PLL started
-/// leaves it running, and it builds no witness, so the stage that would carry
-/// the output to a pin cannot be reached and a caller that answers a refusal
-/// by staying silent is silent.
+/// `PlanRejected` when the plan is one the part does not accept, `PartRefused`
+/// when the tree did not come up to a plan it does, each carrying the bound or
+/// the field that refused. A refusal reached after the PLL started leaves it
+/// running, and it builds no witness, so the stage that would carry the output
+/// to a pin cannot be reached and a caller that answers a refusal by staying
+/// silent is silent.
 pub(crate) fn start(rcc: &RCC, core_clock_hz: u32) -> Result<AudioClock, ClockFault>
 {
     let mut tree = Tree { rcc };

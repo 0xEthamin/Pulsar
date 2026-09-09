@@ -3,7 +3,7 @@
 #
 # The loudspeaker carries no analog filter and no analog mute, so the store that
 # drives XSMT low is the only thing between a fault and the drivers. The source
-# of pulsar_dsp claims five properties which neither a test nor the compiler
+# of pulsar_dsp claims six properties which neither a test nor the compiler
 # checks:
 #
 #   1. every fault and interrupt vector points at a handler that mutes,
@@ -14,7 +14,9 @@
 #      outside the range the startup zero fill walks,
 #   5. once the routine that carries the mute has built the record address in a
 #      register, it makes nine word stores through that register, at the nine
-#      record offsets, in rising offset order.
+#      record offsets, in rising offset order,
+#   6. each of the three start-up guards writes its own cause into the refusal
+#      word, and parks on the instruction after that write.
 #
 # Each claim is checked here against the disassembly of the image that ships.
 #
@@ -66,6 +68,54 @@
 # pre-indexed store, or any store reaching the record through another register,
 # is invisible to it.
 #
+# Claim 6 covers the one thing claim 5 names as unread, the value stored, on the
+# one seam where nothing else reads it. The three start-up guards carry one
+# domain and hand the same type to the same tagging function, so which guard
+# writes which cause is checked by no host test either: pulsar_dsp is a [[bin]],
+# and no host crosses that seam. Swapping two causes between two guards leaves
+# the compiler, clippy, every host test and claims 1 to 5 green, and sends a
+# person reading the record at a probe to the wrong guard. So this claim reads
+# the value: it resolves the immediate each guard builds ahead of its store into
+# the refusal word and requires the three, in the order the guards run, to be
+# the three start-up codes.
+#
+# This gate has only ever been EXTENDED. Claim 6 stands over the five above,
+# none of which is weakened to admit it, and no claim here has been loosened to
+# let a change through. When a gate has to be widened before a change fits, the
+# change is what needs reading, not the gate.
+#
+# Claim 6 finds the arms by the call, not by the value: every call the entry
+# function makes to the routine that carries the mute has to be a word store
+# away from it, and that store is the arm writing its refusal word. It then
+# reads the store backwards over the instructions that build the stored
+# register. A movw, a mov or a movs ends that walk with a value, a movt or a two
+# operand add carries it on, and anything else naming the register ends the walk
+# with nothing. So a word this claim reports was built by the instructions
+# between it and its store, and an arm whose word it cannot read is counted as
+# unread rather than guessed at.
+#
+# Where that store lands is read apart from the walk. The base register has to
+# be one the entry function loads with a single address, and that address plus
+# the offset of the store has to be the refusal word. A base the function loads
+# two ways is refused rather than resolved, and neither the address nor the
+# offset is taken on trust from the arm.
+#
+# Three things claim 6 does not read. It matches the order the arms are emitted
+# in, never which guard branches to which block, so a compiler that reorders the
+# cold blocks turns it red and the path gets read. Nothing here proves the base
+# register still holds that address where the store runs, only that the function
+# builds no other address in it. And an arm whose word is not built from
+# immediates is unread: the clock arm, the transport arm and the release arm
+# compute theirs from the fault they carry, so no claim here says what value any
+# of the three writes. Where each of them writes it is read on the terms above,
+# the same ones a guard arm faces.
+#
+# Both counts are read, which is what makes an arm added to main a decision
+# rather than a silence. A guard whose word is immediate joins STARTUP_REFUSALS
+# or the read count is wrong, and a stage that computes its word joins
+# COMPUTED_REFUSALS or the unread count is. Reading only the first count leaves
+# a stage free to park with an unread word and be named nowhere.
+#
 # What no claim here covers is the stack. This gate reads instructions and says
 # nothing about the stack pointer they run on. A handler entered on a corrupt
 # one faults on its own frame push, ahead of every instruction inspected below,
@@ -101,6 +151,35 @@ RECORD_SYMBOL=FAULT_RECORD
 RECORD_SECTION=.uninit
 RECORD_WORDS=9
 RECORD_BYTES=$((RECORD_WORDS * 4))
+
+# Word the start-up guards of main write their refusal into, owned by
+# pulsar_dsp. It is a private static, so the name a build keeps is the demangled
+# one and not the mangled one, whose hash moves with the crate metadata.
+REFUSAL_SYMBOL='pulsar_dsp::REFUSAL'
+
+# Refusal word each start-up guard writes, in the order the guards run, and the
+# guard each belongs to. The high half is the domain
+# pulsar_lib::postmortem::RefusalDomain gives the start-up, and the low half the
+# StartupFault discriminant of that guard.
+STARTUP_REFUSALS=(
+    "00010001 the core peripheral handle guard"
+    "00010003 the BusFault arming read-back"
+    "00010002 the device peripheral handle guard"
+)
+
+# Arms of main whose refusal word this gate does not read, in the order they are
+# emitted. Each builds its word out of the fault it carries, so the backward walk
+# ends with nothing rather than a value. Where the store lands is read all the
+# same: an unread arm faces the base register and offset check a read one faces,
+# so a computed word still has to reach the refusal word and nowhere else. What
+# is checked on top of that is that there are this many of them: a stage that
+# parks with a computed word and is named on no line below turns claim 6 red, so
+# a new one is read by a person before it ships.
+COMPUTED_REFUSALS=(
+    "the audio clock bring-up"
+    "the output transport bring-up"
+    "the converter mute release gate"
+)
 
 # Instructions a frame may run ahead of the mute store, or ahead of the call
 # that reaches it: the frame push, a register move, an immediate constant, a
@@ -343,6 +422,266 @@ fail()
 {
     echo "FAIL: $*" >&2
     return 1
+}
+
+# Prints the address the frame at one address calls, or nothing when that frame
+# runs anything but bare instructions ahead of its call.
+forwarded_to()
+{
+    local lines call_at
+
+    lines="$(body "$1")"
+    call_at="$(grep -nE '^bl 0x[0-9a-f]+' <<< "$lines" | head -1 | cut -d: -f1)"
+    if [ -z "$call_at" ] \
+        || [ -n "$(first_foreign "$(sed -n "1,${call_at}p" <<< "$lines")")" ]
+    then
+        return 1
+    fi
+
+    printf '%08x' "$(sed -n "${call_at}p" <<< "$lines" | cut -d' ' -f2)"
+}
+
+# Prints the instructions of the function the entry attribute wraps.
+#
+# cortex-m-rt emits main as a frame that forwards to it, the same shape a
+# forwarding fault handler wears, so the descent is the same one mute_body makes
+# and stops at the same depth.
+entry_body()
+{
+    local addr callee
+
+    addr="$(sym_addr main)"
+    if [ -z "$addr" ]
+    then
+        echo "FAIL: the image has no main symbol" >&2
+        return 1
+    fi
+
+    if ! callee="$(forwarded_to "$addr")"
+    then
+        echo "FAIL: main at 0x$addr does not forward to the function it wraps" >&2
+        return 1
+    fi
+
+    body "$callee"
+}
+
+# Prints the address of the routine that carries the mute, read out of the hard
+# fault handler that forwards to it.
+mute_routine()
+{
+    local addr callee
+
+    addr="$(sym_addr HardFault)"
+    if [ -z "$addr" ] || ! callee="$(forwarded_to "$addr")"
+    then
+        echo "FAIL: the hard fault handler forwards to no routine" >&2
+        return 1
+    fi
+
+    printf '%s' "$callee"
+}
+
+# Prints one line per call the entry function makes to the routine that carries
+# the mute: the refusal word the store ahead of that call carries, then the base
+# register and the offset that store reaches memory through. A word the walk
+# cannot read comes back as a dash.
+#
+# The word is read backwards from the store, over the instructions that build
+# the stored register. A movw, a mov or a movs ends the walk with a value, a
+# movt or a two operand add carries it on, and anything else naming that
+# register ends the walk with a dash. So a word printed here was built by the
+# instructions between it and its store, and by nothing else.
+park_arms()
+{
+    local mute=$1
+    local -a insn chain
+    local index at line padded store src base off value known step
+
+    mapfile -t insn <<< "$2"
+
+    for index in "${!insn[@]}"
+    do
+        if [ "${insn[index]%% *}" != "bl" ] \
+            || [ "$(cut -d' ' -f2 <<< "${insn[index]}")" != "$mute" ]
+        then
+            continue
+        fi
+
+        store="${insn[index - 1]-}"
+        if [[ ! "$store" =~ ^str(\.w)?\ (r[0-9]+|lr|ip),\ \[(r[0-9]+)(,\ \#(0x[0-9a-f]+))?\]$ ]]
+        then
+            echo "FAIL: the arm calling the mute routine at line $((index + 1))" \
+                "of the entry function runs \"$store\" ahead of the call, not a" \
+                "store" >&2
+            return 1
+        fi
+        src="${BASH_REMATCH[2]}"
+        base="${BASH_REMATCH[3]}"
+        off=$((${BASH_REMATCH[5]:-0}))
+
+        known=0
+        value=0
+        chain=()
+        at=$((index - 2))
+
+        while [ "$at" -ge 0 ]
+        do
+            line="${insn[at]}"
+            padded=" ${line//[,\[\]\{\}]/ } "
+
+            if [[ "$padded" != *" $src "* ]]
+            then
+                at=$((at - 1))
+                continue
+            fi
+
+            if [[ "$line" =~ ^(movw|movs|mov|mov\.w)\ $src,\ \#(0x[0-9a-f]+)$ ]]
+            then
+                value=$((${BASH_REMATCH[2]}))
+                known=1
+            elif [[ "$line" =~ ^(movt|adds?)\ $src,\ \#(0x[0-9a-f]+)$ ]]
+            then
+                chain=("$line" ${chain[@]+"${chain[@]}"})
+                at=$((at - 1))
+                continue
+            fi
+
+            break
+        done
+
+        if [ "$known" -ne 1 ]
+        then
+            printf -- '- %s %s\n' "$base" "$off"
+            continue
+        fi
+
+        for step in ${chain[@]+"${chain[@]}"}
+        do
+            if [[ "$step" =~ ^movt\ $src,\ \#(0x[0-9a-f]+)$ ]]
+            then
+                value=$(((value & 0xFFFF) | ($((${BASH_REMATCH[1]})) << 16)))
+            elif [[ "$step" =~ ^adds?\ $src,\ \#(0x[0-9a-f]+)$ ]]
+            then
+                value=$((value + $((${BASH_REMATCH[1]}))))
+            fi
+        done
+
+        printf '%08x %s %s\n' "$value" "$base" "$off"
+    done
+}
+
+# Prints the address the entry function loads one register with, or nothing when
+# it loads it with no address or with more than one.
+#
+# The halves are collected over the whole function rather than paired where they
+# stand, so a register the function loads with two different addresses comes
+# back empty and the arm reaching memory through it is refused.
+loaded_address()
+{
+    local reg=$1 lines=$2 lo hi
+
+    lo="$(sed -nE "s/^movw ${reg}, #(0x[0-9a-f]+)\$/\1/p" <<< "$lines" | sort -u)"
+    hi="$(sed -nE "s/^movt ${reg}, #(0x[0-9a-f]+)\$/\1/p" <<< "$lines" | sort -u)"
+
+    if [ -z "$lo" ] || [ -z "$hi" ] \
+        || [ "$(wc -l <<< "$lo")" -ne 1 ] || [ "$(wc -l <<< "$hi")" -ne 1 ]
+    then
+        return 1
+    fi
+
+    printf '%08x' "$(((hi << 16) | lo))"
+}
+
+# Checks claim 6 against the entry function.
+check_startup_refusals()
+{
+    local lines mute arms slot index expected label word base off carried
+    local -a resolved unread
+
+    if ! lines="$(entry_body)" || [ -z "$lines" ]
+    then
+        return 1
+    fi
+
+    slot="$(sym_addr "$REFUSAL_SYMBOL")"
+    if [ -z "$slot" ]
+    then
+        fail "the image has no $REFUSAL_SYMBOL symbol"
+        return 1
+    fi
+
+    if ! mute="$(mute_routine)"
+    then
+        return 1
+    fi
+
+    if ! arms="$(park_arms "0x$(printf '%x' "$((16#$mute))")" "$lines")" \
+        || [ -z "$arms" ]
+    then
+        fail "no arm of the entry function calls the routine that carries the" \
+            "mute"
+        return 1
+    fi
+
+    resolved=()
+    unread=()
+
+    while read -r word base off
+    do
+        if ! carried="$(loaded_address "$base" "$lines")"
+        then
+            fail "an arm of the entry function stores its refusal word through" \
+                "$base, which the function loads with no single address"
+            return 1
+        fi
+
+        if [ "$((16#$carried + off))" -ne "$((16#$slot))" ]
+        then
+            fail "an arm of the entry function stores its refusal word at" \
+                "0x$carried plus $off, and $REFUSAL_SYMBOL is at 0x$slot"
+            return 1
+        fi
+
+        if [ "$word" != "-" ]
+        then
+            resolved+=("$word")
+        else
+            unread+=("$base")
+        fi
+    done <<< "$arms"
+
+    if [ "${#resolved[@]}" -ne "${#STARTUP_REFUSALS[@]}" ]
+    then
+        fail "${#resolved[@]} arms of the entry function build their refusal" \
+            "word from immediates, the start-up has ${#STARTUP_REFUSALS[@]}" \
+            "guards"
+        return 1
+    fi
+
+    if [ "${#unread[@]}" -ne "${#COMPUTED_REFUSALS[@]}" ]
+    then
+        fail "${#unread[@]} arms of the entry function compute their refusal" \
+            "word, this gate names ${#COMPUTED_REFUSALS[@]} stages that do"
+        return 1
+    fi
+
+    for index in "${!STARTUP_REFUSALS[@]}"
+    do
+        expected="${STARTUP_REFUSALS[index]%% *}"
+        label="${STARTUP_REFUSALS[index]#* }"
+
+        if [ "${resolved[index]}" != "$expected" ]
+        then
+            fail "guard $((index + 1)) writes 0x${resolved[index]} to the" \
+                "refusal word, 0x$expected is the code of $label"
+            return 1
+        fi
+    done
+
+    echo "PASS: the ${#resolved[@]} start-up guards write their own cause into" \
+        "0x$slot, in the order they run, and park on the next instruction," \
+        "beside the ${#unread[@]} stages that compute their word"
 }
 
 # Checks claims 2 and 3 on one handler.
@@ -627,6 +966,7 @@ then
 fi
 
 check_record_slot || status=1
+check_startup_refusals || status=1
 
 check_mute_path "the hard fault handler" "$hard_fault" || status=1
 check_record_write "the hard fault handler" "$hard_fault" || status=1

@@ -34,6 +34,11 @@
 //! off its reset value in the two sub-blocks and the two streams is read back
 //! and compared against the plan.
 //!
+//! `StreamReadback` also carries the three error flags of a stream. The
+//! bring-up clears them and does not compare them, because what they report is
+//! a stream that has already run rather than a stream that is configured. They
+//! are here for a stage that watches the transfers over a window.
+//!
 //! # What the read-back does not reach
 //!
 //! The port. `AudioInterface::open_pins` puts five pins on the alternate
@@ -351,156 +356,208 @@ const fn build_tone_table() -> [i32; TONE_SAMPLES]
 pub const TONE_TABLE: [i32; TONE_SAMPLES] = build_tone_table();
 
 /// Reason the part would not accept a transport plan.
+///
+/// The discriminant of a variant is the cause byte a fault record carries for
+/// it, which is the number a person with a probe looks up. Two variants that
+/// carried one number would not compile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum TransportPlanError
 {
     /// The frame does not hold the slots the plan declares.
-    FrameLengthWrong,
+    FrameLengthWrong = 0x01,
     /// `MCKDIV` carries 1 to 63.
-    MasterDividerOutOfRange,
+    MasterDividerOutOfRange = 0x02,
     /// The buffer holds no whole number of frames.
-    BufferNotWholeFrames,
+    BufferNotWholeFrames = 0x03,
     /// The buffer holds no whole number of tone periods, so a circular replay
     /// of it steps across a discontinuity once per lap.
-    BufferNotWholePeriods,
+    BufferNotWholePeriods = 0x04,
     /// The buffer is empty.
-    BufferEmpty,
+    BufferEmpty = 0x05,
     /// The buffer holds more words than `NDTR` counts.
-    BufferTooLong,
+    BufferTooLong = 0x06,
     /// A buffer address is not on a word boundary, which a word wide transfer
     /// requires.
-    BufferUnaligned,
+    BufferUnaligned = 0x07,
     /// A buffer falls outside the memory this transport places its buffers in.
-    BufferUnreachable,
+    BufferUnreachable = 0x08,
     /// The two buffers overlap, so one sub-block reads what the other sends.
-    BuffersOverlap,
+    BuffersOverlap = 0x09,
 }
 
 /// Reason one audio sub-block is not running to plan.
+///
+/// The discriminant of a variant is the cause byte a fault record carries for
+/// it, which is the number a person with a probe looks up. Two variants that
+/// carried one number would not compile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum BlockFault
 {
     /// `MODE` does not carry the direction and mastership of the plan.
-    ModeWrong,
+    ModeWrong = 0x01,
     /// `PRTCFG` does not select the free protocol.
-    ProtocolWrong,
+    ProtocolWrong = 0x02,
     /// `DS` does not carry the data size of the plan.
-    DataSizeWrong,
+    DataSizeWrong = 0x03,
     /// `LSBFIRST` is set, so the frame carries the least significant bit first.
-    BitOrderWrong,
+    BitOrderWrong = 0x04,
     /// `CKSTR` does not put the data change on the edge opposite the one the
     /// converter samples.
-    ClockStrobingWrong,
+    ClockStrobingWrong = 0x05,
     /// `SYNCEN` does not carry the synchronisation of the plan.
-    SynchronisationWrong,
+    SynchronisationWrong = 0x06,
     /// `MONO` is set, so slot 0 is duplicated over slot 1.
-    MonoWrong,
+    MonoWrong = 0x07,
     /// `OUTDRIV` is set, so the data line is driven before the block runs.
-    OutputDriveWrong,
+    OutputDriveWrong = 0x08,
     /// `TRIS` is set, so the data line is released between slots.
-    TristateWrong,
+    TristateWrong = 0x09,
     /// `FTH` does not carry the transfer request threshold of the plan.
-    FifoThresholdWrong,
+    FifoThresholdWrong = 0x0A,
     /// `NOMCK` is set on the master, so no master clock reaches the converter.
-    MasterClockDisabled,
+    MasterClockDisabled = 0x0B,
     /// `MCKDIV` does not carry the master clock divider of the clock plan.
-    MasterDividerWrong,
+    MasterDividerWrong = 0x0C,
     /// `OSR` is set, so the master clock is 512 frame periods and not 256.
-    OversamplingWrong,
+    OversamplingWrong = 0x0D,
     /// `FRL` does not carry the frame length of the clock plan.
-    FrameLengthWrong,
+    FrameLengthWrong = 0x0E,
     /// `FSALL` does not hold the frame clock active for half the frame.
-    FrameActiveLengthWrong,
+    FrameActiveLengthWrong = 0x0F,
     /// `FSDEF` is clear, so the frame clock marks no channel side.
-    FrameDefinitionWrong,
+    FrameDefinitionWrong = 0x10,
     /// `FSPOL` is set, so the frame starts on the rising edge.
-    FramePolarityWrong,
+    FramePolarityWrong = 0x11,
     /// `FSOFF` is clear, so the frame clock moves on the first bit rather than
     /// one bit ahead of it.
-    FrameOffsetWrong,
+    FrameOffsetWrong = 0x12,
     /// `FBOFF` is not zero, so the word does not start at the top of its slot.
-    FirstBitOffsetWrong,
+    FirstBitOffsetWrong = 0x13,
     /// `SLOTSZ` does not carry the slot size of the plan.
-    SlotSizeWrong,
+    SlotSizeWrong = 0x14,
     /// `NBSLOT` does not carry the slot count of the plan.
-    SlotCountWrong,
+    SlotCountWrong = 0x15,
     /// `SLOTEN` leaves a slot of the frame inactive.
-    SlotsNotEnabled,
+    SlotsNotEnabled = 0x16,
     /// `DMAEN` is clear, so nothing fills the FIFO.
-    TransferDisabled,
+    TransferDisabled = 0x17,
     /// `SAIEN` is clear.
-    NotEnabled,
+    NotEnabled = 0x18,
     /// `OVRUDR` is set, so the transmitter has already sent a frame it had no
     /// data for.
-    Underrun,
+    Underrun = 0x19,
     /// `WCKCFG` is set, so the part refuses the frame against the master clock
     /// it was asked to generate.
-    ClockConfigurationRejected,
+    ClockConfigurationRejected = 0x1A,
     /// A sub-block interrupt is enabled, and no handler of this firmware serves
     /// one, so it would reach the fault path and silence the machine.
-    InterruptEnabled,
+    InterruptEnabled = 0x1B,
 }
 
 /// Reason one transfer stream is not running to plan.
+///
+/// The discriminant of a variant is the cause byte a fault record carries for
+/// it, which is the number a person with a probe looks up. Two variants that
+/// carried one number would not compile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum StreamFault
 {
     /// `DMAREQ_ID` routes another peripheral to the stream.
-    RequestWrong,
+    RequestWrong = 0x01,
     /// `SE` is set, so a synchronisation input gates the requests.
-    SynchronisationEnabled,
+    SynchronisationEnabled = 0x02,
     /// `DIR` does not carry a memory to peripheral transfer.
-    DirectionWrong,
+    DirectionWrong = 0x03,
     /// `CIRC` is clear, so the stream stops at the end of the buffer.
-    NotCircular,
+    NotCircular = 0x04,
     /// `MINC` is clear, so every transfer reads the same word.
-    MemoryNotIncrementing,
+    MemoryNotIncrementing = 0x05,
     /// `PINC` is set, so the stream walks off the data register.
-    PeripheralIncrementing,
+    PeripheralIncrementing = 0x06,
     /// `MSIZE` does not carry a word.
-    MemoryWidthWrong,
+    MemoryWidthWrong = 0x07,
     /// `PSIZE` does not carry a word.
-    PeripheralWidthWrong,
+    PeripheralWidthWrong = 0x08,
     /// `DBM` is set, so the stream expects a second buffer address.
-    DoubleBuffered,
+    DoubleBuffered = 0x09,
     /// `PL` does not carry the priority of the plan.
-    PriorityWrong,
+    PriorityWrong = 0x0A,
     /// A stream interrupt is enabled, and no handler of this firmware serves
     /// one, so it would reach the fault path and silence the machine.
-    InterruptEnabled,
+    InterruptEnabled = 0x0B,
     /// `PAR` does not address the data register of the sub-block the stream
     /// feeds.
-    PeripheralAddressWrong,
+    PeripheralAddressWrong = 0x0C,
     /// `M0AR` does not carry the buffer address of the plan.
-    MemoryAddressWrong,
+    MemoryAddressWrong = 0x0D,
     /// `NDTR` did not carry the buffer length of the plan when the stream was
     /// armed.
-    ItemCountWrong,
+    ItemCountWrong = 0x0E,
     /// `NDTR` reads past the buffer length while the stream runs, so the
     /// counter belongs to no lap of it.
-    CounterOutOfRange,
+    CounterOutOfRange = 0x0F,
     /// `EN` is clear.
-    NotEnabled,
+    NotEnabled = 0x10,
+}
+
+/// Reason the bring-up sequence of the output transport gave up.
+///
+/// These are the steps the sequence takes rather than a field it reads back,
+/// so no sub-block and no stream is named. The discriminant of a variant is
+/// the cause byte a fault record carries for it, which is the number a person
+/// with a probe looks up. Two variants that carried one number would not
+/// compile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SequenceFault
+{
+    /// A stream still reported enabled after it was told to stop, so its
+    /// configuration fields would not have taken.
+    StreamNeverStopped = 0x01,
+    /// A sub-block still reported enabled after it was told to stop, so its
+    /// configuration fields would not have taken.
+    BlockNeverStopped = 0x02,
+    /// A FIFO never left empty once the streams were running. Enabling a slave
+    /// transmitter on an empty FIFO is what RM0433 section 51.4.3 forbids.
+    FifoNeverFilled = 0x03,
+    /// A transfer counter never moved once both sub-blocks were running, so
+    /// the frame going out carries whatever the FIFO held and no more.
+    TransferNeverAdvanced = 0x04,
+}
+
+/// Where the output transport bring-up refused.
+///
+/// The discriminant is the place byte of a fault code. Two places that carried
+/// one number would not compile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum TransportPlace
+{
+    /// The bring-up sequence itself, which names no sub-block and no stream.
+    Sequence = 0x00,
+    /// The plan, refused before any register moved.
+    Plan = 0x01,
+    /// The master sub-block.
+    MasterBlock = 0x02,
+    /// The slave sub-block.
+    SlaveBlock = 0x03,
+    /// The stream feeding the master sub-block.
+    MasterStream = 0x04,
+    /// The stream feeding the slave sub-block.
+    SlaveStream = 0x05,
 }
 
 /// Reason the output transport is not running to plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportFault
 {
+    /// The bring-up sequence gave up on a step.
+    Sequence(SequenceFault),
     /// The plan itself is not one the part accepts.
     PlanRejected(TransportPlanError),
-    /// A stream still reported enabled after it was told to stop, so its
-    /// configuration fields would not have taken.
-    StreamNeverStopped,
-    /// A sub-block still reported enabled after it was told to stop, so its
-    /// configuration fields would not have taken.
-    BlockNeverStopped,
-    /// A FIFO never left empty once the streams were running. Enabling a slave
-    /// transmitter on an empty FIFO is what RM0433 section 51.4.3 forbids.
-    FifoNeverFilled,
-    /// A transfer counter never moved once both sub-blocks were running, so
-    /// the frame going out carries whatever the FIFO held and no more.
-    TransferNeverAdvanced,
     /// The master sub-block does not carry the plan.
     MasterBlock(BlockFault),
     /// The slave sub-block does not carry the plan.
@@ -509,6 +566,62 @@ pub enum TransportFault
     MasterStream(StreamFault),
     /// The stream feeding the slave sub-block does not carry the plan.
     SlaveStream(StreamFault),
+}
+
+/// Widest word the transport encoding can carry.
+///
+/// A code is a place byte over a cause byte, so the two types bound it. Nothing
+/// here numbers a place or a cause past its byte, so no variant added to any of
+/// the four enums can pass this, and a fault record therefore keeps the code
+/// out of the domain field it sits beside. The bound is not a value the
+/// encoding reaches.
+///
+/// It is the width of the pair and not the highest place declared today, so
+/// adding a place cannot lower it and cannot narrow what a sweep over the code
+/// space covers.
+pub(crate) const TRANSPORT_CODE_CEILING: u32 = u16::MAX as u32;
+
+impl TransportFault
+{
+    /// Returns the code a fault record carries for this fault.
+    ///
+    /// A probe reads the word and looks the value up here. The code is a place
+    /// byte over a cause byte: the place says WHERE the transport refused, the
+    /// cause says what that place refused with, and one word therefore names
+    /// both. The two sub-blocks share one cause enum, so the same field of
+    /// either reads as one cause under two places.
+    #[must_use]
+    pub const fn code(self) -> u32
+    {
+        u16::from_be_bytes([self.place() as u8, self.cause()]) as u32
+    }
+
+    /// Returns the place byte of the code.
+    const fn place(self) -> TransportPlace
+    {
+        match self
+        {
+            Self::Sequence(_) => TransportPlace::Sequence,
+            Self::PlanRejected(_) => TransportPlace::Plan,
+            Self::MasterBlock(_) => TransportPlace::MasterBlock,
+            Self::SlaveBlock(_) => TransportPlace::SlaveBlock,
+            Self::MasterStream(_) => TransportPlace::MasterStream,
+            Self::SlaveStream(_) => TransportPlace::SlaveStream,
+        }
+    }
+
+    /// Returns the cause byte of the code, which is the discriminant of the
+    /// fault the place carries.
+    const fn cause(self) -> u8
+    {
+        match self
+        {
+            Self::Sequence(fault) => fault as u8,
+            Self::PlanRejected(error) => error as u8,
+            Self::MasterBlock(fault) | Self::SlaveBlock(fault) => fault as u8,
+            Self::MasterStream(fault) | Self::SlaveStream(fault) => fault as u8,
+        }
+    }
 }
 
 /// Which sub-block of the interface a read-back belongs to.
@@ -648,7 +761,7 @@ pub struct BlockReadback
 }
 
 /// Every field of one transfer stream the register block drives off its reset
-/// value, and the two addresses.
+/// value, the two addresses, and the three error flags of the stream.
 ///
 /// Closed against the same boundary as `BlockReadback`, and ranging over the
 /// stream and its multiplexer channel alone. RM0433 section 15.5.5 resets
@@ -656,6 +769,13 @@ pub struct BlockReadback
 /// `0x0000_0021`, so `PFCTRL`, `MBURST`, `PBURST` and `DMDIS` come up carrying
 /// what this transport wants and the bring-up writes none of them to anything
 /// else.
+///
+/// The three error flags are outside that boundary and are read for a
+/// different reason. They are not fields a bring-up writes, they are what the
+/// controller raises while a stream runs, and a stage that watches the
+/// transfers over a window needs them. `bring_up` clears them before it starts
+/// the streams and does not compare them, so a flag read here belongs to the
+/// run the reader is looking at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[expect
 (
@@ -695,6 +815,32 @@ pub struct StreamReadback
     pub items: u32,
     /// `EN`.
     pub enabled: bool,
+    /// `TEIF` of this stream, in the interrupt status register of its
+    /// controller. RM0433 section 15.5.1 raises it on a bus error taken by a
+    /// transfer.
+    pub transfer_error: bool,
+    /// `DMEIF` of this stream.
+    ///
+    /// RM0433 section 15.3.20 confines the flag to a peripheral to memory
+    /// stream in direct mode with `MINC` clear. Both streams of this transport
+    /// are memory to peripheral with `MINC` set, so the part raises this on
+    /// neither of them, and it is read rather than reasoned away: a set bit
+    /// says the stream is not the one the plan armed or the part is not the
+    /// one the manual describes, and either answer belongs to a reader.
+    pub direct_mode_error: bool,
+    /// `FEIF` of this stream.
+    ///
+    /// RM0433 section 15.3.20 raises it in direct mode when the memory bus is
+    /// not granted before a peripheral request, which is a memory to
+    /// peripheral stream running out of data. It is reachable here, unlike
+    /// `DMEIF`.
+    ///
+    /// That reading holds while `DMDIS` is clear, which is the value the same
+    /// section resets it to and the value the register block writes. Nothing
+    /// reads it back, so a run with it set would leave this flag reporting a
+    /// burst against a FIFO threshold instead. Either way it is a stream not
+    /// carrying its plan, so the flag is read rather than interpreted.
+    pub fifo_error: bool,
 }
 
 /// Everything a bring-up reads back off the interface and its two streams.
@@ -1008,9 +1154,11 @@ impl TransportPlan
     ///
     /// # Errors
     ///
-    /// One variant of `TransportFault` per place, carrying the field of that
-    /// place that disagreed. The master sub-block is checked first, because it
-    /// is the one whose clocks the slave runs on.
+    /// `MasterBlock`, `SlaveBlock`, `MasterStream` or `SlaveStream`, carrying
+    /// the field of that place that disagreed. The two places a read-back
+    /// cannot reach, the sequence and the plan, are refused elsewhere. The
+    /// master sub-block is checked first, because it is the one whose clocks
+    /// the slave runs on.
     pub fn verify(self, seen: &TransportReadback) -> Result<(), TransportFault>
     {
         if let Err(fault) = self.verify_block(&seen.master, BlockRole::Master)
@@ -1491,15 +1639,19 @@ impl TransportWaits
 /// "configured as asked", so a bring-up that skipped a write ends here rather
 /// than at a flag. What it compares is every field the register block drives
 /// off its reset value in the two sub-blocks and the two streams, which
-/// `BlockReadback` and `StreamReadback` set out. The port is outside it.
+/// `BlockReadback` and `StreamReadback` set out. The port is outside it, and so
+/// are the three stream error flags, which this sequence clears rather than
+/// compares.
 ///
 /// # Errors
 ///
-/// `PlanRejected` before any register is touched, then one variant per step
-/// that did not take. A refusal reached after `start_master` leaves the clocks
-/// running on whatever the writes did land, which is what the caller wants: the
-/// converter mute sequence needs its clocks, and putting the interface back
-/// where a reset left it is not something a half-applied plan can do.
+/// `PlanRejected` before any register is touched, then `Sequence` carrying one
+/// `SequenceFault` per step that did not take, and one of the read-back
+/// variants per field that disagreed. A refusal reached after `start_master`
+/// leaves the clocks running on whatever the writes did land, which is what the
+/// caller wants: the converter mute sequence needs its clocks, and putting the
+/// interface back where a reset left it is not something a half-applied plan
+/// can do.
 pub fn bring_up<T>
 (
     interface: &mut T,
@@ -1518,14 +1670,14 @@ where
 
     if !poll_until(interface, waits.stream_polls, streams_stopped)
     {
-        return Err(TransportFault::StreamNeverStopped);
+        return Err(TransportFault::Sequence(SequenceFault::StreamNeverStopped));
     }
 
     interface.stop_blocks();
 
     if !poll_until(interface, waits.block_polls, blocks_stopped)
     {
-        return Err(TransportFault::BlockNeverStopped);
+        return Err(TransportFault::Sequence(SequenceFault::BlockNeverStopped));
     }
 
     interface.open_pins();
@@ -1538,7 +1690,7 @@ where
 
     if !poll_until(interface, waits.fifo_polls, fifos_filled)
     {
-        return Err(TransportFault::FifoNeverFilled);
+        return Err(TransportFault::Sequence(SequenceFault::FifoNeverFilled));
     }
 
     interface.start_slave();
@@ -1550,7 +1702,7 @@ where
 
     if !poll_until(interface, waits.transfer_polls, |seen| advanced(seen, &running))
     {
-        return Err(TransportFault::TransferNeverAdvanced);
+        return Err(TransportFault::Sequence(SequenceFault::TransferNeverAdvanced));
     }
 
     Ok(())
@@ -1660,6 +1812,20 @@ mod tests
     /// reference together.
     const TABLE_TOLERANCE: i64 = 1;
 
+    /// `FEIF`, `DMEIF` and `TEIF` of stream 0 in `DMA_LISR`.
+    ///
+    /// RM0433 section 15.5.1 puts them at bits 0, 2 and 3. The mock holds the
+    /// register word and the read takes the flags out of it, so a bit that
+    /// moves in the word moves in the read-back and nothing in the double
+    /// states what a bit is supposed to say.
+    const MASTER_FLAG_MASKS: (u32, u32, u32) = (1 << 0, 1 << 2, 1 << 3);
+
+    /// The same three flags of stream 1, at bits 6, 8 and 9.
+    const SLAVE_FLAG_MASKS: (u32, u32, u32) = (1 << 6, 1 << 8, 1 << 9);
+
+    /// Both sets, in the order the read-back carries the two streams.
+    const STREAM_FLAG_MASKS: [(u32, u32, u32); 2] = [MASTER_FLAG_MASKS, SLAVE_FLAG_MASKS];
+
     /// One broken field of a read-back, and the fault it must produce.
     type Mutation = (fn(&mut TransportReadback), TransportFault);
 
@@ -1695,6 +1861,7 @@ mod tests
     struct MockInterface
     {
         image: TransportReadback,
+        status: u32,
         polls: Cell<u32>,
         streams_started: bool,
         fifo_filled_after: u32,
@@ -1730,6 +1897,7 @@ mod tests
                     master_stream: reset_stream(),
                     slave_stream: reset_stream(),
                 },
+                status: 0,
                 polls: Cell::new(0),
                 streams_started: false,
                 fifo_filled_after: 2,
@@ -1810,7 +1978,20 @@ mod tests
             memory_address: 0,
             items: 0,
             enabled: false,
+            transfer_error: false,
+            direct_mode_error: false,
+            fifo_error: false,
         }
+    }
+
+    /// Takes the three error flags of one stream out of a `DMA_LISR` word.
+    fn apply_stream_flags(stream: &mut StreamReadback, status: u32, masks: (u32, u32, u32))
+    {
+        let (fifo, direct, transfer) = masks;
+
+        stream.fifo_error = status & fifo != 0;
+        stream.direct_mode_error = status & direct != 0;
+        stream.transfer_error = status & transfer != 0;
     }
 
     /// Writes one sub-block the way the register block does.
@@ -1938,6 +2119,10 @@ mod tests
             self.polls.set(polls);
 
             let mut seen = self.image;
+
+            apply_stream_flags(&mut seen.master_stream, self.status, MASTER_FLAG_MASKS);
+            apply_stream_flags(&mut seen.slave_stream, self.status, SLAVE_FLAG_MASKS);
+
             let filled = self.streams_started
                 && !self.fifo_stays_empty
                 && polls >= self.fifo_filled_after;
@@ -2323,7 +2508,7 @@ mod tests
         assert_eq!
         (
             bring_up(&mut interface, &plan(), &waits()),
-            Err(TransportFault::StreamNeverStopped)
+            Err(TransportFault::Sequence(SequenceFault::StreamNeverStopped))
         );
     }
 
@@ -2337,7 +2522,7 @@ mod tests
         assert_eq!
         (
             bring_up(&mut interface, &plan(), &waits()),
-            Err(TransportFault::BlockNeverStopped)
+            Err(TransportFault::Sequence(SequenceFault::BlockNeverStopped))
         );
     }
 
@@ -2350,7 +2535,7 @@ mod tests
         assert_eq!
         (
             bring_up(&mut interface, &plan(), &waits()),
-            Err(TransportFault::FifoNeverFilled)
+            Err(TransportFault::Sequence(SequenceFault::FifoNeverFilled))
         );
     }
 
@@ -2363,7 +2548,7 @@ mod tests
         assert_eq!
         (
             bring_up(&mut interface, &plan(), &waits()),
-            Err(TransportFault::TransferNeverAdvanced)
+            Err(TransportFault::Sequence(SequenceFault::TransferNeverAdvanced))
         );
     }
 
@@ -2622,6 +2807,64 @@ mod tests
     }
 
     #[test]
+    fn each_stream_error_flag_reads_back_on_its_own_stream()
+    {
+        // The two streams share one status register and sit at different bits
+        // in it, so a read that mixed the two sets would report a fault of the
+        // master on the slave. One bit is armed at a time and the whole
+        // read-back is swept for it.
+        for (armed, masks) in STREAM_FLAG_MASKS.iter().enumerate()
+        {
+            for (which, mask) in [masks.0, masks.1, masks.2].into_iter().enumerate()
+            {
+                let mut interface = MockInterface::healthy();
+                interface.status = mask;
+
+                let seen = interface.read();
+                let streams = [seen.master_stream, seen.slave_stream];
+
+                for (stream_index, stream) in streams.into_iter().enumerate()
+                {
+                    let flags =
+                        [stream.fifo_error, stream.direct_mode_error, stream.transfer_error];
+
+                    for (flag_index, raised) in flags.into_iter().enumerate()
+                    {
+                        let wanted = stream_index == armed && flag_index == which;
+
+                        assert_eq!
+                        (
+                            raised,
+                            wanted,
+                            "mask {mask:#x} raised flag {flag_index} of stream \
+                             {stream_index}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_stream_error_flag_does_not_refuse_the_bring_up()
+    {
+        // The bring-up clears these flags and compares none of them, because
+        // what they report is a stream that has already run. A stage that
+        // watches the transfers over a window is what reads them, and this
+        // says which of the two owns them.
+        let mut interface = MockInterface::healthy();
+        interface.status = u32::MAX;
+
+        assert_eq!(bring_up(&mut interface, &plan(), &waits()), Ok(()));
+
+        let seen = interface.read();
+
+        assert!(seen.master_stream.transfer_error);
+        assert!(seen.slave_stream.fifo_error);
+        assert_eq!(plan().verify(&seen), Ok(()));
+    }
+
+    #[test]
     fn the_two_streams_are_told_apart()
     {
         // Feeding the slave sub-block from the buffer and the request of the
@@ -2686,5 +2929,62 @@ mod tests
         assert!(slow.fifo_polls < fast.fifo_polls);
         assert!(slow.transfer_polls < fast.transfer_polls);
         assert_eq!(slow.stream_polls, 64_000);
+    }
+
+    #[test]
+    fn a_code_names_the_place_and_the_cause_apart()
+    {
+        // The cause byte is the discriminant of the fault the place carries,
+        // so rustc is what keeps two causes of one place apart. What is left
+        // to read here is that the place byte separates the groups and that
+        // the numbers a probe looks up are the ones documented.
+        assert_eq!
+        (
+            TransportFault::Sequence(SequenceFault::StreamNeverStopped).code(),
+            0x0001
+        );
+        assert_eq!
+        (
+            TransportFault::PlanRejected(TransportPlanError::BuffersOverlap).code(),
+            0x0109
+        );
+        assert_eq!(TransportFault::MasterBlock(BlockFault::ModeWrong).code(), 0x0201);
+        assert_eq!(TransportFault::SlaveBlock(BlockFault::InterruptEnabled).code(), 0x031B);
+        assert_eq!(TransportFault::MasterStream(StreamFault::RequestWrong).code(), 0x0401);
+        assert_eq!(TransportFault::SlaveStream(StreamFault::NotEnabled).code(), 0x0510);
+
+        // Two places share one cause enum, and nothing in the type system says
+        // the two arms of `place` name two places, so the pairs are read here.
+        // One cause under two places has to read as two codes that differ in
+        // the place byte alone.
+        let pairs =
+        [
+            (
+                TransportFault::MasterBlock(BlockFault::SlotsNotEnabled),
+                TransportFault::SlaveBlock(BlockFault::SlotsNotEnabled),
+            ),
+            (
+                TransportFault::MasterStream(StreamFault::NotCircular),
+                TransportFault::SlaveStream(StreamFault::NotCircular),
+            ),
+        ];
+
+        for (master, slave) in pairs
+        {
+            assert_eq!(master.code() & 0xFF, slave.code() & 0xFF);
+            assert_ne!(master.code() >> 8, slave.code() >> 8);
+        }
+    }
+
+    #[test]
+    fn the_widest_code_the_encoding_can_carry_stays_under_the_ceiling()
+    {
+        // The ceiling bounds the whole encoding, not the values it reaches.
+        // The widest code reached today is the last stream fault of the slave.
+        let widest = TransportFault::SlaveStream(StreamFault::NotEnabled).code();
+
+        assert_eq!(widest, 0x0510);
+        assert!(widest < TRANSPORT_CODE_CEILING);
+        assert_eq!(TRANSPORT_CODE_CEILING, 0xFFFF);
     }
 }

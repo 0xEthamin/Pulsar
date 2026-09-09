@@ -6,10 +6,19 @@
 //! and two transfer streams, reads them back, and hands the plan the fields it
 //! read.
 //!
-//! It touches neither PE7 nor XSMT. The converters stay where the pull-down on
-//! that pin leaves them, whichever way a bring-up ends, so what runs here is a
-//! frame on five pins and nothing that can be heard. The fault path of `main`
-//! is the one place in this firmware that drives PE7.
+//! It touches neither PE7 nor XSMT. The converters stay where they are,
+//! whichever way a bring-up ends, so what runs here is a frame on five pins
+//! and no change to the mute line. Two other places in this firmware drive
+//! PE7: the release gate raises it, and the fault path of `main` drives it
+//! low.
+//!
+//! # What the buffers carry
+//!
+//! Silence, until the release gate has run. `start` fills both with zeros
+//! before either stream is enabled, which is the term of the gate that has the
+//! converter walk its unmute ramp over silence. `write_tone` is what replaces
+//! them with the tone, and it takes the permit the gate returns, so a caller
+//! cannot decide for itself that the mute line went up.
 //!
 //! # Where the buffers live
 //!
@@ -31,6 +40,13 @@
 //! any handler. Not one transfer interrupt is enabled either, which is what the
 //! read-back checks: this binary serves none, so one would reach the fault path
 //! and silence the machine.
+//!
+//! `write_tone` therefore writes into buffers the transfer controllers are
+//! already reading, and puts a step at whichever position they have reached.
+//! That is one discontinuity of at most an eighth of full scale, once, on a
+//! path that reaches an oscilloscope and a pair of headphones. Removing it
+//! would take a refill served from a transfer interrupt, so it is measured
+//! rather than removed.
 
 use core::mem::MaybeUninit;
 use core::ptr;
@@ -63,6 +79,7 @@ use pulsar_lib::transport::
     TransportWaits,
     bring_up,
 };
+use pulsar_lib::release::TonePermit;
 use stm32h7::stm32h743v::dma1::st::cr::{DIR, PL, PSIZE};
 use stm32h7::stm32h743v::dmamux1::ccr::DMAREQ_ID;
 use stm32h7::stm32h743v::sai1::ch::cr1::{CKSTR, DS, MODE, PRTCFG, SYNCEN};
@@ -78,10 +95,17 @@ use stm32h7::stm32h743v::{DMA1, DMAMUX1, GPIOE, RCC, SAI1};
 use crate::clock::AudioClock;
 
 // Every value the plan names for a field this module writes is pinned here
-// against the encoding the peripheral crate carries for it. That is the one
-// seam of this lot no host test crosses: `pulsar_lib` is tested against its own
-// plan, so a plan value that does not mean what the register means passes every
-// test and reaches the pins.
+// against the encoding the peripheral crate carries for it. Those values are a
+// seam no host test crosses: `pulsar_lib` is tested against its own plan, so a
+// plan value that does not mean what the register means passes every test and
+// reaches the pins.
+//
+// The other seam of that kind is the read of the stream error flags below,
+// which names fields of `DMA_LISR` rather than plan values, and nothing pins
+// it. The peripheral crate leaves no way to: its field readers are not `const`,
+// so no assertion can call one, and its register reader carries private bits
+// with no public constructor, so no host test can build one either. What stands
+// there is the register section quoted at the read.
 //
 // The strobing edge is why the seam is checked rather than trusted. RM0433
 // section 51.6.2 names the edge the interface CHANGES its outputs on, and the
@@ -155,10 +179,11 @@ const AUDIO_ALTERNATE_FUNCTION: u8 = 6;
 /// `OSPEEDR` value the interface pins are driven at.
 ///
 /// The medium speed. At 3.3 V with 50 pF hanging on the pin the STM32H743VI
-/// datasheet table 160 guarantees 60 MHz there and a 5.2 ns edge, against the
-/// 11.2896 MHz of the fastest signal in the group. The lowest setting
-/// guarantees 12 MHz and a 16.6 ns edge, which is a fifth of a master clock
-/// period.
+/// datasheet table 160 gives 60 MHz there and a 5.2 ns edge, against the
+/// 11.2896 MHz of the fastest signal in the group. The lowest setting gives
+/// 12 MHz and a 16.6 ns edge, which is a fifth of a master clock period. Its
+/// note 1 makes every figure of that table guaranteed by design rather than
+/// tested in production.
 const AUDIO_PIN_SPEED: u8 = 0b01;
 
 /// `MODER` value putting a pin on its alternate function. RM0433 section 11.4.1.
@@ -189,9 +214,9 @@ const _: () = assert!
 /// Buffer the stream of the master sub-block replays.
 ///
 /// `.axisram` is a `NOLOAD` output section, so the startup sequence neither
-/// copies nor zeroes what lands here and `fill_buffer` is what puts the tone in
-/// it. The name is unmangled so that one string identifies the buffer in
-/// `llvm-nm` and in a debugger across rebuilds.
+/// copies nor zeroes what lands here and `fill_buffer` is what puts silence in
+/// it before either stream runs. The name is unmangled so that one string
+/// identifies the buffer in `llvm-nm` and in a debugger across rebuilds.
 #[expect
 (
     unsafe_code,
@@ -212,7 +237,7 @@ static mut MASTER_BUFFER: MaybeUninit<[u32; BUFFER_WORDS]> = MaybeUninit::uninit
 static mut SLAVE_BUFFER: MaybeUninit<[u32; BUFFER_WORDS]> = MaybeUninit::uninit();
 
 /// The audio interface, its two transfer streams and the pins that carry them.
-struct Interface<'a>
+pub(crate) struct Interface<'a>
 {
     sai: &'a SAI1,
     dma: &'a DMA1,
@@ -453,6 +478,30 @@ impl Interface<'_>
         let fifo = stream.fcr().read();
         let route = self.mux.ccr(index).read();
 
+        // RM0433 section 15.5.1 packs the flags of the first four streams into
+        // one register, `TEIF`, `DMEIF` and `FEIF` of stream 0 at bits 3, 2 and
+        // 0 and of stream 1 at bits 9, 8 and 6. The two sets are read through
+        // the field names of the peripheral crate rather than through masks,
+        // and they are read per role, so the flags of one stream cannot be
+        // reported on the other.
+        let status = self.dma.lisr().read();
+
+        let (transfer_error, direct_mode_error, fifo_error) = match role
+        {
+            BlockRole::Master =>
+            (
+                status.teif0().bit_is_set(),
+                status.dmeif0().bit_is_set(),
+                status.feif0().bit_is_set(),
+            ),
+            BlockRole::Slave =>
+            (
+                status.teif1().bit_is_set(),
+                status.dmeif1().bit_is_set(),
+                status.feif1().bit_is_set(),
+            ),
+        };
+
         StreamReadback
         {
             request_bits: route.dmareq_id().bits(),
@@ -474,6 +523,9 @@ impl Interface<'_>
             memory_address: stream.m0ar().read().m0a().bits(),
             items: u32::from(stream.ndtr().read().ndt().bits()),
             enabled: control.en().bit_is_set(),
+            transfer_error,
+            direct_mode_error,
+            fifo_error,
         }
     }
 }
@@ -501,8 +553,8 @@ impl AudioInterface for Interface<'_>
     /// this step.
     ///
     /// PE7 is not named here. It carries the converter mute, and this module
-    /// leaves it in the analog mode a reset gives it, under the 10 k pull-down
-    /// that holds it low. The fault path of `main` is what drives it.
+    /// leaves it where it stands. The release gate is what puts it under the
+    /// port and raises it, and the fault path of `main` is what drives it low.
     #[expect
     (
         unsafe_code,
@@ -635,8 +687,9 @@ const fn stream_index(role: BlockRole) -> usize
 
 /// Clears the five interrupt flags of one stream.
 ///
-/// A flag left from an earlier run is read by a probe as a fault of this one,
-/// and the read-back that follows the bring-up reports none of them.
+/// A flag left from an earlier run is read by a probe as a fault of this one.
+/// Three of the five reach the read-back, so clearing them here is what makes a
+/// flag the release gate finds one this run raised.
 fn clear_stream_flags(dma: &DMA1, role: BlockRole)
 {
     match role
@@ -684,11 +737,14 @@ fn enable_clocks(rcc: &RCC)
     let _ = rcc.apb2enr().read().sai1en().bit_is_set();
 }
 
-/// Writes one lap of the tone table into `buffer`.
+/// Writes one sample into every slot of `buffer`.
 ///
 /// Both slots of a frame carry the same sample, so the four channels of the
 /// frame send one waveform and any skew between the two data lines is the skew
 /// between the two sub-blocks rather than a difference in what they carry.
+///
+/// `sample` is read from a function of the frame index, which is what lets one
+/// walk write silence and another write the tone.
 ///
 /// The stores are volatile because nothing in this binary reads the buffer
 /// back. The transfer controller does, and no compiler sees that.
@@ -702,19 +758,19 @@ fn enable_clocks(rcc: &RCC)
               static the transfer controller also reads would claim exclusive \
               access this firmware does not have"
 )]
-fn fill_buffer(buffer: *mut [u32; BUFFER_WORDS])
+fn fill_buffer(buffer: *mut [u32; BUFFER_WORDS], sample: fn(usize) -> u32)
 {
     let base = buffer.cast::<u32>();
 
-    for (index, sample) in TONE_TABLE.iter().enumerate()
+    for index in 0..TONE_SAMPLES
     {
-        let word = sample.cast_unsigned();
+        let word = sample(index);
 
         // SAFETY: the array holds BUFFER_WORDS words, which is twice
         // TONE_SAMPLES, and this loop turns TONE_SAMPLES times writing the two
         // words at index * 2 and index * 2 + 1, so the last one written is the
-        // last of the array. This runs before either stream is enabled, so
-        // nothing else reads the buffer yet.
+        // last of the array. Nothing else in this firmware writes the buffer,
+        // and the transfer controller only reads it.
         unsafe
         {
             let frame = base.add(index.saturating_mul(2));
@@ -722,6 +778,44 @@ fn fill_buffer(buffer: *mut [u32; BUFFER_WORDS])
             ptr::write_volatile(frame.add(1), word);
         }
     }
+}
+
+/// Returns silence, whatever the frame index.
+const fn silence(_index: usize) -> u32
+{
+    0
+}
+
+/// Returns the tone table entry for one frame of the lap.
+///
+/// A frame index past the table describes no entry and gives silence, which
+/// the caller cannot reach: it walks `TONE_SAMPLES` frames and the table holds
+/// `TONE_SAMPLES` entries.
+fn tone(index: usize) -> u32
+{
+    match TONE_TABLE.get(index)
+    {
+        Some(sample) => sample.cast_unsigned(),
+        None => 0,
+    }
+}
+
+/// Writes the tone into both buffers, over the silence they were filled with.
+///
+/// `_permit` is what the release gate returns once the clocks were verified,
+/// the transfers were watched over a whole lap of the buffer, and the mute line
+/// had been high for the whole converter unmute ramp with zeros going out.
+/// Taking it is what stops a caller deciding for itself that the gate ran.
+///
+/// The streams are already replaying these buffers, so the write puts a step
+/// at whatever position the transfer controllers have reached. That step is
+/// one eighth of full scale at worst, once, into an oscilloscope and a pair of
+/// headphones. Removing it would take a refill from a transfer interrupt,
+/// which this firmware does not serve.
+pub(crate) fn write_tone(_permit: &TonePermit)
+{
+    fill_buffer((&raw mut MASTER_BUFFER).cast::<[u32; BUFFER_WORDS]>(), tone);
+    fill_buffer((&raw mut SLAVE_BUFFER).cast::<[u32; BUFFER_WORDS]>(), tone);
 }
 
 /// Brings the output transport up and proves the part took the plan.
@@ -738,14 +832,17 @@ fn fill_buffer(buffer: *mut [u32; BUFFER_WORDS])
 ///
 /// Once this returns the five pins carry a master clock, a bit clock, a frame
 /// clock and two data lines, and they keep carrying them with no further work
-/// from the core. XSMT is untouched, so the converters stay muted and nothing
-/// is audible.
+/// from the core. XSMT is untouched here, and both buffers hold zeros, so what
+/// goes out is a frame of silence and the release gate is what decides whether
+/// the mute line ever rises over it.
 ///
 /// # Errors
 ///
-/// Every variant of `TransportFault`. A refusal reached after the interface
-/// started leaves the clocks running, which is what the converter mute sequence
-/// needs, and the caller answers by staying silent.
+/// A `TransportFault` naming where the bring-up refused, the sequence, the
+/// plan, one of the two sub-blocks or one of the two streams, and what that
+/// place refused with. A refusal reached after the interface started leaves the
+/// clocks running, which is what the converter mute sequence needs, and the
+/// caller answers by staying silent.
 pub(crate) fn start
 (
     clock: &AudioClock,
@@ -759,23 +856,44 @@ pub(crate) fn start
 {
     enable_clocks(rcc);
 
-    fill_buffer((&raw mut MASTER_BUFFER).cast::<[u32; BUFFER_WORDS]>());
-    fill_buffer((&raw mut SLAVE_BUFFER).cast::<[u32; BUFFER_WORDS]>());
+    fill_buffer((&raw mut MASTER_BUFFER).cast::<[u32; BUFFER_WORDS]>(), silence);
+    fill_buffer((&raw mut SLAVE_BUFFER).cast::<[u32; BUFFER_WORDS]>(), silence);
 
-    // A pointer on this part is one word wide, which is what the transfer
-    // register holds, so the two addresses reach the plan unchanged. The plan
-    // is what refuses one outside the memory the buffers belong in.
-    let plan = TransportPlan::for_clock
+    let mut interface = observe(sai, dma, mux, port);
+
+    bring_up(&mut interface, &plan(clock), &TransportWaits::for_core_clock(core_clock_hz))
+}
+
+/// Returns the plan the interface and the release gate are both built on.
+///
+/// A pointer on this part is one word wide, which is what the transfer
+/// register holds, so the two addresses reach the plan unchanged. The plan is
+/// what refuses one outside the memory the buffers belong in.
+pub(crate) fn plan(clock: &AudioClock) -> TransportPlan
+{
+    TransportPlan::for_clock
     (
         &clock.plan(),
         (&raw const MASTER_BUFFER) as u32,
         (&raw const SLAVE_BUFFER) as u32,
         buffer_words()
-    );
+    )
+}
 
-    let mut interface = Interface { sai, dma, mux, port };
-
-    bring_up(&mut interface, &plan, &TransportWaits::for_core_clock(core_clock_hz))
+/// Returns a view of the audio interface, its two streams and the pins.
+///
+/// The release gate holds one by shared reference, and `AudioInterface` takes
+/// `&mut self` for every write and `&self` for the one read, so what it can do
+/// through this is read.
+pub(crate) fn observe<'a>
+(
+    sai: &'a SAI1,
+    dma: &'a DMA1,
+    mux: &'a DMAMUX1,
+    port: &'a GPIOE
+) -> Interface<'a>
+{
+    Interface { sai, dma, mux, port }
 }
 
 /// Returns the length of one buffer, as the plan counts it.

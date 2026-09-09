@@ -5,7 +5,26 @@
 //! reaches the drivers directly.
 //!
 //! The converters come out of reset muted, held there by the pull-down on their
-//! XSMT pin. Nothing in this binary raises XSMT, so they stay muted.
+//! XSMT pin. One stage of this binary raises XSMT, the release gate, and it
+//! does so only after the audio clock read back as planned, the transport read
+//! back as planned, both transfer counters reloaded twice with no error flag,
+//! which is a whole lap of their buffers whatever position they were found at,
+//! and a buffer of zeros was held over the converter unmute ramp. Every other
+//! path here drives that pin low once the core reaches its first instruction,
+//! and the two gaps below are where it does not.
+//!
+//! Once it has risen, the machine is audible until something drives the pin
+//! back down or a reset returns it to its pull-down. A core lockup does
+//! neither: PM0253 section 2.5.5 stops the core executing and leaves the
+//! peripherals alone, so the port keeps driving PE7 high with no instruction
+//! running to change it. A handler entered on a corrupt stack pointer is the
+//! second gap, described below, and what it leaves behind is undetermined
+//! rather than audible for certain. A fault path that runs is neither, since it
+//! drives the pin low as its first instruction. Nothing in this binary bounds
+//! either gap, because the watchdog that would is not here yet. That is
+//! accepted while no driver is connected and the only listeners are an
+//! oscilloscope and a pair of headphones, and it stops being acceptable the
+//! moment one is.
 //!
 //! A Rust panic, a hard fault, and any exception or interrupt without a handler
 //! of its own drive XSMT low and park the core, because a fault that mutes only
@@ -19,16 +38,23 @@
 //! through that same pointer. Section 2.5.2 exempts only the entry push, so
 //! nothing carries the second one, and whether XSMT goes low on this path is
 //! undetermined. Putting the mute in front of those pushes takes an entry that
-//! touches no stack, which this binary does not have.
+//! touches no stack, which this binary does not have. Past the release gate
+//! that undetermined case is a pin left high rather than a pin left on its
+//! pull-down, so what an overflow costs grew with the gate even though the path
+//! did not change.
 //!
 //! `main` brings the audio kernel clock up, then the output transport that
-//! carries it to the header. The clock bring-up reads the register fields the
-//! output frequency depends on back and compares each against the plan, because
-//! a lock bit reports a PLL fed from the wrong oscillator as ready. The
-//! transport bring-up does the same for every field it drives off its reset
-//! value in the two sub-blocks and the two transfer streams, because the
-//! interface reports no bit meaning "configured as asked". Either one failing
-//! to verify takes the fault path.
+//! carries it to the header, then the gate that unmutes the converters. The
+//! clock bring-up reads the register fields the output frequency depends on
+//! back and compares each against the plan, because a lock bit reports a PLL
+//! fed from the wrong oscillator as ready. The transport bring-up does the same
+//! for every field it drives off its reset value in the two sub-blocks and the
+//! two transfer streams, because the interface reports no bit meaning
+//! "configured as asked". The gate then measures rather than reads: it watches
+//! both transfer counters until each has reloaded twice, which a bring-up
+//! cannot do, since a counter that moves once does not tell a stream that runs
+//! from one that advances a word and stalls. Any of the three failing takes
+//! the fault path.
 //!
 //! Two inputs stay outside both read-backs. The crystal frequency is the one
 //! the clock depends on and no register reports, and the port that carries the
@@ -36,29 +62,44 @@
 //! witness that the part took the plan, not a proof of the frame rate and not a
 //! proof that a pin moves.
 //!
-//! Once both are up, PE2 to PE6 carry a master clock, a bit clock, a frame
-//! clock and two data lines, and a 1 kHz tone repeats on the four channels of
-//! the frame with no further work from the core. PE7 is named by nothing but
-//! the fault path, so it keeps the analog mode a reset leaves it in and the
-//! 10 k pull-down on it holds the converters muted through all of this.
+//! Once all three are up, PE2 to PE6 carry a master clock, a bit clock, a frame
+//! clock and two data lines, PE7 holds the converters unmuted, and a 1 kHz tone
+//! repeats on the four channels of the frame with no further work from the
+//! core. The tone is written last of all, and only against the permit the gate
+//! returns, so the buffers carry silence for the whole of the clock bring-up,
+//! the transport bring-up, the transfer window and the unmute ramp.
 //!
 //! Whichever path does reach the mute then latches the active exception number,
-//! the fault status registers and the clock fault code into `FAULT_RECORD`,
-//! between the mute and the park. The module documentation of
-//! `pulsar_lib::postmortem` carries the offset by offset layout to read at that
-//! symbol. Nothing in this binary reads the record back, and no fault reaches
-//! the control link, so a probe on SWD is the only reader.
+//! the fault status registers and the refusal code into `FAULT_RECORD`, between
+//! the mute and the park. The module documentation of `pulsar_lib::postmortem`
+//! carries the offset by offset layout to read at that symbol. Nothing in this
+//! binary reads the record back, and no fault reaches the control link, so a
+//! probe on SWD is the only reader.
 //!
-//! Every path here parks in `wfi`, which is Sleep, and Sleep stops the
+//! Those two fields say between them how a parked board got there. Every arm of
+//! `main` that parks writes a refusal code first, and each of them names one
+//! guard, one clock refusal, one transport refusal or one release refusal. A
+//! release refusal says as well whether the mute line had been raised when the
+//! gate refused, so a reader knows whether the board was ever audible. A vector
+//! writes none and is named by its exception number instead. The one entry
+//! that would set neither is the panic handler, which runs in thread mode and
+//! refuses nothing, and the compiler emits it only once something in the image
+//! can panic. While nothing can, no path of this binary seals a record with
+//! zero in both fields, so one that holds both came off a different image than
+//! the one on the bench.
+//!
+//! Every path here ends parked in `wfi`, which is Sleep, on a core that gets
+//! that far. The two gaps above are where one may not. Sleep stops the
 //! processor clock unless `DBGMCU_CR.DBGSLEEP_D1` is set. `main` sets it ahead
 //! of everything else, so a parked core keeps answering the debug port. Without
-//! that bit the record, the thirty-four clock fault codes it can carry and the
-//! two guards that tell it from stale memory have no reader at all.
+//! that bit the record, the refusal code it carries and the two guards that
+//! tell it from stale memory have no reader at all.
 
 #![no_std]
 #![no_main]
 
 mod clock;
+mod release;
 mod transport;
 
 use core::mem::MaybeUninit;
@@ -72,7 +113,7 @@ use cortex_m::peripheral::scb::Exception;
 use cortex_m::peripheral::{AC, SCB};
 use cortex_m_rt::{entry, exception};
 use pulsar_lib::constants::{BOOT_CORE_CLOCK_HZ, MAX_CORE_CLOCK_HZ, mute_hold_iterations};
-use pulsar_lib::postmortem::{FaultRecord, FaultRegisters};
+use pulsar_lib::postmortem::{self, FaultRecord, FaultRegisters, StartupFault};
 use stm32h7::stm32h743v as device;
 use stm32h7::stm32h743v::{GPIOE, RCC};
 
@@ -82,7 +123,11 @@ use stm32h7::stm32h743v::{GPIOE, RCC};
 /// the two modules cannot disagree about being muted.
 const XSMT_PIN: u8 = 7;
 
-/// Delay loop iterations the fault path holds before it parks the core.
+/// Delay loop iterations covering the converter mute sequence.
+///
+/// The fault path holds it after driving XSMT low, and the release gate holds
+/// it after raising XSMT, so the window that covers a ramp down and the window
+/// that covers a ramp up are one count and cannot drift apart.
 ///
 /// Sized for the highest core clock, so it is long enough at every slower one
 /// the part can run, including the 64 MHz it boots on.
@@ -107,28 +152,35 @@ const DBGSLEEP_D1: u32 = 1;
 /// thread mode.
 const VECTACTIVE_MASK: u32 = 0x1FF;
 
-/// Clock fault code a fault path that no clock bring-up refused carries.
+/// Refusal code a fault path no arm of `main` reached carries.
 ///
-/// `ClockFault::code` numbers no fault zero, so the record tells the two apart.
-const NO_CLOCK_FAULT: u32 = 0;
+/// Every domain of the encoding is numbered from 1, so a zero word says no arm
+/// of `main` wrote one and the path was entered from somewhere else.
+const NO_REFUSAL: u32 = 0;
 
-/// Clock fault code the fault path latches into the record.
+/// Refusal code the fault path latches into the record.
 ///
-/// A refused clock raises no exception, so it is the one cause `ICSR` cannot
+/// A refused start-up raises no exception, so it is the one cause `ICSR` cannot
 /// carry. It travels here rather than in an argument, which leaves
 /// `silence_and_park` with a signature a forwarding frame folds into its
 /// caller, and keeps the mute store the first memory access of every vector.
 ///
+/// One word carries every arm of `main`. The arms run one after another and
+/// each parks, so no two can write it. The domain field of the word says which
+/// stage refused, and the three guards below share one domain, so under it the
+/// cause byte is what says which guard.
+///
 /// The startup zero fill covers `.bss`, so the value out of reset is
-/// `NO_CLOCK_FAULT` and only the one arm of `main` that answers a refused clock
-/// writes it. `.bss` sits above STACK, where an overflowing stack does not
-/// reach, so the fault path reads it back on that route as well.
-static CLOCK_FAULT: AtomicU32 = AtomicU32::new(NO_CLOCK_FAULT);
+/// `NO_REFUSAL` and only the arms of `main` that park write it. `.bss` sits
+/// above STACK, where an overflowing stack does not reach, so the fault path
+/// reads it back on that route as well.
+static REFUSAL: AtomicU32 = AtomicU32::new(NO_REFUSAL);
 
 const _: () = assert!
 (
     XSMT_PIN == 7,
-    "the register writers in the fault path name pin 7 directly"
+    "the register writers in the fault path and in the release gate name pin 7 \
+     directly"
 );
 
 /// Post-mortem the fault path leaves at a fixed address.
@@ -160,10 +212,10 @@ static mut FAULT_RECORD: MaybeUninit<FaultRecord> = MaybeUninit::uninit();
 /// Sets `DBGMCU_CR.DBGSLEEP_D1`, which keeps a parked core on the debug port.
 ///
 /// `wfi` is Sleep, and Sleep stops the processor clock while the bit is clear,
-/// which is what a power on reset leaves it at. Every path of this binary ends
-/// parked in `wfi`, and a probe is the only reader `FAULT_RECORD` has, so this
-/// bit is what carries the record, its clock fault code and its two guards off
-/// the board.
+/// which is what a power on reset leaves it at. Every path of this binary that
+/// seals a record ends parked in `wfi`, and a probe is the only reader
+/// `FAULT_RECORD` has, so this bit is what carries the record, its refusal code
+/// and its two guards off the board.
 ///
 /// The other bits of the register are carried over rather than cleared. RM0433
 /// section 60.5.8 exempts this block from the system reset, so a debugger
@@ -197,20 +249,27 @@ fn keep_core_visible_in_sleep()
 /// park, so none of them takes the core off the debug port.
 ///
 /// PM0253 section 2.5.2 escalates a fault to `HardFault` when the handler for
-/// that fault is disabled, and exempts the stack push that enters an enabled
-/// `BusFault` handler from escalation. Arming `SHCSR.BUSFAULTENA` is what lets
-/// a faulted stack push reach a vector at all. It goes up before the clock, so
-/// a fault in the bring-up reaches a vector rather than lockup.
+/// that fault is disabled, and both vectors of this binary mute, so a bus error
+/// reaches the mute armed or not. What arming `SHCSR.BUSFAULTENA` buys is the
+/// escalation left over the handler that runs. The same section exempts the
+/// stack push that enters an enabled `BusFault` handler from escalation and
+/// sends a fault raised inside that handler on to `HardFault`, which mutes as
+/// well, while section 2.5.5 locks the core up on a fault taken inside the
+/// `HardFault` handler. So the mute gets two attempts armed and one disabled.
+/// It goes up before the clock, so the bring-up runs with the second one in
+/// place.
 ///
 /// Every arm below ends in silence, because no state of this binary means "the
 /// guard is absent" or "the clock is close enough". The waits are sized for the
 /// clock the part boots on, which is the one this function runs at, since
 /// nothing here moves the system clock off the internal oscillator.
 ///
-/// A refused clock is the one arm that names its cause. It writes the
-/// `ClockFault` code to `CLOCK_FAULT` before it enters the fault path, so a
-/// board that parks silent on the bench says which of the thirty-four refusals
-/// it hit rather than only that it refused.
+/// Every arm below names its cause. Each writes its code to `REFUSAL` before it
+/// enters the fault path, so a board that parks silent on the bench says which
+/// stage refused and what it refused on, rather than only that it refused. The
+/// three guards here carry a domain of their own, because a handle that comes
+/// back taken and a `BUSFAULTENA` that does not read back armed leave the same
+/// registers behind as a panic does.
 ///
 /// The transport takes the witness the clock bring-up returns by reference,
 /// which is what leaves the start order to the compiler: RM0433 requires the
@@ -219,12 +278,20 @@ fn keep_core_visible_in_sleep()
 ///
 /// The transport is what puts the master clock, the bit clock, the frame clock
 /// and the two data lines on the header. It configures PE2 to PE6 and leaves
-/// PE7 alone, so the converter mute keeps the pull-down that holds it.
+/// PE7 alone, so the converter mute is still on its pull-down when it returns,
+/// and it leaves both buffers holding zeros.
 ///
-/// A refused transport carries no code into the record. `FAULT_RECORD` names
-/// one clock fault and a refusal here is not one, and the interface and stream
-/// registers a refusal leaves behind say more than a code would: they are read
-/// over the debug port, in place, by the probe that measures the frame.
+/// A refused transport names where it refused, the bring-up sequence, the plan,
+/// one of the two sub-blocks or one of the two streams, and what that place
+/// refused with. The registers it leaves behind say more still, and a probe
+/// reads them in place, but only once a person knows a stage refused and which
+/// one.
+///
+/// The release gate runs last, on the same witness. It watches the transfers,
+/// puts PE7 under the port and raises it, and holds the buffers of zeros over
+/// the converter unmute ramp. This is the first time this firmware makes the
+/// machine audible, and the permit it returns is what the tone write needs, so
+/// nothing non-zero can reach the converters ahead of it.
 #[entry]
 fn main() -> !
 {
@@ -233,6 +300,11 @@ fn main() -> !
     let Some(mut core) = Peripherals::take()
     else
     {
+        REFUSAL.store
+        (
+            postmortem::startup_refusal(StartupFault::CoreHandleTaken),
+            Ordering::Relaxed
+        );
         silence_and_park()
     };
 
@@ -240,12 +312,22 @@ fn main() -> !
 
     if !core.SCB.is_enabled(Exception::BusFault)
     {
+        REFUSAL.store
+        (
+            postmortem::startup_refusal(StartupFault::BusFaultNotArmed),
+            Ordering::Relaxed
+        );
         silence_and_park()
     }
 
     let Some(part) = device::Peripherals::take()
     else
     {
+        REFUSAL.store
+        (
+            postmortem::startup_refusal(StartupFault::DeviceHandleTaken),
+            Ordering::Relaxed
+        );
         silence_and_park()
     };
 
@@ -254,7 +336,7 @@ fn main() -> !
         Ok(witness) => witness,
         Err(fault) =>
         {
-            CLOCK_FAULT.store(fault.code(), Ordering::Relaxed);
+            REFUSAL.store(postmortem::clock_refusal(fault), Ordering::Relaxed);
             silence_and_park()
         }
     };
@@ -270,10 +352,34 @@ fn main() -> !
         BOOT_CORE_CLOCK_HZ
     );
 
-    if transport.is_err()
+    if let Err(fault) = transport
     {
+        REFUSAL.store(postmortem::transport_refusal(fault), Ordering::Relaxed);
         silence_and_park()
     }
+
+    let released = release::start
+    (
+        &audio_clock,
+        &part.RCC,
+        &part.SAI1,
+        &part.DMA1,
+        &part.DMAMUX1,
+        &part.GPIOE,
+        BOOT_CORE_CLOCK_HZ
+    );
+
+    let permit = match released
+    {
+        Ok(permit) => permit,
+        Err(fault) =>
+        {
+            REFUSAL.store(postmortem::release_refusal(fault), Ordering::Relaxed);
+            silence_and_park()
+        }
+    };
+
+    transport::write_tone(&permit);
 
     loop
     {
@@ -303,13 +409,17 @@ fn main() -> !
 /// the barrier an interrupt already recognised can still be taken.
 ///
 /// The port clock and the pin direction come third, so the mute never waits on
-/// a read-modify-write. RM0433 resets every pin of this port to analog mode and
-/// nothing else in this binary names PE7, so the pad is high impedance until
-/// this step and the 10 k pull-down is what holds XSMT low there. This step is
-/// therefore what drives the pin, and the store above is what fixes the order:
-/// the transport sets `GPIOEEN`, so on every path where the converter clocks
-/// are running that store reaches `BSRR` rather than being dropped, ahead of
-/// the read this step performs.
+/// a read-modify-write. Which of the two steps drives the pad depends on how
+/// far the start-up got, and there are three answers. Past the release gate PE7
+/// is an output held high, and the store above is what takes it down. Short of
+/// the gate the pad is in the mode a reset left it in, the 10 k pull-down is
+/// what holds XSMT low, and this step is what puts a driver behind that level.
+/// Inside the gate, between the pad going under the port and the gate refusing
+/// or the raise landing, it is an output already held low and both steps find
+/// it where they want it. The store comes first in all three, which is what
+/// fixes the order: the transport and the gate both set `GPIOEEN`, so on every
+/// path where the converter clocks are running that store reaches `BSRR` rather
+/// than being dropped, ahead of the read this step performs.
 ///
 /// The post-mortem comes fourth, once the mute is complete, and it is the whole
 /// diagnostic this binary produces. The exception number comes from `ICSR`
@@ -320,12 +430,12 @@ fn main() -> !
 /// no frame leaves the board after a fault, and `FAULT_RECORD` is read by a
 /// probe alone.
 ///
-/// `CLOCK_FAULT` is the one cause `ICSR` cannot carry, since a refused clock
-/// raises no exception. This routine takes no argument, which is what lets the
-/// compiler fold a forwarding handler into the trampoline above it and leaves
-/// one frame push on each side of the vector rather than two. The code is read
-/// from `.bss` here, after the mute store, so the mute stays the first memory
-/// access of the path.
+/// `REFUSAL` is the one cause `ICSR` cannot carry, since a refused start-up
+/// raises no exception. This routine takes no argument, which is what
+/// lets the compiler fold a forwarding handler into the trampoline above it and
+/// leaves one frame push on each side of the vector rather than two. The code
+/// is read from `.bss` here, after the mute store, so the mute stays the first
+/// memory access of the path.
 ///
 /// The record goes down one word at a time, so the fault path builds no copy of
 /// it on the stack. The magic lands first and the checksum last, which leaves
@@ -416,7 +526,7 @@ fn silence_and_park() -> !
         };
 
         let slot = (&raw mut FAULT_RECORD).cast::<u32>();
-        let record = FaultRecord::new(&registers, CLOCK_FAULT.load(Ordering::Relaxed))
+        let record = FaultRecord::new(&registers, REFUSAL.load(Ordering::Relaxed))
             .to_words();
 
         for (index, word) in record.into_iter().enumerate()
@@ -453,8 +563,11 @@ fn panic(_info: &PanicInfo) -> !
 /// the `ExceptionFrame` argument, and the compiler still emits a frame push of
 /// its own, so the handler costs stack like any other. PM0253 section 2.5.5:
 /// once the core is in lockup it executes no instruction until a reset, an NMI
-/// or a debugger halt. Lockup leaves the port alone, so only a reset hands PE7
-/// back to the 10 k pull-down.
+/// or a debugger halt. Lockup leaves the port alone, so no instruction of this
+/// handler runs and only a reset hands PE7 back to the 10 k pull-down. Past the
+/// release gate that pin is an output held high, so lockup leaves the machine
+/// audible for as long as the board stays powered. The watchdog that would
+/// bound it is not in this binary.
 #[expect
 (
     unsafe_code,

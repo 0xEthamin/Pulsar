@@ -68,6 +68,26 @@ pub const MID_HIGH_HZ: f32 = 1_400.0;
 /// samples.
 pub const MUTE_RAMP_SAMPLES: u32 = 104;
 
+/// Samples the converter takes to raise its data to full scale once XSMT rises.
+///
+/// PCM5102A datasheet 9.3.3: a low to high transition on XSMT starts a soft
+/// digital un-mute that applies 1 dB gain steps every sample time from minus
+/// infinity to 0 dBFS, and takes this many samples.
+///
+/// This is the ramp UPWARD, and it is a different sentence of the datasheet
+/// from the one `MUTE_RAMP_SAMPLES` comes from. Section 11.2 gives a whole
+/// power down sequence and no section faces it with a power up one, so the
+/// figure here is the entire specification of the rise. The two counts
+/// coincide at 104 and describe opposite directions, so neither stands in for
+/// the other.
+const UNMUTE_RAMP_SAMPLES: u32 = 104;
+
+/// Length of the converter unmute ramp, in microseconds scaled by the rate.
+///
+/// It is here for the assertion below, which is what proves the hold a release
+/// runs after raising XSMT outlasts the ramp that raise starts.
+const UNMUTE_RAMP_US_TIMES_RATE: u32 = UNMUTE_RAMP_SAMPLES * MICROSECONDS_PER_SECOND;
+
 /// Sample periods in the converter mute sequence.
 ///
 /// PCM5102A datasheet 11.2, the sequence takes 150 tS plus a fixed term.
@@ -90,7 +110,24 @@ const MUTE_SEQUENCE_US_TIMES_RATE: u32 =
 /// The fault path lowers XSMT and leaves the audio clocks running for at least
 /// this long. Stopping them sooner strands the converter part way through its
 /// ramp, and it pops.
+///
+/// A release reuses it as the window it holds zeros over after raising XSMT.
+/// That window has to cover the unmute ramp, which is a shorter and separate
+/// figure, and the assertion below is what proves it does rather than assuming
+/// the two coincide.
 pub const MUTE_SEQUENCE_US: f32 = MUTE_SEQUENCE_US_TIMES_RATE as f32 / SAMPLE_RATE_HZ as f32;
+
+/// Frame clock periods of continuous zero data the converter analog mutes on.
+///
+/// PCM5102A datasheet 9.3.2.3: the part detects continuous zero data and
+/// enters a full analog mute, counting the zeros over 1024 frame clock periods
+/// before it does. In hardware mode both channels have to carry zero for the
+/// count to run, and both slots of this frame carry the same sample, so the
+/// condition is met whenever the buffer holds silence.
+///
+/// At this sample rate the count is 23.2 ms, six times the mute sequence, and
+/// the assertion below is what holds those two figures against each other.
+const ZERO_DATA_MUTE_FRAMES: u32 = 1_024;
 
 /// Duration of a gain ramp, in milliseconds.
 ///
@@ -188,6 +225,22 @@ const _: () = assert!
     "the full sequence outlasts the soft attenuation ramp inside it"
 );
 
+const _: () = assert!
+(
+    MUTE_SEQUENCE_US_TIMES_RATE > UNMUTE_RAMP_US_TIMES_RATE,
+    "the mute sequence a release holds zeros for outlasts the unmute ramp it \
+     is held over, so the converter walks its gain steps over silence"
+);
+
+const _: () = assert!
+(
+    ZERO_DATA_MUTE_FRAMES as u64 * MICROSECONDS_PER_SECOND as u64
+        > MUTE_SEQUENCE_US_TIMES_RATE as u64,
+    "the converter counts zeros for longer than its own mute sequence lasts, \
+     so what arms its analog mute is silence sent before the sequence and not \
+     the sequence"
+);
+
 #[cfg(test)]
 mod tests
 {
@@ -211,6 +264,36 @@ mod tests
         // 150 sample periods at 44.1 kHz plus 0.2 ms, so 3.6 ms.
         assert!((MUTE_SEQUENCE_US - 3_601.36).abs() < 1.0);
         assert!(MUTE_SEQUENCE_US > MUTE_RAMP_SAMPLES as f32 * SAMPLE_PERIOD_US);
+    }
+
+    #[test]
+    fn the_unmute_ramp_is_its_own_figure_and_the_hold_covers_it()
+    {
+        // 104 sample periods at 44.1 kHz, so 2.4 ms, against the 3.6 ms of the
+        // sequence the release hold is sized on. The two counts coincide and
+        // the two durations do not, which is what stops one standing in for
+        // the other.
+        let ramp = UNMUTE_RAMP_SAMPLES as f32 * SAMPLE_PERIOD_US;
+
+        assert_eq!(UNMUTE_RAMP_SAMPLES, 104);
+        assert!((ramp - 2_358.28).abs() < 1.0);
+        assert!((MUTE_SEQUENCE_US - ramp - 1_243.08).abs() < 1.0);
+    }
+
+    #[test]
+    fn the_zero_data_mute_outlasts_the_mute_sequence()
+    {
+        // 1024 frame clock periods at 44.1 kHz, so 23.2 ms against the 3.6 ms
+        // of the sequence, which is the ordering the compile time assertion
+        // beside the constant carries. Nothing here says whether a release
+        // reaches the count: what arms it is silence sent before the sequence
+        // rather than the sequence, and that belongs to the gate.
+        let zero_data = ZERO_DATA_MUTE_FRAMES as f32 * MICROSECONDS_PER_SECOND as f32
+            / SAMPLE_RATE_HZ as f32;
+
+        assert_eq!(ZERO_DATA_MUTE_FRAMES, 1_024);
+        assert!((zero_data - 23_219.95).abs() < 1.0);
+        assert!((zero_data - MUTE_SEQUENCE_US - 19_618.59).abs() < 1.0);
     }
 
     #[test]
