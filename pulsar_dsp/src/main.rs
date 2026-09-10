@@ -7,11 +7,12 @@
 //! The converters come out of reset muted, held there by the pull-down on their
 //! XSMT pin. One stage of this binary raises XSMT, the release gate, and it
 //! does so only after the audio clock read back as planned, the transport read
-//! back as planned, both transfer counters reloaded twice with no error flag,
-//! which is a whole lap of their buffers whatever position they were found at,
-//! and a buffer of zeros was held over the converter unmute ramp. Every other
-//! path here drives that pin low once the core reaches its first instruction,
-//! and the two gaps below are where it does not.
+//! back as planned, both transfer counters reloaded twice with no error flag
+//! raised over that window, which is a whole lap of their buffers whatever
+//! position they were found at, and a buffer of zeros was held over the
+//! converter unmute ramp. Every other path here drives that pin low once the
+//! core reaches its first instruction, and the two gaps below are where it
+//! does not.
 //!
 //! Once it has risen, the machine is audible until something drives the pin
 //! back down or a reset returns it to its pull-down. A core lockup does
@@ -53,8 +54,10 @@
 //! "configured as asked". The gate then measures rather than reads: it watches
 //! both transfer counters until each has reloaded twice, which a bring-up
 //! cannot do, since a counter that moves once does not tell a stream that runs
-//! from one that advances a word and stalls. Any of the three failing takes
-//! the fault path.
+//! from one that advances a word and stalls. It takes the two FIFO error flags
+//! down as that window opens, and no other flag, because the fill that starts
+//! the transport raises those two before it has carried anything and every one
+//! of these flags is sticky. Any of the three failing takes the fault path.
 //!
 //! Two inputs stay outside both read-backs. The crystal frequency is the one
 //! the clock depends on and no register reports, and the port that carries the

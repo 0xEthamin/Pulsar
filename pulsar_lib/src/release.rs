@@ -6,8 +6,9 @@
 //! verify, raise, hold, permit.
 //!
 //! Nothing here touches a peripheral. `AudioInterface` is how it observes the
-//! transport, `ConverterMute` is the mute line a register block implements,
-//! and `open` is the sequence run over the two.
+//! transport and how it takes the two FIFO error flags down as its window
+//! opens, `ConverterMute` is the mute line a register block implements, and
+//! `open` is the sequence run over the two.
 //!
 //! # The terms
 //!
@@ -31,6 +32,24 @@
 //! stream that advances one word and stalls. So `open` watches both transfer
 //! counters until each has reloaded twice, and reads the error flags of the
 //! two sub-blocks and the two streams on every poll of that window.
+//!
+//! The window opens on a cleared pair of `FEIF` flags, and on nothing else
+//! cleared. Both streams raise that flag while their FIFOs fill from empty,
+//! before either buffer has moved a half, and every one of these flags is
+//! sticky, so a window that kept it would refuse on the start-up of the very
+//! transport it is measuring. What makes taking it down lossless is RM0433
+//! section 15.3.20. It reads two ways, and the window catches both without the
+//! flag: a burst against a FIFO threshold clears `EN` in hardware, which is
+//! `StreamAlarm::NotEnabled`, and an underrun carries "there is no data loss
+//! when this kind of errors occur" with the one way out running through the
+//! peripheral, which is `BlockAlarm::Underrun` and is not cleared. `TEIF` and
+//! `DMEIF` are not cleared either, so a bus error or a part that is not the one
+//! the manual describes refuses whenever it appeared.
+//!
+//! The wipe runs once, ahead of the opening read. Inside the polling loop it
+//! would erase a flag raised while the window ran, which is the reading the
+//! window exists to take, and `watch` holds the interface by shared reference
+//! so that it cannot.
 //!
 //! Two reloads are what makes the window a lap. The counters are found wherever
 //! they stand, so the run up to a FIRST reload is a fraction of a lap and can
@@ -251,13 +270,20 @@ pub enum StreamAlarm
 {
     /// `TEIF` is set, so a transfer took a bus error.
     TransferError = 0x01,
-    /// `FEIF` is set.
+    /// `FEIF` is set, and the gate took it down as it opened the window, so
+    /// the condition was met while the window ran.
     ///
     /// RM0433 section 15.3.20 raises it in direct mode when the memory bus is
     /// not granted before a peripheral request, which is this stream running
-    /// out of data. Direct mode is `DMDIS` clear, which nothing reads back, so
-    /// the alternative reading is a burst against a FIFO threshold. Both say
-    /// the stream is not carrying the plan, which is why one cause covers them.
+    /// out of data. The same section attaches no data loss to that, so what
+    /// this refuses is a transport working at the edge of its bus rather than
+    /// a sample already gone. `BlockAlarm::Underrun` is where the loss the
+    /// manual does leave open arrives.
+    ///
+    /// Direct mode is `DMDIS` clear, which nothing reads back, so the
+    /// alternative reading is a burst against a FIFO threshold. That one has
+    /// the part clear `EN` in hardware, so `NotEnabled` refuses it whether or
+    /// not this flag does.
     FifoError = 0x02,
     /// `DMEIF` is set.
     ///
@@ -463,7 +489,12 @@ impl Laps
 ///
 /// The steps run in this order, and the order is the point.
 ///
-/// The transfers are watched first, while the line is still low, so nothing
+/// The two FIFO error flags go down first, in one call, because the fill that
+/// starts the transport raises them before it has carried anything. Nothing
+/// else is cleared, and nothing is cleared again after this, so every flag the
+/// window goes on to read belongs to the window.
+///
+/// The transfers are watched next, while the line is still low, so nothing
 /// this step refuses was ever audible. The window ends when both counters have
 /// reloaded twice, which is a whole lap of the buffer from wherever they were
 /// found, and every poll of it reads the two sub-blocks and the two streams for
@@ -493,7 +524,7 @@ impl Laps
 /// silent is silent.
 pub fn open<I, M, W>
 (
-    interface: &I,
+    interface: &mut I,
     line: &mut M,
     _clock: &W,
     plan: &TransportPlan,
@@ -504,6 +535,8 @@ where
     M: ConverterMute + ?Sized,
     W: VerifiedClock + ?Sized,
 {
+    interface.clear_fifo_errors();
+
     watch(interface, plan, waits)?;
 
     line.drive_low();
@@ -524,6 +557,10 @@ where
 ///
 /// The first reading opens the window and the budget is spent on the ones
 /// after it, so a budget of zero still buys one look at every alarm.
+///
+/// The interface comes in by shared reference, which is what leaves every
+/// write of it, the wipe of the FIFO error flags included, outside the loop. A
+/// wipe per poll would take down a flag raised between two of them.
 fn watch<I>
 (
     interface: &I,
@@ -716,6 +753,9 @@ mod tests
     /// One broken reading of the transport, and the fault it must produce.
     type Mutation = (fn(&mut TransportReadback), ReleaseFault);
 
+    /// One flag the transport holds, and the fault it must produce.
+    type StandingFlag = (fn(&mut MockFlags), ReleaseFault);
+
     /// One step of the mute line, in the order the gate asks for it.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Step
@@ -858,15 +898,74 @@ mod tests
         }
     }
 
+    /// The error flags the interface holds, as its registers hold them.
+    ///
+    /// Every one of them is sticky: the part raises it and it stands until
+    /// software writes the clear bit that names it. `clear_fifo_errors` is the
+    /// only thing here that writes one, so what a reading carries is what was
+    /// raised minus what that call took down.
+    #[derive(Debug, Clone, Copy)]
+    #[expect
+    (
+        clippy::struct_excessive_bools,
+        reason = "each field is one register flag, and naming them apart is \
+                  what lets a test raise one"
+    )]
+    struct MockFlags
+    {
+        /// `FEIF` of both streams.
+        fifo_error: bool,
+        /// `TEIF` of both streams.
+        transfer_error: bool,
+        /// `DMEIF` of both streams.
+        direct_mode_error: bool,
+        /// `OVRUDR` of both sub-blocks.
+        underrun: bool,
+    }
+
+    impl MockFlags
+    {
+        /// Returns the flags of a transport with none of them raised.
+        const fn none() -> Self
+        {
+            Self
+            {
+                fifo_error: false,
+                transfer_error: false,
+                direct_mode_error: false,
+                underrun: false,
+            }
+        }
+    }
+
+    /// Puts the flags the interface holds into one reading of it.
+    fn apply_flags(seen: &mut TransportReadback, flags: MockFlags)
+    {
+        seen.master.underrun = flags.underrun;
+        seen.slave.underrun = flags.underrun;
+
+        for stream in [&mut seen.master_stream, &mut seen.slave_stream]
+        {
+            stream.fifo_error = flags.fifo_error;
+            stream.transfer_error = flags.transfer_error;
+            stream.direct_mode_error = flags.direct_mode_error;
+        }
+    }
+
     /// An interface whose transfer counters walk down and reload.
     ///
-    /// Every write method is a no-op: the gate takes the interface by shared
-    /// reference and reads it, and this is what says so.
+    /// The only write it answers is `clear_fifo_errors`. The gate makes no
+    /// other one, and every remaining method is a no-op that says so.
     struct MockInterface
     {
         polls: Cell<u32>,
         master: MockStream,
         slave: MockStream,
+        /// Flags standing right now. Sticky, and held behind a cell because a
+        /// read is what raises one.
+        flags: Cell<MockFlags>,
+        /// Poll after which the transport holds `FEIF` up.
+        raises_fifo_error_at: u32,
         alarm_at: u32,
         alarm_polls: u32,
         alarm: fn(&mut TransportReadback),
@@ -882,10 +981,18 @@ mod tests
                 polls: Cell::new(0),
                 master: MockStream::running(TEST_MASTER_BUFFER),
                 slave: MockStream::running(TEST_SLAVE_BUFFER),
+                flags: Cell::new(MockFlags::none()),
+                raises_fifo_error_at: u32::MAX,
                 alarm_at: u32::MAX,
                 alarm_polls: 0,
                 alarm: |_| {},
             }
+        }
+
+        /// Raises a flag, the way the part does, before anything reads it.
+        fn hold(&mut self, flags: MockFlags)
+        {
+            self.flags.set(flags);
         }
 
         /// Arms `raise_it` on `polls` reads starting at poll `at`.
@@ -1027,18 +1134,39 @@ mod tests
                 slave_stream: self.slave.reading(polls),
             };
 
+            apply_flags(&mut seen, self.flags.get());
+
             if polls >= self.alarm_at
                 && polls.saturating_sub(self.alarm_at) < self.alarm_polls
             {
                 (self.alarm)(&mut seen);
             }
 
+            // The raise lands after the reading has been taken, which is where
+            // a condition met between two polls puts it. So a flag raised on
+            // poll n is one poll n + 1 finds standing, and a wipe run between
+            // the two is a wipe that takes it down unread.
+            if polls >= self.raises_fifo_error_at
+            {
+                let mut flags = self.flags.get();
+                flags.fifo_error = true;
+                self.flags.set(flags);
+            }
+
             seen
+        }
+
+        /// Writes the clear bit of `FEIF`, and of no other flag.
+        fn clear_fifo_errors(&mut self)
+        {
+            let mut flags = self.flags.get();
+            flags.fifo_error = false;
+            self.flags.set(flags);
         }
     }
 
-    /// Runs the gate on a healthy interface and returns what it did.
-    fn run(interface: &MockInterface) -> (Result<TonePermit, ReleaseFault>, MockLine)
+    /// Runs the gate on an interface and returns what it did.
+    fn run(interface: &mut MockInterface) -> (Result<TonePermit, ReleaseFault>, MockLine)
     {
         let mut line = MockLine::new();
         let outcome = open(interface, &mut line, &TestClock, &plan(), waits());
@@ -1066,8 +1194,8 @@ mod tests
     #[test]
     fn a_healthy_transport_gets_the_line_raised_and_a_permit()
     {
-        let interface = MockInterface::healthy();
-        let (outcome, line) = run(&interface);
+        let mut interface = MockInterface::healthy();
+        let (outcome, line) = run(&mut interface);
 
         assert!(outcome.is_ok());
         assert!(line.high.get());
@@ -1081,8 +1209,8 @@ mod tests
         // passes through a high nobody asked for, and the hold comes after the
         // raise rather than before it, or the zeros would run out before the
         // converter has finished ramping.
-        let interface = MockInterface::healthy();
-        let (outcome, line) = run(&interface);
+        let mut interface = MockInterface::healthy();
+        let (outcome, line) = run(&mut interface);
 
         assert!(outcome.is_ok());
         assert_eq!
@@ -1119,7 +1247,7 @@ mod tests
             interface.master.opened_at = opened_at;
             interface.slave.opened_at = opened_at;
 
-            let (outcome, _line) = run(&interface);
+            let (outcome, _line) = run(&mut interface);
             let watched = interface.polls.get().saturating_sub(1);
 
             assert!
@@ -1143,7 +1271,7 @@ mod tests
         interface.master.stalls_after = 0;
         interface.slave.stalls_after = 0;
 
-        let (outcome, line) = run(&interface);
+        let (outcome, line) = run(&mut interface);
 
         assert_eq!
         (
@@ -1164,7 +1292,7 @@ mod tests
         interface.master.stalls_after = 1;
         interface.slave.stalls_after = 1;
 
-        let (outcome, line) = run(&interface);
+        let (outcome, line) = run(&mut interface);
 
         assert_eq!
         (
@@ -1206,7 +1334,7 @@ mod tests
                     interface.master.stalls_after = POLLS_BEFORE_A_STALL;
                 }
 
-                let (outcome, line) = run(&interface);
+                let (outcome, line) = run(&mut interface);
                 let stream = if stalling_slave { "slave" } else { "master" };
 
                 assert_eq!
@@ -1313,7 +1441,7 @@ mod tests
                 let mut interface = MockInterface::healthy();
                 interface.arm(at, 1, raise_it);
 
-                let (outcome, line) = run(&interface);
+                let (outcome, line) = run(&mut interface);
 
                 assert_eq!
                 (
@@ -1333,21 +1461,115 @@ mod tests
     }
 
     #[test]
+    fn a_fifo_error_the_start_up_left_standing_does_not_refuse()
+    {
+        // Both streams raise FEIF while their FIFOs fill from empty, so the
+        // flag is up before the gate has read anything, and it is sticky. The
+        // window opens on the read that follows the wipe, so this is the one
+        // reading of that flag the gate is not entitled to.
+        let mut interface = MockInterface::healthy();
+        interface.hold(MockFlags { fifo_error: true, ..MockFlags::none() });
+
+        let (outcome, line) = run(&mut interface);
+
+        assert!
+        (
+            outcome.is_ok(),
+            "a FIFO error the wipe took down before the window still refused"
+        );
+        assert!(line.high.get(), "the window refused and left the mute line low");
+    }
+
+    #[test]
+    fn a_fifo_error_raised_inside_the_window_refuses_wherever_it_lands()
+    {
+        // The wipe runs once and ahead of the opening read, so every flag from
+        // there on is one the window measures. The poll the transport raises it
+        // on is swept over the window, and it stands from that poll to the end,
+        // which is what a wipe inside the polling loop would take down.
+        for at in ALARM_POLLS
+        {
+            let mut interface = MockInterface::healthy();
+            interface.raises_fifo_error_at = at;
+
+            let (outcome, line) = run(&mut interface);
+
+            assert_eq!
+            (
+                outcome.err(),
+                Some(ReleaseFault::MasterStream(Phase::Muted, StreamAlarm::FifoError)),
+                "a FIFO error the transport raised on poll {at} did not refuse"
+            );
+            assert!
+            (
+                !line.high.get(),
+                "a FIFO error the transport raised on poll {at} left the line high"
+            );
+        }
+    }
+
+    #[test]
+    fn the_wipe_reaches_the_fifo_error_and_leaves_every_other_flag_standing()
+    {
+        // Each of these three is raised by something the start-up does not do:
+        // RM0433 section 15.3.20 gives TEIF a bus error and confines DMEIF to a
+        // peripheral to memory stream in direct mode, and a sub-block raises
+        // OVRUDR on a frame it had no data for. So each of them is significant
+        // at any instant, and a wipe that reached one would drop a reading
+        // nothing else carries. Each is held from the construction of the mock,
+        // beside the FIFO error the wipe is entitled to.
+        let cases: [StandingFlag; 3] =
+        [
+            (
+                |flags| flags.transfer_error = true,
+                ReleaseFault::MasterStream(Phase::Muted, StreamAlarm::TransferError),
+            ),
+            (
+                |flags| flags.direct_mode_error = true,
+                ReleaseFault::MasterStream(Phase::Muted, StreamAlarm::DirectModeError),
+            ),
+            (
+                |flags| flags.underrun = true,
+                ReleaseFault::MasterBlock(Phase::Muted, BlockAlarm::Underrun),
+            ),
+        ];
+
+        for (raise_it, expected) in cases
+        {
+            let mut flags = MockFlags { fifo_error: true, ..MockFlags::none() };
+            raise_it(&mut flags);
+
+            let mut interface = MockInterface::healthy();
+            interface.hold(flags);
+
+            let (outcome, line) = run(&mut interface);
+
+            assert_eq!
+            (
+                outcome.err(),
+                Some(expected),
+                "the wipe of the FIFO error took {expected:?} down with it"
+            );
+            assert!(!line.high.get(), "{expected:?} left the mute line high");
+        }
+    }
+
+    #[test]
     fn an_alarm_raised_across_the_hold_drives_the_line_back_low()
     {
         // The read that follows the hold is the last one the gate makes, so a
         // healthy run is what says which poll it is rather than a figure
         // written here. An alarm armed there is one the gate can only see with
         // the mute line already high.
-        let healthy = MockInterface::healthy();
-        let (settled, _line) = run(&healthy);
+        let mut healthy = MockInterface::healthy();
+        let (settled, _line) = run(&mut healthy);
 
         assert!(settled.is_ok());
 
         let mut interface = MockInterface::healthy();
         interface.arm(healthy.polls.get(), 1, |seen| seen.master.underrun = true);
 
-        let (outcome, line) = run(&interface);
+        let (outcome, line) = run(&mut interface);
 
         assert_eq!
         (
@@ -1523,10 +1745,10 @@ mod tests
     #[test]
     fn a_wait_of_zero_polls_still_looks_once()
     {
-        let interface = MockInterface::healthy();
+        let mut interface = MockInterface::healthy();
         let mut line = MockLine::new();
         let waits = ReleaseWaits { lap_polls: 0 };
-        let outcome = open(&interface, &mut line, &TestClock, &plan(), waits);
+        let outcome = open(&mut interface, &mut line, &TestClock, &plan(), waits);
 
         assert_eq!
         (
