@@ -100,12 +100,13 @@ use crate::clock::AudioClock;
 // plan value that does not mean what the register means passes every test and
 // reaches the pins.
 //
-// The other seam of that kind is the read of the stream error flags below,
-// which names fields of `DMA_LISR` rather than plan values, and nothing pins
-// it. The peripheral crate leaves no way to: its field readers are not `const`,
-// so no assertion can call one, and its register reader carries private bits
-// with no public constructor, so no host test can build one either. What stands
-// there is the register section quoted at the read.
+// The other seams of that kind name flag fields of `DMA_LISR` and `DMA_LIFCR`
+// rather than plan values, and nothing pins them. The peripheral crate leaves
+// no way to: its field readers are not `const`, so no assertion can call one,
+// and its register reader carries private bits with no public constructor, so
+// no host test can build one either. What stands there is the register section
+// quoted at each of them, and, for the write that wipes the two FIFO error
+// flags, the read the release gate makes immediately after it.
 //
 // The strobing edge is why the seam is checked rather than trusted. RM0433
 // section 51.6.2 names the edge the interface CHANGES its outputs on, and the
@@ -660,6 +661,30 @@ impl AudioInterface for Interface<'_>
             slave_stream: self.read_stream(BlockRole::Slave),
         }
     }
+
+    /// Writes `CFEIF0` and `CFEIF1` into `DMA_LIFCR`, and no other bit.
+    ///
+    /// What holds the other flags up is not a property of the write but the one
+    /// way down they have. RM0433 section 15.5.1 gives `HTIF`, `TCIF`, `TEIF`,
+    /// `DMEIF` and `FEIF` the same sentence: each is set by hardware and
+    /// "cleared by software writing 1 to the corresponding bit" of `DMA_LIFCR`,
+    /// and the section describes no second route. A bit this write leaves at
+    /// zero therefore takes nothing down. Section 15.5.3 makes that register
+    /// write only, one flag per bit, and resets the word to zero.
+    ///
+    /// The `OVRUDR` of a sub-block is not reachable from here at all. It lives
+    /// in `SAI_xSR` and section 51.4.14 clears it on `COVRUDR` of `SAI_xCLRFR`,
+    /// which this module writes at bring-up and nowhere else.
+    ///
+    /// This is a seam nothing pins, like the read of the flags above, and it is
+    /// the one seam of the two that closes itself. The read that opens the
+    /// release window follows this write, so a bit that named the wrong stream
+    /// or a write that did not land leaves both flags standing and the window
+    /// refuses.
+    fn clear_fifo_errors(&mut self)
+    {
+        self.dma.lifcr().write(|w| w.cfeif0().set_bit().cfeif1().set_bit());
+    }
 }
 
 /// Returns the index of the sub-block a role names.
@@ -688,8 +713,10 @@ const fn stream_index(role: BlockRole) -> usize
 /// Clears the five interrupt flags of one stream.
 ///
 /// A flag left from an earlier run is read by a probe as a fault of this one.
-/// Three of the five reach the read-back, so clearing them here is what makes a
-/// flag the release gate finds one this run raised.
+/// It runs while the stream is stopped, so what it settles is `TEIF` and
+/// `DMEIF`, which nothing raises again until the stream carries a transfer.
+/// `FEIF` comes back up during the fill that follows, and the release gate is
+/// what takes that one down as it opens its window.
 fn clear_stream_flags(dma: &DMA1, role: BlockRole)
 {
     match role
@@ -882,9 +909,9 @@ pub(crate) fn plan(clock: &AudioClock) -> TransportPlan
 
 /// Returns a view of the audio interface, its two streams and the pins.
 ///
-/// The release gate holds one by shared reference, and `AudioInterface` takes
-/// `&mut self` for every write and `&self` for the one read, so what it can do
-/// through this is read.
+/// The release gate holds one by exclusive reference and makes one write
+/// through it, the wipe of the two FIFO error flags that opens its window.
+/// Everything else it does through this is a read.
 pub(crate) fn observe<'a>
 (
     sai: &'a SAI1,

@@ -774,8 +774,10 @@ pub struct BlockReadback
 /// different reason. They are not fields a bring-up writes, they are what the
 /// controller raises while a stream runs, and a stage that watches the
 /// transfers over a window needs them. `bring_up` clears them before it starts
-/// the streams and does not compare them, so a flag read here belongs to the
-/// run the reader is looking at.
+/// the streams and compares none of them. `FEIF` comes back up during the fill
+/// that follows, so what a later reader finds on it belongs to the start unless
+/// that reader took it down itself, which `AudioInterface::clear_fifo_errors`
+/// is for. The other two stand from the moment the streams were armed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[expect
 (
@@ -835,11 +837,18 @@ pub struct StreamReadback
     /// peripheral stream running out of data. It is reachable here, unlike
     /// `DMEIF`.
     ///
-    /// That reading holds while `DMDIS` is clear, which is the value the same
-    /// section resets it to and the value the register block writes. Nothing
+    /// The same section leaves the stream enabled there and says "there is no
+    /// data loss when this kind of errors occur", so the flag reports a
+    /// condition met and not a sample gone. Its note names the way out: an
+    /// acknowledge that takes too long has the peripheral run its own buffer
+    /// dry, which is the `OVRUDR` of `BlockReadback::underrun`.
+    ///
+    /// That reading holds while `DMDIS` is clear, which is the value section
+    /// 15.5.10 resets it to and the value the register block writes. Nothing
     /// reads it back, so a run with it set would leave this flag reporting a
-    /// burst against a FIFO threshold instead. Either way it is a stream not
-    /// carrying its plan, so the flag is read rather than interpreted.
+    /// burst against a FIFO threshold instead. Section 15.3.20 clears `EN` in
+    /// hardware on that one, so `enabled` reports it whether or not this flag
+    /// does.
     pub fifo_error: bool,
 }
 
@@ -1507,7 +1516,7 @@ const fn reaches_memory(address: u32, bytes: u32) -> bool
     address >= BUFFER_REGION_BASE && end <= region_end
 }
 
-/// The register writes and the one read a bring-up needs.
+/// The register writes and the one read a bring-up and a release gate need.
 ///
 /// Each write covers one step of the order the part specifies, because that
 /// order is what makes the writes take. `read` is the only way to observe the
@@ -1558,6 +1567,22 @@ pub trait AudioInterface
     ///
     /// The port is not among them. Nothing here observes it.
     fn read(&self) -> TransportReadback;
+
+    /// Clears `FEIF` on both streams, and nothing else.
+    ///
+    /// `HTIF`, `TCIF`, `TEIF` and `DMEIF` stand through it, and so does the
+    /// `OVRUDR` of either sub-block, which is the flag a sample the transmitter
+    /// never got reaches a reader through.
+    ///
+    /// A stage that measures the transfers over a window calls it once as that
+    /// window opens. Both streams raise `FEIF` while their FIFOs fill from
+    /// empty, before either buffer has moved a half, and the flag is sticky, so
+    /// a window that kept it would read the start rather than the run in front
+    /// of it. RM0433 section 15.3.20 is what makes taking it down lossless: the
+    /// stream stays enabled and the manual attaches no data loss to the
+    /// condition, and the loss it does leave open arrives at the peripheral,
+    /// which `BlockReadback::underrun` carries.
+    fn clear_fifo_errors(&mut self);
 }
 
 /// Polls each wait holds before it gives up.
@@ -1641,7 +1666,8 @@ impl TransportWaits
 /// off its reset value in the two sub-blocks and the two streams, which
 /// `BlockReadback` and `StreamReadback` set out. The port is outside it, and so
 /// are the three stream error flags, which this sequence clears rather than
-/// compares.
+/// compares. It clears them while the streams are stopped, and the FIFOs then
+/// fill from empty, which puts `FEIF` back up before the first frame goes out.
 ///
 /// # Errors
 ///
@@ -2144,6 +2170,13 @@ mod tests
             }
 
             seen
+        }
+
+        /// Writes `CFEIF0` and `CFEIF1` into the status word the reads take
+        /// their flags out of.
+        fn clear_fifo_errors(&mut self)
+        {
+            self.status &= !(MASTER_FLAG_MASKS.0 | SLAVE_FLAG_MASKS.0);
         }
     }
 

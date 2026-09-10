@@ -2,9 +2,9 @@
 //!
 //! `pulsar_lib::release` holds the terms, the sequence and the permit. This
 //! module is the port pin that sequence drives and the delay it holds: it
-//! writes PE7 low, hands it to the port driver, drives it high, and gives the
-//! gate a read only view of the transport to watch. The order those four run
-//! in belongs to the gate, so a host test reaches it.
+//! writes PE7 low, hands it to the port driver, drives it high, and hands the
+//! gate the transport to watch. The order those four run in belongs to the
+//! gate, so a host test reaches it.
 //!
 //! One line drives XSMT on both converter modules, so a single register write
 //! moves both and the two cannot disagree about being muted.
@@ -241,12 +241,12 @@ pub(crate) fn start
     enable_port_clock(rcc);
 
     let plan = transport::plan(clock);
-    let interface = transport::observe(sai, dma, mux, port);
+    let mut interface = transport::observe(sai, dma, mux, port);
     let mut line = MuteLine { port };
 
     open
     (
-        &interface,
+        &mut interface,
         &mut line,
         clock,
         &plan,
