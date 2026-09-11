@@ -22,6 +22,12 @@
 //! unit circle can land on or outside it, so every section faces the Jury
 //! triangle after it narrows and a design that fails is refused.
 //!
+//! `Biquad::step` is the other half of the module: it runs one sample through
+//! one section and advances the history that section carries. Design and
+//! difference equation sit together so that `cascade_magnitude` reads the
+//! coefficients the same `Biquad` runs, which is what lets a host test bound
+//! the response of the chain.
+//!
 //! Nothing here allocates. A cascade fills a buffer the caller owns and returns
 //! how many sections it wrote.
 
@@ -224,6 +230,73 @@ impl Default for Biquad
     fn default() -> Self
     {
         Self::SILENT
+    }
+}
+
+/// The four samples one section carries from a step to the next.
+///
+/// Direct form 1 feeds back the two inputs and the two outputs behind the
+/// current sample, so those four are the whole of what a section remembers. A
+/// state of zeros is a section at rest, and a section at rest fed silence
+/// produces silence, which is what makes a non zero output on a silent input
+/// the reading of a state that was never cleared.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub(crate) struct BiquadState
+{
+    /// The input one step back.
+    previous_input: f32,
+    /// The input two steps back.
+    older_input: f32,
+    /// The output one step back.
+    previous_output: f32,
+    /// The output two steps back.
+    older_output: f32,
+}
+
+impl BiquadState
+{
+    /// A section that carries no history.
+    pub(crate) const AT_REST: Self = Self
+    {
+        previous_input: 0.0,
+        older_input: 0.0,
+        previous_output: 0.0,
+        older_output: 0.0,
+    };
+}
+
+impl Biquad
+{
+    /// Runs one sample through the section and advances `state`.
+    ///
+    /// The RBJ Audio EQ Cookbook equation 4, which is the direct form 1
+    /// recurrence of the coefficient set its equation 2 normalises:
+    /// `y[n] = b0*x[n] + b1*x[n-1] + b2*x[n-2] - a1*y[n-1] - a2*y[n-2]`.
+    ///
+    /// Each term is a single precision multiply and each join a single
+    /// precision add, evaluated left to right, and no fused multiply-add stands
+    /// in for a pair. A host and the part therefore compute the same bits, so
+    /// the frequency response of the chain is measurable off the board against
+    /// `cascade_magnitude`, which is the only measurement of it that reads
+    /// finer than half a decibel.
+    ///
+    /// The value returned can stand above the input: a section of the crossover
+    /// overshoots a step by a few per cent. Bounding it belongs to whatever
+    /// converts the sample back to the format a buffer carries.
+    pub(crate) fn step(self, state: &mut BiquadState, input: f32) -> f32
+    {
+        let output = self.b0 * input
+            + self.b1 * state.previous_input
+            + self.b2 * state.older_input
+            - self.a1 * state.previous_output
+            - self.a2 * state.older_output;
+
+        state.older_input = state.previous_input;
+        state.previous_input = input;
+        state.older_output = state.previous_output;
+        state.previous_output = output;
+
+        output
     }
 }
 
@@ -651,6 +724,26 @@ const _: () = assert!
         && way_sections(Way::High) <= CROSSOVER_SECTIONS,
     "the buffer constant covers the length every way checks against"
 );
+
+/// Builds the section that answers every sample unchanged.
+///
+/// `b0` at one and the four others at zero. No design produces it, and it is
+/// reachable from no other module of the build: a section that passes the whole
+/// range is what a way with no filter on it would run, and `SILENT` is what an
+/// unwritten slot holds instead. What it is for is a test that measures where a
+/// loop PUTS a word, which needs the value to cross unchanged to be read at all.
+#[cfg(test)]
+pub(crate) const fn unit_section_for_test() -> Biquad
+{
+    Biquad
+    {
+        b0: 1.0,
+        b1: 0.0,
+        b2: 0.0,
+        a1: 0.0,
+        a2: 0.0,
+    }
+}
 
 #[cfg(test)]
 mod tests
