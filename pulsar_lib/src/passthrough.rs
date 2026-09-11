@@ -89,13 +89,23 @@
 //!
 //! The streams take 11.3 microseconds a word at this frame rate, so a block of
 //! 441 words is 5.000 milliseconds and a new event lands every 5.000
-//! milliseconds. The carry costs 0.47 microseconds a word folded into the
-//! handler, 207 microseconds a block, which is 24 times the faster of the two.
-//! The same carry with the two accessors left out of line costs 8.6, three
-//! calls and 65 instructions a word instead of 3.6, which is 3779 microseconds
-//! a block and only 1.3 times the faster. So the fold is not decoration: it is
-//! the difference between a budget spent at four per cent and one spent at
-//! seventy six.
+//! milliseconds. The carry spends 31 instructions and 11 memory accesses on a
+//! word, eight of those accesses the history the filter reads back and writes
+//! forward, which comes to 1.8 to 2.0 microseconds a word and 806 to 896
+//! microseconds a block on the clock the part boots on. That is 16 to 18 per
+//! cent of the period, and it leaves the carry about six times faster than the
+//! streams it has to stay ahead of.
+//!
+//! Those figures are a count of instructions and of memory accesses on the
+//! linked image, not a reading taken on the part. What carries their
+//! uncertainty is the cost of one access to the memory the buffers and the
+//! filter history sit in, taken at nine core cycles, which is what the
+//! allowance this firmware already runs on works out to. A bench closes it.
+//!
+//! The two accessors fold into the loop, and that is what keeps the count at 31
+//! instructions. Left out of line the same word costs 88 instructions and three
+//! calls for the same 11 accesses, counted the same way, so the fold buys about
+//! a third of the budget.
 //!
 //! A carry starts writing where the read pointer has just left, so it has a
 //! whole block of clearance ahead of it, 441 words or 5.000 milliseconds, at an
@@ -162,6 +172,7 @@
 
 use crate::clock::wait_polls;
 use crate::constants::{MICROSECONDS_PER_SECOND, SAMPLE_RATE_HZ};
+use crate::filter::{Biquad, BiquadState};
 use crate::release::{Laps, TonePermit};
 use crate::transport::
 {
@@ -228,9 +239,14 @@ const HALVES: u32 = 2;
 /// taken on time starts a whole block, 441 words and 5.000 milliseconds, ahead
 /// of it, and the floor is what a handler entered late enough runs into.
 ///
-/// A carry moves 441 words, and at thirty core cycles for a read and two writes
-/// it takes 207 microseconds on the clock the part boots on, so it is done
-/// inside a third of the tightest entry this admits.
+/// A carry of 441 words takes 806 to 896 microseconds on the clock the part
+/// boots on, which is LONGER than the 624 microseconds an entry at the floor
+/// leaves. What answers that is the rate rather than the total: the carry
+/// spends 1.8 to 2.0 microseconds on a word against the 11.3 the streams spend
+/// reading one, so from the tightest entry this admits it starts 55 words ahead
+/// of the read pointer and gains on it at every word. The total would only
+/// matter to a carry that ran no faster than the streams, and the module
+/// documentation carries what such a carry does.
 const GUARD_DIVISOR: u32 = 8;
 
 /// Lowest shift, as a fraction of one half, a start-up may leave.
@@ -538,6 +554,10 @@ pub enum InputSequenceFault
     /// seed budget, so the tone has not been round the link and the buffer
     /// still holds what was in it before.
     SeedNeverLapped = 0x06,
+    /// The coefficient build refused the corner the carry filters on, so the
+    /// stage carries no section and the machine stays silent rather than
+    /// carrying a way with no filter on it.
+    FilterRefused = 0x07,
 }
 
 /// Reason one transfer event is not one the block structure serves.
@@ -1703,8 +1723,8 @@ const fn overlaps(one: u32, other: u32, bytes: u32) -> bool
 ///
 /// Every method is `Sized`, and none of the generic functions over this trait
 /// admits `?Sized`. A call through `dyn InputInterface` is a call the compiler
-/// cannot fold, and the carry costs eighteen times the instructions a word out
-/// of line, so the door is shut rather than left open for a caller that does
+/// cannot fold, and the carry costs 88 instructions a word out of line against
+/// 31 folded, so the door is shut rather than left open for a caller that does
 /// not exist.
 pub trait InputInterface
 {
@@ -1796,6 +1816,154 @@ pub trait InputInterface
     fn write_word(&mut self, role: BlockRole, index: u32, word: u32);
 }
 
+/// One second order section and the history it carries between blocks.
+///
+/// # Where it lives
+///
+/// The caller owns it and lends it to the carry. Nothing here is a `static`, so
+/// a host test holds one per case and no case can reach the state of another,
+/// and this crate keeps `unsafe` forbidden. A handler has no caller to own
+/// anything, so the crate that owns the registers parks one and lends it the
+/// same way, and it parks it before the write that puts a served interrupt on a
+/// vector rather than after.
+///
+/// # Why it carries one history per slot
+///
+/// A buffer word is one slot of a frame, and the two slots of a frame are the
+/// two channels of a converter, so consecutive words belong to different
+/// channels. One history over that stream would feed each channel the samples
+/// of the other, and the shape it produced would be no filter the coefficients
+/// describe and nothing `cascade_magnitude` can be compared against.
+///
+/// So the section is one and the history is one per slot, which is the same
+/// filter running on each channel. A shift moves a whole number of frames, so a
+/// word keeps its slot from the receiving buffer to the output buffers and the
+/// parity of the source index is the channel.
+///
+/// # What an unpublished one carries
+///
+/// `silent` holds `Biquad::SILENT`, which stops the signal. A stage that never
+/// took its coefficients therefore carries silence rather than the full range
+/// of a way with no filter on it, and there is no value of this type that means
+/// no filtering.
+///
+/// # What bounds the sample it returns
+///
+/// A section overshoots. A crossover half answers a full scale step above full
+/// scale, so a signal near the ceiling leaves the section past it, and the
+/// conversion back to a buffer word SATURATES there. What a conversion that
+/// wrapped would answer is a sample of the opposite sign at full scale, which
+/// is a step of two full scales into a way with no analog filter in front of
+/// it.
+///
+/// The saturation stands at the conversion and nowhere else: the history the
+/// section feeds back is the value it computed. Feeding back the bounded value
+/// instead would put a limiter inside the feedback of a filter, which is no
+/// longer the filter the coefficients describe and no longer a shape
+/// `cascade_magnitude` can be compared against.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FilterStage
+{
+    section: Biquad,
+    first_slot: BiquadState,
+    second_slot: BiquadState,
+}
+
+/// Words between two samples of one channel.
+///
+/// A word is one slot of a frame and the slots of a frame are the channels of a
+/// converter, so one channel is every `SLOTS_PER_FRAME` words of a buffer.
+const CHANNEL_STRIDE: u32 = SLOTS_PER_FRAME as u32;
+
+/// A frame of another width would leave a channel with no history of its own,
+/// and the two above are the whole of what this type holds.
+///
+/// The transport pins the frame at 64 bits rather than at two slots, and a
+/// frame of four 16 bit slots satisfies that while leaving two channels of this
+/// stage sharing one history, so this stands on its own rather than repeating
+/// it.
+const _: () = assert!
+(
+    CHANNEL_STRIDE == 2,
+    "a frame carries a slot this stage keeps no history for"
+);
+
+impl FilterStage
+{
+    /// Returns a stage that stops the signal.
+    #[must_use]
+    pub const fn silent() -> Self
+    {
+        Self::of(Biquad::SILENT)
+    }
+
+    /// Returns a stage running `section` on each slot, with no history behind
+    /// either.
+    #[must_use]
+    pub const fn of(section: Biquad) -> Self
+    {
+        Self
+        {
+            section,
+            first_slot: BiquadState::AT_REST,
+            second_slot: BiquadState::AT_REST,
+        }
+    }
+
+    /// Runs the word standing at `index` through the section, advancing the
+    /// history of the slot that index names.
+    fn carry(&mut self, index: u32, word: u32) -> u32
+    {
+        let section = self.section;
+
+        let state = if index.is_multiple_of(CHANNEL_STRIDE)
+        {
+            &mut self.first_slot
+        }
+        else
+        {
+            &mut self.second_slot
+        };
+
+        carry_word(section, state, word)
+    }
+}
+
+/// Runs one buffer word through `section` and advances `state`.
+///
+/// A buffer word carries one sample as an `i32` at full scale. It widens to the
+/// format the section runs, crosses the section, and comes back through
+/// `to_word`, which is what bounds it.
+#[expect
+(
+    clippy::cast_precision_loss,
+    reason = "the audio path is single precision, and this is the step that \
+              gets a sample there"
+)]
+fn carry_word(section: Biquad, state: &mut BiquadState, word: u32) -> u32
+{
+    to_word(section.step(state, word.cast_signed() as f32))
+}
+
+/// Returns the buffer word `value` makes, bounded to the sample format.
+///
+/// The bound is the conversion itself. A float to integer cast in this language
+/// saturates: a value above the largest `i32` gives that largest one, a value
+/// below the smallest gives that smallest one, and a value that is not a number
+/// gives zero, which is silence. So the sample cannot come back round to the
+/// opposite sign, and the one place that could break it is a change of this
+/// line to a conversion that wraps.
+#[expect
+(
+    clippy::cast_possible_truncation,
+    reason = "the cast is the saturation, and inside the format it drops the \
+              fraction of the sample and nothing else"
+)]
+fn to_word(value: f32) -> u32
+{
+    (value as i32).cast_unsigned()
+}
+
 /// Carries one half of the receiving buffer into both output buffers, at the
 /// positions the words it holds were sent from.
 ///
@@ -1805,8 +1973,13 @@ pub trait InputInterface
 /// on. `CarryShift` holds that over the counter distance and over the pipeline
 /// taken off it both. Into both buffers, because the two converters replay one
 /// each and a word that reaches only one of them leaves the other replaying the
-/// lap before. That is the whole of the processing this path performs, and it
-/// is the loop a filter stage is inserted into.
+/// lap before.
+///
+/// `stage` filters the word ONCE, between the read and the two writes, so the
+/// two converters replay one sample rather than two computed apart, and the
+/// section crosses a word once however many buffers it fans out to. The history
+/// the stage carries runs on past the end of this call, which is what makes a
+/// block boundary nothing the signal can hear.
 ///
 /// The loop lives here rather than behind the trait so that a host test walks
 /// it, the fan-out onto the two buffers included. The register block owns the
@@ -1822,9 +1995,10 @@ pub trait InputInterface
 ///
 /// The streams that replay the output buffers take one word every 11.3
 /// microseconds at this frame rate, and this loop has a whole block to run in,
-/// which is 441 words and 5.000 milliseconds. Folded into the handler it costs
-/// 3.6 instructions a word, which is 207 microseconds a block on the clock the
-/// part boots on, so the streams are 24 times the slower of the two.
+/// which is 441 words and 5.000 milliseconds. Folded into the handler it spends
+/// 31 instructions and 11 memory accesses on a word, 1.8 to 2.0 microseconds,
+/// so a block costs 806 to 896 microseconds and the carry moves a word about
+/// six times faster than the streams read one.
 ///
 /// A loop that costs more than 5.000 milliseconds a block never catches up
 /// again, and the streams then overtake it inside the block: the words behind
@@ -1834,7 +2008,14 @@ pub trait InputInterface
 /// between two entries. It refuses at the entry that follows, so the damage
 /// comes out before the silence does. The module documentation carries the
 /// whole of it.
-pub fn carry_block<I>(interface: &mut I, plan: &InputPlan, half: Half, shift: CarryShift)
+pub(crate) fn carry_block<I>
+(
+    interface: &mut I,
+    plan: &InputPlan,
+    half: Half,
+    shift: CarryShift,
+    stage: &mut FilterStage
+)
 where
     I: InputInterface,
 {
@@ -1846,7 +2027,7 @@ where
     for step in 0..count
     {
         let index = first.saturating_add(step);
-        let word = interface.read_word(index);
+        let word = stage.carry(index, interface.read_word(index));
 
         interface.write_word(BlockRole::Master, at, word);
         interface.write_word(BlockRole::Slave, at, word);
@@ -1940,6 +2121,14 @@ const fn lap_microseconds(plan: &InputPlan, laps: u32) -> u32
 /// `arm` is the only thing that builds one, and it builds one only after it has
 /// consumed the permit the release gate returns. The field is private, so no
 /// other module and no other crate can construct one.
+///
+/// The state the carry advances does NOT live in here, and the reason is the
+/// instant this is minted. `arm` unmasks the line inside the call that returns
+/// this, so a handler entering between the unmask and the caller parking it
+/// would find no state at all, and the handler answers a thing it cannot find
+/// by silencing the machine. A `FilterStage` is parked ahead of the unmask
+/// instead, the way the carry shift is, and the property this type holds is
+/// unchanged: nothing reaches the vector without the permit.
 #[derive(Debug, PartialEq, Eq)]
 #[must_use]
 pub struct Passthrough(());
@@ -2249,16 +2438,22 @@ fn check_event_state(seen: &Event) -> Result<(), EventFault>
 /// # Errors
 ///
 /// `Event`, carrying what the entry refused with. Nothing has been written when
-/// one comes back, so the caller answers by silencing the machine.
-pub fn serve<I>(interface: &mut I, plan: &InputPlan, shift: CarryShift)
-    -> Result<(), PassthroughFault>
+/// one comes back and `stage` has not moved, so the caller answers by silencing
+/// the machine.
+pub fn serve<I>
+(
+    interface: &mut I,
+    plan: &InputPlan,
+    shift: CarryShift,
+    stage: &mut FilterStage
+) -> Result<(), PassthroughFault>
 where
     I: InputInterface,
 {
     let half = next_block(&interface.event(), plan, shift)?;
 
     interface.clear_event(half);
-    carry_block(interface, plan, half, shift);
+    carry_block(interface, plan, half, shift, stage);
 
     Ok(())
 }
@@ -2363,8 +2558,12 @@ mod tests
 
     use super::*;
     use crate::clock::AUDIO_PLAN;
+    use crate::constants::LOW_MID_HZ;
+    use crate::filter::{LINKWITZ_RILEY_SECTIONS, cascade_magnitude, linkwitz_riley_low_pass};
     use crate::transport::{TONE_SAMPLES, TONE_TABLE};
     use core::cell::Cell;
+    use core::f64::consts::TAU;
+    use libm::{cos, round, sin, sqrt};
 
     /// Words in each buffer of the tests, one tone period per channel.
     const TEST_WORDS: u32 = TONE_SAMPLES as u32 * 2;
@@ -2436,6 +2635,72 @@ mod tests
         let truncated = offset - offset % plan().frame_slots();
 
         CarryShift(truncated - PIPELINE_WORDS)
+    }
+
+    /// Returns the section every test below runs.
+    ///
+    /// One section of the four pole low-pass the low way carries, which is the
+    /// section the register crate publishes, so a test measures the filter the
+    /// machine runs rather than one written for the occasion.
+    fn section() -> Biquad
+    {
+        let mut sections = [Biquad::SILENT; LINKWITZ_RILEY_SECTIONS];
+        let built = linkwitz_riley_low_pass(LOW_MID_HZ, SAMPLE_RATE_HZ, &mut sections);
+
+        assert_eq!(built, Ok(LINKWITZ_RILEY_SECTIONS), "the low-pass refused its own corner");
+
+        sections.first().copied().unwrap_or(Biquad::SILENT)
+    }
+
+    /// Returns a stage at rest running that section.
+    fn stage() -> FilterStage
+    {
+        FilterStage::of(section())
+    }
+
+    /// Returns a stage that answers every word unchanged.
+    ///
+    /// The two loop tests below measure WHERE a word lands over laps of a
+    /// closed link, and a closed link crosses the section once a lap, so a
+    /// shape that attenuates takes the content to zero and leaves them
+    /// comparing silence against silence. A transparent section is what keeps
+    /// the placement readable. The response of the real section is measured
+    /// over a driven source instead, where it belongs.
+    fn transparent_stage() -> FilterStage
+    {
+        FilterStage::of(crate::filter::unit_section_for_test())
+    }
+
+    /// Returns the word `word` becomes once it has crossed the stage.
+    ///
+    /// A transparent section changes no value, and the sample still crosses
+    /// single precision, which holds 24 bits of a sample that carries 32. So a
+    /// word comes back rounded, by at most half of one unit in the last place
+    /// of its own magnitude, and the rounded value is a fixed point of the trip:
+    /// it is already a float, so a second crossing leaves it where it is. That
+    /// is what makes this an exact expectation over any number of laps rather
+    /// than a tolerance.
+    #[expect
+    (
+        clippy::cast_precision_loss,
+        reason = "the narrowing is the property this measures"
+    )]
+    fn narrowed(word: u32) -> u32
+    {
+        ((word.cast_signed() as f32) as i32).cast_unsigned()
+    }
+
+    /// Returns `buffer` with every word narrowed.
+    fn narrowed_buffer(buffer: &[u32; TEST_WORDS as usize]) -> [u32; TEST_WORDS as usize]
+    {
+        let mut out = [0_u32; TEST_WORDS as usize];
+
+        for (slot, word) in out.iter_mut().zip(buffer.iter())
+        {
+            *slot = narrowed(*word);
+        }
+
+        out
     }
 
     /// Builds a permit the way the release gate does.
@@ -3610,17 +3875,22 @@ mod tests
         }
     }
 
-    /// Returns what the two output buffers hold once the words of `half` have
-    /// been carried onto an empty pair of them.
+    /// Writes into `want` what a carry of `half` through a TRANSPARENT section
+    /// leaves in an output buffer.
     ///
-    /// The destination is written out here from the distance the mock is armed
-    /// at, less the pipeline the data crosses, rather than taken from
-    /// `CarryShift`, so the expectation is not the code under test spelled
-    /// twice.
-    fn carried_image(half: Half) -> [u32; TEST_WORDS as usize]
+    /// Both halves of the expectation are closed forms, and neither calls the
+    /// code under test. The destination comes from the distance the mock is
+    /// armed at, less the pipeline the data crosses, rather than from
+    /// `CarryShift`. The value comes from `narrowed`, since a transparent
+    /// section changes nothing but the single precision the sample crosses.
+    ///
+    /// The tests that use this measure WHERE a word lands and how many buffers
+    /// it reaches. What the real section does to a word is measured against
+    /// `cascade_magnitude` and against a straight walk of the same samples,
+    /// neither of which knows anything about this loop.
+    fn carry_into_image(half: Half, want: &mut [u32; TEST_WORDS as usize])
     {
         let plan = plan();
-        let mut want = [0_u32; TEST_WORDS as usize];
 
         for step in 0..plan.block_words()
         {
@@ -3629,9 +3899,18 @@ mod tests
 
             if let Some(slot) = want.get_mut(at as usize)
             {
-                *slot = 0xC0DE_0000 | index;
+                *slot = narrowed(0xC0DE_0000 | index);
             }
         }
+    }
+
+    /// Returns what the two output buffers hold once the words of `half` have
+    /// been carried onto an empty pair of them through a transparent section.
+    fn carried_image(half: Half) -> [u32; TEST_WORDS as usize]
+    {
+        let mut want = [0_u32; TEST_WORDS as usize];
+
+        carry_into_image(half, &mut want);
 
         want
     }
@@ -3644,7 +3923,7 @@ mod tests
             let mut interface = MockInput::healthy();
             seed_source(&mut interface);
 
-            carry_block(&mut interface, &plan(), half, shift());
+            carry_block(&mut interface, &plan(), half, shift(), &mut transparent_stage());
 
             let count = plan().block_words();
 
@@ -3686,7 +3965,7 @@ mod tests
         let mut interface = MockInput::healthy();
         seed_source(&mut interface);
 
-        carry_block(&mut interface, &plan(), Half::Second, shift());
+        carry_block(&mut interface, &plan(), Half::Second, shift(), &mut transparent_stage());
 
         let plan = plan();
         let first = (plan.block_start(Half::First) + plan.arming_position() - PIPELINE_WORDS)
@@ -3711,22 +3990,611 @@ mod tests
         let mut interface = MockInput::healthy();
         seed_source(&mut interface);
 
-        carry_block(&mut interface, &plan(), Half::First, shift());
-        carry_block(&mut interface, &plan(), Half::Second, shift());
+        // One stage crosses both halves, so this walks the block boundary as
+        // well as the lap: the history the second carry opens on is the history
+        // the first left.
+        let mut running = transparent_stage();
 
-        let back = TEST_WORDS - (plan().arming_position() - PIPELINE_WORDS);
+        carry_block(&mut interface, &plan(), Half::First, shift(), &mut running);
+        carry_block(&mut interface, &plan(), Half::Second, shift(), &mut running);
 
-        for index in 0..TEST_WORDS
+        assert_eq!
+        (
+            interface.written, TEST_WORDS * OUTPUT_BUFFERS,
+            "the two halves left {} writes, a lap is {TEST_WORDS} words into \
+             each of {OUTPUT_BUFFERS} buffers",
+            interface.written
+        );
+
+        let mut want = [0_u32; TEST_WORDS as usize];
+
+        carry_into_image(Half::First, &mut want);
+        carry_into_image(Half::Second, &mut want);
+
+        for index in 0..TEST_WORDS as usize
         {
             assert_eq!
             (
-                interface.master.get(index as usize).copied(),
-                Some(0xC0DE_0000 | ((index + back) % TEST_WORDS)),
+                interface.master.get(index).copied(),
+                want.get(index).copied(),
                 "word {index} did not come through a whole lap"
             );
         }
 
         assert_eq!(interface.master, interface.slave);
+    }
+
+    /// Samples one channel holds in one lap of the buffer.
+    const LAP_SAMPLES: u32 = TEST_WORDS / CHANNEL_STRIDE;
+
+    /// Amplitude the response sweep drives, as a sample.
+    ///
+    /// Under half of full scale, so the pass band of the section leaves room
+    /// for the overshoot and nothing in the sweep meets the saturation the
+    /// tests below it measure on purpose.
+    const SWEEP_AMPLITUDE: f64 = 1.0e9;
+
+    /// Laps a sweep runs before it reads the one it measures.
+    ///
+    /// The section places its poles at radius 0.970, so its impulse response
+    /// falls by that factor a sample and what is left of a transient after `n`
+    /// samples is 0.970 to the power of `n`. Six laps are 2646 samples of one
+    /// channel, which is e to the minus eighty, so what the seventh lap carries
+    /// is the steady state and not the start-up.
+    const SWEEP_WARM_LAPS: u32 = 6;
+
+    /// Largest relative departure the ARITHMETIC may put between a measured
+    /// gain and the designed one, once the rounding of a sample is taken off.
+    ///
+    /// MEASURED over the whole sweep below rather than read at one point, on
+    /// both slots, as the departure less the rounding floor beside it. The
+    /// largest of the set is 2.33e-6, at 200 Hz, and the residue falls under
+    /// the floor entirely above 3000 Hz. The bound is a little over twice the
+    /// worst of them, which is what covers the frequencies between the ones the
+    /// sweep stands on.
+    ///
+    /// What it covers is the single precision difference equation against a
+    /// double precision evaluation of the same coefficients.
+    const RESPONSE_TOLERANCE: f64 = 5.0e-6;
+
+    /// Words of amplitude the rounding of a sample can move one measurement by.
+    ///
+    /// A sample leaves each end of the chain rounded to a whole word, so it
+    /// stands at most half a word from the value it carries. One bin of the
+    /// transform sums those over a lap and scales by two over the lap, so the
+    /// amplitude it reads stands at most `2 * (0.5 * N) / N` from the true one,
+    /// which is one word whatever the length. It enters the gain twice, once
+    /// through the measurement of the drive and once through the measurement of
+    /// what came back, and it is what a gain of five parts in a hundred million
+    /// runs into: at 21900 Hz the section leaves 52 words of amplitude out of
+    /// the billion it was driven with.
+    const QUANTISATION_WORDS: f64 = 1.0;
+
+    /// Returns the word a channel of a sine holds at `index` of lap `lap`.
+    ///
+    /// The sample number of a word is the lap it belongs to times the samples a
+    /// lap holds, plus the position of its frame, so the two channels carry the
+    /// same sine and a lap joins the one before it. `cycles` periods fill one
+    /// lap exactly, which is what puts the whole of the signal in one bin of
+    /// the measurement below.
+    fn sine_word(lap: u32, index: u32, cycles: u32, amplitude: f64) -> u32
+    {
+        let sample = lap * LAP_SAMPLES + index / CHANNEL_STRIDE;
+        let angle = TAU * f64::from(cycles) * f64::from(sample) / f64::from(LAP_SAMPLES);
+
+        (round(amplitude * sin(angle)) as i32).cast_unsigned()
+    }
+
+    /// Carries `laps` laps of blocks, filling each source half from `word`
+    /// before it is carried, and leaves in `out` what the master buffer holds
+    /// at the destination of every source index of the LAST lap.
+    ///
+    /// It drives the source rather than closing the link on the output, which
+    /// is the path the product runs: a source this board does not write, one
+    /// filter, one set of output buffers. A closed link would cross the section
+    /// once a lap and take any signal to silence.
+    fn run_laps<F>
+    (
+        stage: &mut FilterStage,
+        laps: u32,
+        word: F,
+        out: &mut [u32; TEST_WORDS as usize]
+    )
+    where
+        F: Fn(u32, u32) -> u32,
+    {
+        let plan = plan();
+        let mut interface = MockInput::healthy();
+
+        for lap in 0..laps
+        {
+            for half in [Half::First, Half::Second]
+            {
+                let first = plan.block_start(half);
+
+                for step in 0..plan.block_words()
+                {
+                    let index = first + step;
+
+                    if let Some(slot) = interface.source.get_mut(index as usize)
+                    {
+                        *slot = word(lap, index);
+                    }
+                }
+
+                carry_block(&mut interface, &plan, half, shift(), stage);
+
+                for step in 0..plan.block_words()
+                {
+                    let index = first + step;
+                    let at = (index + plan.arming_position() - PIPELINE_WORDS) % TEST_WORDS;
+
+                    if let (Some(slot), Some(carried)) =
+                        (out.get_mut(index as usize), interface.master.get(at as usize))
+                    {
+                        *slot = *carried;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Returns the amplitude one slot of `buffer` carries at `cycles` periods
+    /// per lap.
+    ///
+    /// One bin of a discrete Fourier transform over a whole lap of one channel.
+    /// A sine of `cycles` periods a lap fills that bin and nothing else, so this
+    /// reads its amplitude with no window and no leakage.
+    fn amplitude_at(buffer: &[u32; TEST_WORDS as usize], slot: u32, cycles: u32) -> f64
+    {
+        let mut real = 0.0_f64;
+        let mut imaginary = 0.0_f64;
+
+        for sample in 0..LAP_SAMPLES
+        {
+            let index = sample * CHANNEL_STRIDE + slot;
+            let word = buffer.get(index as usize).copied().unwrap_or(0);
+            let value = f64::from(word.cast_signed());
+            let angle = -TAU * f64::from(cycles) * f64::from(sample) / f64::from(LAP_SAMPLES);
+
+            real += value * cos(angle);
+            imaginary += value * sin(angle);
+        }
+
+        2.0 * sqrt(real * real + imaginary * imaginary) / f64::from(LAP_SAMPLES)
+    }
+
+    /// Returns the magnitude the design gives at `cycles` periods per lap.
+    fn designed_magnitude(cycles: u32) -> f64
+    {
+        let frequency_hz =
+            f64::from(cycles) * f64::from(SAMPLE_RATE_HZ) / f64::from(LAP_SAMPLES);
+
+        cascade_magnitude(&[section()], frequency_hz as f32, SAMPLE_RATE_HZ).unwrap_or(0.0)
+    }
+
+    /// Periods per lap the sweep walks.
+    ///
+    /// One lap holds 441 samples of a channel at 44100 Hz, so a period count is
+    /// a frequency in hundreds of hertz and the set below runs 100 Hz to 21900
+    /// Hz. It crosses the 300 Hz corner, stands either side of it, and reaches
+    /// the last bin under Nyquist, so the bound it produces is a bound over the
+    /// band and not a reading at one point.
+    const SWEEP_CYCLES: [u32; 16] =
+        [1, 2, 3, 4, 5, 7, 10, 14, 20, 30, 45, 70, 110, 160, 200, 219];
+
+    #[test]
+    fn the_filtered_response_matches_the_designed_magnitude()
+    {
+        // The whole point of the stage, measured against an evaluation of the
+        // same coefficients that knows nothing of this loop. The gain is a
+        // ratio of two measurements taken the same way, so the rounding of a
+        // sample to a whole number at the source cancels out of it.
+        let mut points = 0_u32;
+
+        for cycles in SWEEP_CYCLES
+        {
+            let mut carried = [0_u32; TEST_WORDS as usize];
+            let mut driven = [0_u32; TEST_WORDS as usize];
+
+            run_laps
+            (
+                &mut stage(),
+                SWEEP_WARM_LAPS + 1,
+                |lap, index| sine_word(lap, index, cycles, SWEEP_AMPLITUDE),
+                &mut carried
+            );
+
+            for index in 0..TEST_WORDS
+            {
+                if let Some(slot) = driven.get_mut(index as usize)
+                {
+                    *slot = sine_word(SWEEP_WARM_LAPS, index, cycles, SWEEP_AMPLITUDE);
+                }
+            }
+
+            let designed = designed_magnitude(cycles);
+
+            for slot in 0..CHANNEL_STRIDE
+            {
+                let drive = amplitude_at(&driven, slot, cycles);
+                let measured = amplitude_at(&carried, slot, cycles) / drive;
+                let departure = (measured - designed).abs() / designed;
+
+                // The floor is built from the amplitude the DESIGN calls for,
+                // never from the one that came back. Built from what came back,
+                // a stage that answers nothing at all in this bin divides by
+                // nothing and buys itself a tolerance without bound, which is a
+                // test that passes on a filter with its feedback cut.
+                let floor = QUANTISATION_WORDS
+                    * (1.0 / (designed * drive) + 1.0 / drive);
+
+                points = points.saturating_add(1);
+
+                assert!
+                (
+                    departure <= RESPONSE_TOLERANCE + floor,
+                    "slot {slot} at {cycles}00 Hz read a gain of {measured} \
+                     against the designed {designed}, a departure of {departure}"
+                );
+            }
+        }
+
+        assert_eq!
+        (
+            points,
+            SWEEP_CYCLES.len() as u32 * CHANNEL_STRIDE,
+            "a point of the sweep went unmeasured"
+        );
+    }
+
+    #[test]
+    fn a_stage_at_rest_answers_a_silent_block_with_silence()
+    {
+        // The safety property of the state. A history that was never cleared,
+        // or one a start-up never wrote, shows as a word that is not zero on a
+        // source that is.
+        let mut carried = [0xDEAD_BEEF_u32; TEST_WORDS as usize];
+
+        run_laps(&mut stage(), 2, |_, _| 0, &mut carried);
+
+        for index in 0..TEST_WORDS as usize
+        {
+            assert_eq!
+            (
+                carried.get(index).copied(),
+                Some(0),
+                "word {index} of a silent block came out loud"
+            );
+        }
+    }
+
+    #[test]
+    fn a_history_a_loud_block_left_shows_on_the_silent_block_that_follows()
+    {
+        // The other side of the property above, and what tells a state that
+        // PERSISTS from one that is thrown away at every block. A section fed
+        // silence after a signal answers the tail of its own impulse response,
+        // so the first silent block is not silent, and the tail dies.
+        let mut stage = stage();
+        let mut carried = [0_u32; TEST_WORDS as usize];
+
+        run_laps
+        (
+            &mut stage,
+            2,
+            |lap, index| sine_word(lap, index, 3, SWEEP_AMPLITUDE),
+            &mut carried
+        );
+
+        let mut tail = [0_u32; TEST_WORDS as usize];
+
+        run_laps(&mut stage, 1, |_, _| 0, &mut tail);
+
+        let loudest = tail
+            .iter()
+            .map(|word| word.cast_signed().unsigned_abs())
+            .max()
+            .unwrap_or(0);
+
+        assert!(loudest > 0, "a stage carried no history across the block it left");
+
+        let mut quiet = [0_u32; TEST_WORDS as usize];
+
+        run_laps(&mut stage, 20, |_, _| 0, &mut quiet);
+
+        let left = quiet
+            .iter()
+            .map(|word| word.cast_signed().unsigned_abs())
+            .max()
+            .unwrap_or(0);
+
+        assert!(left < loudest, "the tail of {loudest} did not decay, it stands at {left}");
+    }
+
+    #[test]
+    fn each_slot_carries_a_history_of_its_own()
+    {
+        // The two slots of a frame are the two channels of a converter. One
+        // history over both would feed each channel the samples of the other,
+        // so a channel driven with silence is what reads that: it comes back
+        // silent or it does not.
+        let mut carried = [0_u32; TEST_WORDS as usize];
+
+        run_laps
+        (
+            &mut stage(),
+            SWEEP_WARM_LAPS + 1,
+            |lap, index| if index.is_multiple_of(CHANNEL_STRIDE)
+            {
+                sine_word(lap, index, 3, SWEEP_AMPLITUDE)
+            }
+            else
+            {
+                0
+            },
+            &mut carried
+        );
+
+        for sample in 0..LAP_SAMPLES
+        {
+            let index = sample * CHANNEL_STRIDE + 1;
+
+            assert_eq!
+            (
+                carried.get(index as usize).copied(),
+                Some(0),
+                "the silent slot carried word {index}, so the other channel \
+                 reached its history"
+            );
+        }
+
+        assert!
+        (
+            amplitude_at(&carried, 0, 3) > 0.0,
+            "the driven slot carried nothing, so the test above proves nothing"
+        );
+    }
+
+    #[test]
+    fn a_run_of_blocks_answers_what_one_unbroken_run_answers()
+    {
+        // The lesson of the lot that built this loop: a test that reads ONE
+        // block cannot see a state that is dropped at a block boundary, or a
+        // history that crosses between the two channels at the seam. So this
+        // runs the block structure over several blocks and compares it against
+        // a straight walk of the same samples through the same section, which
+        // knows nothing of halves, of positions or of shifts. The two blocks of
+        // a lap start on different slots of a frame, which is what makes the
+        // seam a real one to cross.
+        const LAPS: u32 = 4;
+
+        let mut carried = [0_u32; TEST_WORDS as usize];
+
+        run_laps
+        (
+            &mut stage(),
+            LAPS,
+            |lap, index| sine_word(lap, index, 7, SWEEP_AMPLITUDE),
+            &mut carried
+        );
+
+        let mut straight = [BiquadState::AT_REST; CHANNEL_STRIDE as usize];
+        let mut want = [0_u32; TEST_WORDS as usize];
+
+        for lap in 0..LAPS
+        {
+            for index in 0..TEST_WORDS
+            {
+                let slot = (index % CHANNEL_STRIDE) as usize;
+                let driven = sine_word(lap, index, 7, SWEEP_AMPLITUDE);
+
+                if let Some(state) = straight.get_mut(slot)
+                {
+                    let answered = carry_word(section(), state, driven);
+
+                    if let Some(place) = want.get_mut(index as usize)
+                    {
+                        *place = answered;
+                    }
+                }
+            }
+        }
+
+        for index in 0..TEST_WORDS as usize
+        {
+            assert_eq!
+            (
+                carried.get(index).copied(),
+                want.get(index).copied(),
+                "word {index} of the last lap does not continue the run"
+            );
+        }
+    }
+
+    /// Returns the last lap one channel answers when the recurrence runs in
+    /// DOUBLE precision with its feedback unbounded, a sample bounded only
+    /// where it becomes a word.
+    ///
+    /// This is the reference for the property the stage documents: the history
+    /// carries the value the section computed, and the bound stands at the
+    /// conversion alone. A section that fed back the bounded value is a
+    /// different filter, and it differs exactly where the signal is loudest.
+    ///
+    /// Double precision rather than single, so this is an EVALUATION of the
+    /// recurrence and not a transcription of the one under test. A difference
+    /// of association or of rounding order then shows as a departure of a few
+    /// parts in a million, which stands orders below what a bounded feedback
+    /// moves.
+    fn unbounded_channel<F>(section: Biquad, laps: u32, slot: u32, word: F)
+        -> [u32; LAP_SAMPLES as usize]
+    where
+        F: Fn(u32, u32) -> u32,
+    {
+        let b0 = f64::from(section.b0());
+        let b1 = f64::from(section.b1());
+        let b2 = f64::from(section.b2());
+        let a1 = f64::from(section.a1());
+        let a2 = f64::from(section.a2());
+
+        let mut previous_input = 0.0_f64;
+        let mut older_input = 0.0_f64;
+        let mut previous_output = 0.0_f64;
+        let mut older_output = 0.0_f64;
+        let mut out = [0_u32; LAP_SAMPLES as usize];
+
+        for lap in 0..laps
+        {
+            for sample in 0..LAP_SAMPLES
+            {
+                let index = sample * CHANNEL_STRIDE + slot;
+                let driven = f64::from(word(lap, index).cast_signed());
+
+                let answered = b0 * driven + b1 * previous_input + b2 * older_input
+                    - a1 * previous_output
+                    - a2 * older_output;
+
+                older_input = previous_input;
+                previous_input = driven;
+                older_output = previous_output;
+                previous_output = answered;
+
+                if let Some(place) = out.get_mut(sample as usize)
+                {
+                    *place = (answered as i32).cast_unsigned();
+                }
+            }
+        }
+
+        out
+    }
+
+    /// Words a carried sample may stand from the double precision evaluation of
+    /// the same recurrence.
+    ///
+    /// MEASURED on the drive below, over both slots and over the whole lap
+    /// rather than at one sample: the largest gap a healthy stage leaves is
+    /// 44005 words, on a format that runs to 2147483647, which is two parts in
+    /// a hundred thousand. What it covers is single precision against double
+    /// through a recursion, which carries its own rounding forward.
+    ///
+    /// The same drive through a section whose feedback is bounded to the format
+    /// moves a sample by 8066527 words, 183 times as far. The bound below
+    /// stands between the two: four and a half times the worst a healthy stage
+    /// leaves, and forty times under what a bounded feedback produces.
+    const FEEDBACK_TOLERANCE_WORDS: i64 = 200_000;
+
+    #[test]
+    fn a_drive_past_the_format_feeds_back_what_the_section_computed()
+    {
+        // The stage documents that the bound stands at the conversion and
+        // nowhere else, and that the history carries the computed value. That
+        // sentence is on the way to the drivers: a bound inside the feedback of
+        // a low-pass is a filter whose shape changes when the signal is
+        // loudest, which is when the compression driver is most exposed. So it
+        // carries its test rather than standing on its own.
+        //
+        // The drive is a step from the bottom of the format to the top, which
+        // takes the section past the format on its overshoot. The two runs part
+        // company there and the parting shows in the ringing that follows,
+        // where the output is back inside the format and readable.
+        const STEP_LAP: u32 = 2;
+        const LAPS: u32 = STEP_LAP + 1;
+
+        let drive = |lap: u32, _index: u32| if lap < STEP_LAP
+        {
+            i32::MIN.cast_unsigned()
+        }
+        else
+        {
+            i32::MAX.cast_unsigned()
+        };
+
+        let mut carried = [0_u32; TEST_WORDS as usize];
+
+        run_laps(&mut stage(), LAPS, drive, &mut carried);
+
+        for slot in 0..CHANNEL_STRIDE
+        {
+            let want = unbounded_channel(section(), LAPS, slot, drive);
+
+            for sample in 0..LAP_SAMPLES
+            {
+                let index = sample * CHANNEL_STRIDE + slot;
+                let answered = carried.get(index as usize).copied().unwrap_or(0).cast_signed();
+                let reference = want.get(sample as usize).copied().unwrap_or(0).cast_signed();
+                let gap = i64::from(answered) - i64::from(reference);
+
+                assert!
+                (
+                    gap.abs() <= FEEDBACK_TOLERANCE_WORDS,
+                    "slot {slot} sample {sample} came out at {answered} against \
+                     {reference}, a gap of {gap} words"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_overshoot_saturates_instead_of_coming_back_round()
+    {
+        // A section answers a step above the step. Driven at full scale it
+        // therefore leaves the format, and what it must NOT do there is come
+        // back round to the opposite sign, which is a swing of two full scales
+        // into a way with no analog filter in front of it.
+        //
+        // The drive is a step from the bottom of the format to the top, held
+        // long enough for the section to settle, which is the input that
+        // reaches the largest overshoot this section can produce.
+        const STEP_LAP: u32 = 2;
+
+        let mut carried = [0_u32; TEST_WORDS as usize];
+
+        run_laps
+        (
+            &mut stage(),
+            STEP_LAP + 1,
+            |lap, _| if lap < STEP_LAP
+            {
+                i32::MIN.cast_unsigned()
+            }
+            else
+            {
+                i32::MAX.cast_unsigned()
+            },
+            &mut carried
+        );
+
+        let first_bound = carried
+            .iter()
+            .position(|word| word.cast_signed() == i32::MAX)
+            .unwrap_or(TEST_WORDS as usize);
+
+        assert!
+        (
+            first_bound < TEST_WORDS as usize,
+            "the drive never took the section past the format, so this measures \
+             nothing about the bound"
+        );
+
+        // From the first word the bound holds, the section stands at or above
+        // full scale for the whole of its overshoot. A conversion that came
+        // back round would answer that stretch with the opposite sign, so this
+        // is where a wrap shows and nowhere else: before it the section is
+        // still climbing out of the bottom of the format, legitimately below
+        // zero.
+        for index in first_bound..TEST_WORDS as usize
+        {
+            let word = carried.get(index).copied().unwrap_or(0).cast_signed();
+
+            assert!
+            (
+                word > 0,
+                "word {index} came out at {word} after the bound first held at \
+                 word {first_bound}, which is the sign a conversion that \
+                 wrapped produces"
+            );
+        }
     }
 
     #[test]
@@ -3735,7 +4603,7 @@ mod tests
         let mut interface = MockInput::healthy();
 
         assert_eq!(bring_up(&mut interface, &plan(), &waits()), Ok(shift()));
-        assert_eq!(serve(&mut interface, &plan(), shift()), Ok(()));
+        assert_eq!(serve(&mut interface, &plan(), shift(), &mut stage()), Ok(()));
 
         let (cleared, cleared_at) = interface.cleared.unwrap_or((Half::Second, 0));
         let (carried, carried_at) = interface.carried.unwrap_or((Half::Second, 0));
@@ -3762,7 +4630,11 @@ mod tests
             interface.next_event = half;
 
             assert_eq!(bring_up(&mut interface, &plan(), &waits()), Ok(shift()));
-            assert_eq!(serve(&mut interface, &plan(), shift()), Ok(()));
+            assert_eq!
+            (
+                serve(&mut interface, &plan(), shift(), &mut transparent_stage()),
+                Ok(())
+            );
 
             assert_eq!
             (
@@ -3801,7 +4673,7 @@ mod tests
 
         assert_eq!
         (
-            serve(&mut interface, &plan(), shift()),
+            serve(&mut interface, &plan(), shift(), &mut stage()),
             Err(PassthroughFault::Event(EventFault::Overrun))
         );
         assert_eq!(interface.carried, None);
@@ -3990,8 +4862,13 @@ mod tests
     /// positions carry the same slot parity at every instant. `PIPELINE_WORDS`
     /// is a whole number of frames, which an assertion beside it holds, so it
     /// moves no word out of its slot either.
-    fn run_loop(interface: &mut MockInput, laps: u32, shift: CarryShift)
-        -> Result<(), PassthroughFault>
+    fn run_loop
+    (
+        interface: &mut MockInput,
+        laps: u32,
+        shift: CarryShift,
+        stage: &mut FilterStage
+    ) -> Result<(), PassthroughFault>
     {
         let plan = plan();
         let words = plan.transfer_items();
@@ -4017,7 +4894,7 @@ mod tests
 
             interface.next_event = filled;
             interface.written = 0;
-            serve(interface, &plan, shift)?;
+            serve(interface, &plan, shift, stage)?;
         }
 
         Ok(())
@@ -4082,9 +4959,13 @@ mod tests
 
             seed_tone(&mut interface);
 
-            let seed = interface.master;
+            // The seed narrowed once. Every sample crosses single precision on
+            // its way through the stage, so what a lap returns is the rounded
+            // word rather than the seeded one, and it returns the same one at
+            // every lap after that.
+            let seed = narrowed_buffer(&interface.master);
 
-            assert_eq!(run_loop(&mut interface, 12, shift), Ok(()));
+            assert_eq!(run_loop(&mut interface, 12, shift, &mut transparent_stage()), Ok(()));
 
             for index in 0..TEST_WORDS as usize
             {
@@ -4102,6 +4983,64 @@ mod tests
                 );
             }
         }
+    }
+
+    /// Fall a closed link of twelve laps must leave, as a divisor of the seed.
+    ///
+    /// The measurement beside the test that reads it stands at a forty-sixth,
+    /// so this is half of what was measured.
+    const DECAY_FLOOR: u32 = 20;
+
+    /// Returns the largest magnitude any word of `buffer` carries.
+    fn largest_magnitude(buffer: &[u32; TEST_WORDS as usize]) -> u32
+    {
+        buffer
+            .iter()
+            .map(|word| word.cast_signed().unsigned_abs())
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn a_closed_link_through_the_section_falls_silent()
+    {
+        // The two tests below run a transparent section, and this is what that
+        // trades away, measured instead of left unsaid. A closed link carries
+        // what this board sent, so its content crosses the section once a lap
+        // and what survives is the part of it the section passes.
+        //
+        // MEASURED here, from a seed of 268433753: one lap leaves 54774476, and
+        // twelve leave 5754772, a forty-sixth of the seed. The fall is steep
+        // over the first laps and then slow, because what is left by then sits
+        // where the section barely attenuates. The bound below is a twentieth,
+        // which is half the measured fall.
+        //
+        // It is also the reason a closed link can measure WHERE a word lands
+        // and never what the section does to it: a bench reading this loop
+        // reads a content the section has already eaten.
+        let mut interface = MockInput::healthy();
+
+        interface.offset = plan().arming_position();
+
+        let shift = shift();
+
+        assert_eq!(bring_up(&mut interface, &plan(), &waits()), Ok(shift));
+
+        seed_tone(&mut interface);
+
+        let seeded = largest_magnitude(&interface.master);
+
+        assert!(seeded > 0, "the seed carries a tone");
+        assert_eq!(run_loop(&mut interface, 12, shift, &mut stage()), Ok(()));
+
+        let left = largest_magnitude(&interface.master);
+
+        assert!
+        (
+            left.saturating_mul(DECAY_FLOOR) < seeded,
+            "twelve crossings of the section left {left} of {seeded}"
+        );
+        assert_eq!(interface.master, interface.slave);
     }
 
     #[test]
@@ -4130,10 +5069,10 @@ mod tests
 
             seed_tone(&mut interface);
 
-            let bound = largest_step(&interface.master, 0);
+            let bound = largest_step(&narrowed_buffer(&interface.master), 0);
 
             assert!(bound > 0, "the seeded tone moves");
-            assert_eq!(run_loop(&mut interface, 12, shift), Ok(()));
+            assert_eq!(run_loop(&mut interface, 12, shift, &mut transparent_stage()), Ok(()));
 
             for slot in 0..2
             {
