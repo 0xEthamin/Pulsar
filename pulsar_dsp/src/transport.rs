@@ -18,7 +18,9 @@
 //! before either stream is enabled, which is the term of the gate that has the
 //! converter walk its unmute ramp over silence. `write_tone` is what replaces
 //! them with the tone, and it takes the permit the gate returns, so a caller
-//! cannot decide for itself that the mute line went up.
+//! cannot decide for itself that the mute line went up. `write_output_word`
+//! writes them after that, one word into one of them at a time, once the block
+//! structure of the input path is armed. Those three are the only writers.
 //!
 //! # Where the buffers live
 //!
@@ -35,18 +37,24 @@
 //!
 //! # What runs after the bring-up
 //!
-//! Nothing. Each buffer holds a whole number of tone periods and each stream is
-//! circular, so the frame repeats with no interrupt, no refill and no work in
-//! any handler. Not one transfer interrupt is enabled either, which is what the
-//! read-back checks: this binary serves none, so one would reach the fault path
-//! and silence the machine.
+//! Neither of these two streams asks for anything. Each buffer holds a whole
+//! number of tone periods and each stream is circular, so the frame repeats
+//! with no interrupt and no refill of its own. Neither stream has a transfer
+//! interrupt enabled, which is what the read-back of this module checks, and
+//! their two vectors still reach the handler that silences the machine.
 //!
-//! `write_tone` therefore writes into buffers the transfer controllers are
-//! already reading, and puts a step at whichever position they have reached.
-//! That is one discontinuity of at most an eighth of full scale, once, on a
-//! path that reaches an oscilloscope and a pair of headphones. Removing it
-//! would take a refill served from a transfer interrupt, so it is measured
-//! rather than removed.
+//! What does write these buffers after the bring-up is the block structure of
+//! the input path, through `write_output_word`, from the vector of a third
+//! stream this module neither writes nor reads back. It replaces one half of
+//! both buffers on each of the two events a lap of the receiving buffer raises,
+//! one word into one buffer a call.
+//!
+//! `write_tone` writes into buffers the transfer controllers are already
+//! reading, and puts a step at whichever position they have reached. That is
+//! one discontinuity of at most an eighth of full scale, once, on a path that
+//! reaches an oscilloscope and a pair of headphones. It is measured rather than
+//! removed, since it lands before the input path is armed and the carry that
+//! follows overwrites both buffers a lap at a time.
 
 use core::mem::MaybeUninit;
 use core::ptr;
@@ -68,6 +76,8 @@ use pulsar_lib::transport::
     STREAM_PRIORITY,
     SYNC_ASYNCHRONOUS,
     SYNC_INTERNAL,
+    SYNC_IN_NO_SOURCE,
+    SYNC_OUT_BLOCK_A,
     StreamReadback,
     TONE_SAMPLES,
     TONE_TABLE,
@@ -92,6 +102,8 @@ use stm32h7::stm32h743v::gpioc::pupdr::PULL;
 use stm32h7::stm32h743v::sai1::ch::slotr::SLOTSZ;
 use stm32h7::stm32h743v::{DMA1, DMAMUX1, GPIOE, RCC, SAI1};
 
+use pulsar_lib::clock::ClockPlan;
+
 use crate::clock::AudioClock;
 
 // Every value the plan names for a field this module writes is pinned here
@@ -99,6 +111,13 @@ use crate::clock::AudioClock;
 // seam no host test crosses: `pulsar_lib` is tested against its own plan, so a
 // plan value that does not mean what the register means passes every test and
 // reaches the pins.
+//
+// `SYNCOUT` is a plan value nothing pins, and it is the one of them. The
+// peripheral crate gives the field a plain two bit writer and names no variant
+// for any of its four values, so no assertion can call one. What stands there
+// is RM0433 section 51.6.1 quoted at the constant, and the input path refusing
+// at the step that watches its counter move, since a sub-block of the other
+// interface with no frame clock receives nothing at all.
 //
 // The other seams of that kind name flag fields of `DMA_LISR` and `DMA_LIFCR`
 // rather than plan values, and nothing pins them. The peripheral crate leaves
@@ -133,6 +152,7 @@ const _: () = assert!
     "the two synchronisations the plan names encode the way SYNCEN does"
 );
 
+
 const _: () = assert!
 (
     PROTOCOL_FREE == PRTCFG::Free as u8
@@ -162,7 +182,7 @@ const _: () = assert!
 /// One frame is two words, one slot per converter channel, and the buffer holds
 /// one lap of the tone table. A circular stream over it therefore replays whole
 /// periods for ever.
-const BUFFER_WORDS: usize = TONE_SAMPLES * 2;
+pub(crate) const BUFFER_WORDS: usize = TONE_SAMPLES * 2;
 
 /// Stream of the first transfer controller feeding the master sub-block.
 const MASTER_STREAM: usize = 0;
@@ -328,9 +348,10 @@ impl Interface<'_>
                 .sloten().bits(plan.slot_enable_field())
         });
 
-        // A warm restart can find an interrupt unmasked, and no handler of this
-        // firmware serves one, so the mask register goes back to its reset
-        // value rather than being left where it was found.
+        // A warm restart can find an interrupt unmasked, and the vector this
+        // interface raises is not one this firmware serves, so the mask
+        // register goes back to its reset value rather than being left where it
+        // was found.
         block.im().reset();
 
         block.clrfr().write(|w| w
@@ -391,9 +412,9 @@ impl Interface<'_>
         // transport wants, and the write below drives them nowhere else.
         //
         // The four transfer interrupt enables go down here and the FIFO one
-        // goes down with the register below. No handler of this firmware serves
-        // one, so an enabled interrupt would reach the fault path and silence
-        // the machine.
+        // goes down with the register below. Neither vector these two streams
+        // raise is one this firmware serves, so an enabled interrupt would
+        // reach the fault path and silence the machine.
         //
         // SAFETY: the direction, the two widths and the priority are values
         // RM0433 section 15.5.5 defines over two bits each.
@@ -545,6 +566,35 @@ impl AudioInterface for Interface<'_>
         self.sai.chb().cr1().modify(|_, w| w.saien().clear_bit());
     }
 
+    /// Writes `SYNCOUT` into `SAI_GCR`, and `SYNCIN` to the value that names
+    /// nothing.
+    ///
+    /// This interface follows no other, so its own `SYNCIN` is written to zero
+    /// rather than left where a warm restart found it. RM0433 section 51.6.1
+    /// requires both fields written while the two sub-blocks are disabled,
+    /// which the step ahead of this one is what delivers.
+    ///
+    /// Nothing on the output path reads what this writes. It is the frame clock
+    /// of sub-block A leaving the interface for the receiving one, so what
+    /// answers for it is the read-back below and the input path refusing when
+    /// its counter never moves.
+    #[expect
+    (
+        unsafe_code,
+        reason = "the two synchronisation fields take raw bits in the \
+                  peripheral crate"
+    )]
+    fn declare_sync_source(&mut self)
+    {
+        // SAFETY: both values are two bit fields, and RM0433 section 51.6.1
+        // defines 0b01 for the SYNCOUT that puts block A out and 0b00 for a
+        // SYNCIN that names no source.
+        self.sai.gcr().write(|w| unsafe
+        {
+            w.syncout().bits(SYNC_OUT_BLOCK_A).syncin().bits(SYNC_IN_NO_SOURCE)
+        });
+    }
+
     /// Puts PE2 to PE6 on the audio alternate function.
     ///
     /// Every value is a raw one rather than a variant named in the peripheral
@@ -659,6 +709,7 @@ impl AudioInterface for Interface<'_>
             slave: self.read_block(BlockRole::Slave),
             master_stream: self.read_stream(BlockRole::Master),
             slave_stream: self.read_stream(BlockRole::Slave),
+            sync_out_bits: self.sai.gcr().read().syncout().bits(),
         }
     }
 
@@ -845,6 +896,74 @@ pub(crate) fn write_tone(_permit: &TonePermit)
     fill_buffer((&raw mut SLAVE_BUFFER).cast::<[u32; BUFFER_WORDS]>(), tone);
 }
 
+/// Writes one word into the buffer one sub-block replays, at one index.
+///
+/// This, `write_tone` and `start` are the only writers of either buffer, and no
+/// pointer into one leaves this module, so the shape a caller can reach them in
+/// is this one: one word, at one index, in the buffer a role names. A caller
+/// cannot keep a writable pointer or reach a word outside the buffers.
+///
+/// The role rather than both buffers, because the fan-out onto the two of them
+/// belongs to `pulsar_lib::passthrough::carry_block`, where a host test walks
+/// it. What this widens against writing both here is that a caller can now
+/// write one buffer without the other. What that buys is that the loop deciding
+/// it is on the side of the build `cargo test` reaches, where dropping a
+/// destination turns a test red instead of leaving one converter replaying
+/// whatever its buffer last held.
+///
+/// What it cannot carry is the permit. The block structure calls this from the
+/// served vector, which takes no argument, so the witness `write_tone` takes
+/// cannot reach here and the door this narrows is not closed by a type. What
+/// stands in front of it on the served path is `next_block`, which refuses
+/// every entry the arming did not produce and returns before a word moves.
+///
+/// An index past the buffers writes nothing rather than reaching memory they do
+/// not own.
+///
+/// It is inlined for the reason `Input::read_word` carries: the carry reaches
+/// it twice a word, and out of line the block costs eighteen times the
+/// instructions and closes on the streams that read the buffers it writes.
+#[expect
+(
+    unsafe_code,
+    reason = "both buffers are reached by raw pointer, since a reference to a \
+              static a transfer controller also touches would claim exclusive \
+              access this firmware does not have"
+)]
+#[expect
+(
+    clippy::inline_always,
+    reason = "the carry reaches this twice a word, and the block costs 3.6 \
+              instructions a word folded against 65 left out of line, both \
+              counted on the linked image, which is 207 microseconds a block \
+              against 3779, on a block the streams read in 5000"
+)]
+#[inline(always)]
+pub(crate) fn write_output_word(role: BlockRole, index: u32, word: u32)
+{
+    let at = index as usize;
+
+    if at >= BUFFER_WORDS
+    {
+        return;
+    }
+
+    let buffer = match role
+    {
+        BlockRole::Master => (&raw mut MASTER_BUFFER).cast::<u32>(),
+        BlockRole::Slave => (&raw mut SLAVE_BUFFER).cast::<u32>(),
+    };
+
+    // SAFETY: the index stands below BUFFER_WORDS, which is the length of both
+    // arrays, so the write is inside the object the role named. It is volatile
+    // because the transfer controllers are the other end of both, and nothing
+    // in this binary reads either buffer back.
+    unsafe
+    {
+        ptr::write_volatile(buffer.add(at), word);
+    }
+}
+
 /// Brings the output transport up and proves the part took the plan.
 ///
 /// `clock` is the witness that the audio kernel clock came up and read back as
@@ -898,9 +1017,22 @@ pub(crate) fn start
 /// what refuses one outside the memory the buffers belong in.
 pub(crate) fn plan(clock: &AudioClock) -> TransportPlan
 {
+    plan_of(&clock.plan())
+}
+
+/// Returns the plan a validated clock plan makes, without the witness.
+///
+/// The witness is what fixes the order between the clock bring-up and this one,
+/// and a caller that has already run behind it has nothing left to order. The
+/// handler that serves the transfer events of the input path is that caller:
+/// the interrupt reaching it is enabled by one call, and that call is made only
+/// after the clock, the transport, the input path and the release gate have all
+/// reported.
+pub(crate) fn plan_of(clock: &ClockPlan) -> TransportPlan
+{
     TransportPlan::for_clock
     (
-        &clock.plan(),
+        clock,
         (&raw const MASTER_BUFFER) as u32,
         (&raw const SLAVE_BUFFER) as u32,
         buffer_words()

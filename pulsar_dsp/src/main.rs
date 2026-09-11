@@ -10,9 +10,11 @@
 //! back as planned, both transfer counters reloaded twice with no error flag
 //! raised over that window, which is a whole lap of their buffers whatever
 //! position they were found at, and a buffer of zeros was held over the
-//! converter unmute ramp. Every other path here drives that pin low once the
-//! core reaches its first instruction, and the two gaps below are where it
-//! does not.
+//! converter unmute ramp. One vector serves the transfer events of the input
+//! path and drives that pin low only on an entry it refuses, which is what the
+//! third gap below covers. Every other path here drives it low once the core
+//! reaches its first instruction, and the two gaps after that are where it does
+//! not.
 //!
 //! Once it has risen, the machine is audible until something drives the pin
 //! back down or a reset returns it to its pull-down. A core lockup does
@@ -20,16 +22,19 @@
 //! peripherals alone, so the port keeps driving PE7 high with no instruction
 //! running to change it. A handler entered on a corrupt stack pointer is the
 //! second gap, described below, and what it leaves behind is undetermined
-//! rather than audible for certain. A fault path that runs is neither, since it
-//! drives the pin low as its first instruction. Nothing in this binary bounds
-//! either gap, because the watchdog that would is not here yet. That is
-//! accepted while no driver is connected and the only listeners are an
-//! oscilloscope and a pair of headphones, and it stops being acceptable the
-//! moment one is.
+//! rather than audible for certain. The third is the vector that serves the
+//! transfer events: it carries a block and returns, so a flag it fails to take
+//! down has it re-enter for ever on audio that stopped moving with the pin
+//! still high. A fault path that runs is none of the three, since it drives the
+//! pin low as its first instruction. Nothing in this binary bounds any of them,
+//! because the watchdog that would is not here yet. That is accepted while no
+//! driver is connected and the only listeners are an oscilloscope and a pair of
+//! headphones, and it stops being acceptable the moment one is.
 //!
 //! A Rust panic, a hard fault, and any exception or interrupt without a handler
 //! of its own drive XSMT low and park the core, because a fault that mutes only
-//! sometimes is not a mute.
+//! sometimes is not a mute. One interrupt has a handler of its own, and it
+//! reaches the same routine for every entry it refuses.
 //!
 //! A stack overflow does not. PM0253 section 2.5.3 makes a processor store
 //! fault asynchronous, so the overflowing push pends a `BusFault` rather than
@@ -45,19 +50,27 @@
 //! did not change.
 //!
 //! `main` brings the audio kernel clock up, then the output transport that
-//! carries it to the header, then the gate that unmutes the converters. The
-//! clock bring-up reads the register fields the output frequency depends on
-//! back and compares each against the plan, because a lock bit reports a PLL
-//! fed from the wrong oscillator as ready. The transport bring-up does the same
-//! for every field it drives off its reset value in the two sub-blocks and the
-//! two transfer streams, because the interface reports no bit meaning
-//! "configured as asked". The gate then measures rather than reads: it watches
-//! both transfer counters until each has reloaded twice, which a bring-up
+//! carries it to the header, then the input path that the output is wired back
+//! into, then the gate that unmutes the converters, and last the block
+//! structure that carries the input into the output buffers. The clock bring-up
+//! reads the register fields the output frequency depends on back and compares
+//! each against the plan, because a lock bit reports a PLL fed from the wrong
+//! oscillator as ready. The transport bring-up does the same for every field it
+//! drives off its reset value in the two sub-blocks and the two transfer
+//! streams, because the interface reports no bit meaning "configured as asked".
+//! The input bring-up does the same for the receiving sub-block and its stream,
+//! and starts that stream at a chosen position of the transmitting one, so the
+//! distance between the two read pointers is a constant of the plan rather than
+//! a draw at each power-up. The gate then measures rather than reads: it watches
+//! both transmitting counters until each has reloaded twice, which a bring-up
 //! cannot do, since a counter that moves once does not tell a stream that runs
 //! from one that advances a word and stalls. It takes the two FIFO error flags
 //! down as that window opens, and no other flag, because the fill that starts
 //! the transport raises those two before it has carried anything and every one
-//! of these flags is sticky. Any of the three failing takes the fault path.
+//! of these flags is sticky. The arming comes after the gate and after the tone,
+//! and it waits for the tone to travel a whole lap of the receiving buffer
+//! before it enables the transfer events, since a loop seeded with silence
+//! carries silence for ever. Any of the five failing takes the fault path.
 //!
 //! Two inputs stay outside both read-backs. The crystal frequency is the one
 //! the clock depends on and no register reports, and the port that carries the
@@ -65,12 +78,16 @@
 //! witness that the part took the plan, not a proof of the frame rate and not a
 //! proof that a pin moves.
 //!
-//! Once all three are up, PE2 to PE6 carry a master clock, a bit clock, a frame
-//! clock and two data lines, PE7 holds the converters unmuted, and a 1 kHz tone
-//! repeats on the four channels of the frame with no further work from the
-//! core. The tone is written last of all, and only against the permit the gate
-//! returns, so the buffers carry silence for the whole of the clock bring-up,
-//! the transport bring-up, the transfer window and the unmute ramp.
+//! Once all five are up, PE2 to PE6 carry a master clock, a bit clock, a frame
+//! clock and two data lines, PD11 carries that frame back in, and PE7 holds the
+//! converters unmuted. A 1 kHz tone travels the loop, and the core carries one
+//! half of the receiving buffer into both output buffers twice a lap. The tone
+//! is what seeds that loop: it is written after the gate and against the permit
+//! the gate returns, so the output buffers carry silence for the whole of the
+//! clock bring-up, the transport bring-up, the input bring-up, the transfer
+//! window and the unmute ramp. The arming takes that same permit by value, so
+//! nothing can enable the events that write those buffers ahead of the gate
+//! either.
 //!
 //! Whichever path does reach the mute then latches the active exception number,
 //! the fault status registers and the refusal code into `FAULT_RECORD`, between
@@ -81,15 +98,18 @@
 //!
 //! Those two fields say between them how a parked board got there. Every arm of
 //! `main` that parks writes a refusal code first, and each of them names one
-//! guard, one clock refusal, one transport refusal or one release refusal. A
-//! release refusal says as well whether the mute line had been raised when the
-//! gate refused, so a reader knows whether the board was ever audible. A vector
-//! writes none and is named by its exception number instead. The one entry
-//! that would set neither is the panic handler, which runs in thread mode and
-//! refuses nothing, and the compiler emits it only once something in the image
-//! can panic. While nothing can, no path of this binary seals a record with
-//! zero in both fields, so one that holds both came off a different image than
-//! the one on the bench.
+//! guard, one clock refusal, one transport refusal, one input path refusal or
+//! one release refusal. A release refusal says as well whether the mute line had
+//! been raised when the gate refused, so a reader knows whether the board was
+//! ever audible. Every vector but the one that serves the transfer events writes
+//! none and is named by its exception number instead. That one writes an input
+//! path refusal, so a record carrying exception 29 beside a refusal code is the
+//! ordinary shape of a refused transfer event rather than a sign of a different
+//! image. The one entry that would set neither is the panic handler, which runs
+//! in thread mode and refuses nothing, and the compiler emits it only once
+//! something in the image can panic. While nothing can, no path of this binary
+//! seals a record with zero in both fields, so one that holds both came off a
+//! different image than the one on the bench.
 //!
 //! Every path here ends parked in `wfi`, which is Sleep, on a core that gets
 //! that far. The two gaps above are where one may not. Sleep stops the
@@ -102,6 +122,7 @@
 #![no_main]
 
 mod clock;
+mod passthrough;
 mod release;
 mod transport;
 
@@ -111,14 +132,13 @@ use core::ptr;
 use core::sync::atomic::{AtomicU32, Ordering};
 use cortex_m::Peripherals;
 use cortex_m::asm;
-use cortex_m::interrupt;
 use cortex_m::peripheral::scb::Exception;
 use cortex_m::peripheral::{AC, SCB};
 use cortex_m_rt::{entry, exception};
 use pulsar_lib::constants::{BOOT_CORE_CLOCK_HZ, MAX_CORE_CLOCK_HZ, mute_hold_iterations};
 use pulsar_lib::postmortem::{self, FaultRecord, FaultRegisters, StartupFault};
 use stm32h7::stm32h743v as device;
-use stm32h7::stm32h743v::{GPIOE, RCC};
+use stm32h7::stm32h743v::{GPIOE, RCC, interrupt};
 
 /// Port E pin wired to the XSMT input of both converter modules.
 ///
@@ -245,8 +265,9 @@ fn keep_core_visible_in_sleep()
     }
 }
 
-/// Keeps the parked core visible, arms `BusFault`, starts the clock and the
-/// output transport.
+/// Keeps the parked core visible, arms `BusFault`, starts the clock, the output
+/// transport and the input path, opens the release gate, and arms the block
+/// structure that carries one into the other.
 ///
 /// `keep_core_visible_in_sleep` runs first, ahead of every arm below that can
 /// park, so none of them takes the core off the debug port.
@@ -290,11 +311,24 @@ fn keep_core_visible_in_sleep()
 /// reads them in place, but only once a person knows a stage refused and which
 /// one.
 ///
-/// The release gate runs last, on the same witness. It watches the transfers,
+/// The input path comes up between the transport and the gate, on the same
+/// witness. It configures the receiving sub-block, its stream and PD11, and it
+/// starts that stream where the shift the two read pointers leave lands in the
+/// band a carry can work in. It writes no output buffer and leaves PE7
+/// alone, so the gate that follows still finds the buffers holding zeros.
+///
+/// The release gate runs on the same witness again. It watches the transfers,
 /// puts PE7 under the port and raises it, and holds the buffers of zeros over
 /// the converter unmute ramp. This is the first time this firmware makes the
 /// machine audible, and the permit it returns is what the tone write needs, so
 /// nothing non-zero can reach the converters ahead of it.
+///
+/// The arming runs last and takes that permit by value. It waits for the tone
+/// to travel a whole lap of the receiving buffer, then enables the two transfer
+/// events, which is the one door the block structure comes through. Nothing in
+/// this binary can enable those events without the permit, so the buffers the
+/// converters read carry zeros until the gate has run and the tone the gate
+/// permitted after that.
 #[entry]
 fn main() -> !
 {
@@ -344,6 +378,8 @@ fn main() -> !
         }
     };
 
+    passthrough::prepare(&part.RCC);
+
     let transport = transport::start
     (
         &audio_clock,
@@ -358,6 +394,14 @@ fn main() -> !
     if let Err(fault) = transport
     {
         REFUSAL.store(postmortem::transport_refusal(fault), Ordering::Relaxed);
+        silence_and_park()
+    }
+
+    let mut input = passthrough::observe(&part.SAI2, &part.DMA1, &part.DMAMUX1, &part.GPIOD);
+
+    if let Err(fault) = passthrough::start(&audio_clock, &mut input, BOOT_CORE_CLOCK_HZ)
+    {
+        REFUSAL.store(postmortem::passthrough_refusal(fault), Ordering::Relaxed);
         silence_and_park()
     }
 
@@ -383,6 +427,14 @@ fn main() -> !
     };
 
     transport::write_tone(&permit);
+
+    let armed = passthrough::start_blocks(&audio_clock, &mut input, permit, BOOT_CORE_CLOCK_HZ);
+
+    if let Err(fault) = armed
+    {
+        REFUSAL.store(postmortem::passthrough_refusal(fault), Ordering::Relaxed);
+        silence_and_park()
+    }
 
     loop
     {
@@ -482,7 +534,7 @@ fn silence_and_park() -> !
         GPIOE::steal().bsrr().write(|w| w.br7().set_bit());
     }
 
-    interrupt::disable();
+    cortex_m::interrupt::disable();
     asm::isb();
 
     // SAFETY: interrupts are masked and this function never returns, so nothing
@@ -543,6 +595,41 @@ fn silence_and_park() -> !
     loop
     {
         asm::wfi();
+    }
+}
+
+/// Carries one half of the received buffer into the two output buffers.
+///
+/// This is the one vector of this binary that does not silence the machine on
+/// entry, and the reason it does not is that the block structure of the input
+/// path is armed to raise it twice a lap of the buffer.
+///
+/// What it does with an entry it was not armed for is refuse it and take the
+/// fault path, which is what `DefaultHandler` would have done for this vector
+/// before it had a handler of its own.
+/// `pulsar_lib::passthrough::next_block` is where that decision lives, and it
+/// refuses an entry carrying neither transfer event flag, one carrying both, a
+/// receiving sub-block or stream reporting an alarm, a counter reading past its
+/// buffer, and a read pointer standing where the carry would write. Nothing has
+/// been written when it refuses, so the machine goes silent on the entry rather
+/// than on the block after it.
+///
+/// The flag of the half being served goes down before the carry runs. Left
+/// standing it would raise the line again the moment this returns and the core
+/// would re-enter for ever, on audio that stopped moving with the converters
+/// still unmuted, and nothing in this binary bounds that: the watchdog that
+/// would is not here yet.
+///
+/// `REFUSAL` carries the code as every arm of the entry function does. The arms
+/// all park, and this handler runs only once the last of them has been passed,
+/// so no two writers of that word can exist at one time.
+#[interrupt]
+fn DMA_STR2()
+{
+    if let Err(fault) = passthrough::serve_event()
+    {
+        REFUSAL.store(postmortem::passthrough_refusal(fault), Ordering::Relaxed);
+        silence_and_park()
     }
 }
 
