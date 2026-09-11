@@ -19,5 +19,6 @@ pub mod filter;
 pub mod passthrough;
 pub mod postmortem;
 pub mod protocol;
+mod readback;
 pub mod release;
 pub mod transport;

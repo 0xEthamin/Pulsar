@@ -57,6 +57,7 @@
 
 use crate::clock::{ClockPlan, wait_polls};
 use crate::constants::SAMPLE_RATE_HZ;
+use crate::readback::refuse_unless;
 
 /// Samples in the tone table.
 ///
@@ -1272,34 +1273,15 @@ impl TransportPlan
     /// Checks the direction, the protocol and the clock generator.
     fn verify_block_shape(self, seen: &BlockReadback, role: BlockRole) -> Result<(), BlockFault>
     {
-        if seen.mode_bits != self.mode_field(role)
+        refuse_unless!
         {
-            return Err(BlockFault::ModeWrong);
-        }
-
-        if seen.protocol_bits != self.protocol_field()
-        {
-            return Err(BlockFault::ProtocolWrong);
-        }
-
-        if seen.sync_bits != self.sync_field(role)
-        {
-            return Err(BlockFault::SynchronisationWrong);
-        }
-
-        if seen.data_size_bits != self.data_size_field()
-        {
-            return Err(BlockFault::DataSizeWrong);
-        }
-
-        if seen.lsb_first
-        {
-            return Err(BlockFault::BitOrderWrong);
-        }
-
-        if seen.changes_on_falling_edge != self.clock_strobing_field()
-        {
-            return Err(BlockFault::ClockStrobingWrong);
+            seen, BlockFault,
+            ModeWrong unless mode_bits carries self.mode_field(role),
+            ProtocolWrong unless protocol_bits carries self.protocol_field(),
+            SynchronisationWrong unless sync_bits carries self.sync_field(role),
+            DataSizeWrong unless data_size_bits carries self.data_size_field(),
+            BitOrderWrong unless lsb_first clear,
+            ClockStrobingWrong unless changes_on_falling_edge carries self.clock_strobing_field(),
         }
 
         if !role.generates_clocks()
@@ -1307,19 +1289,12 @@ impl TransportPlan
             return Ok(());
         }
 
-        if seen.no_master_clock
+        refuse_unless!
         {
-            return Err(BlockFault::MasterClockDisabled);
-        }
-
-        if seen.master_divider_field != self.master_divider_field()
-        {
-            return Err(BlockFault::MasterDividerWrong);
-        }
-
-        if seen.oversampling
-        {
-            return Err(BlockFault::OversamplingWrong);
+            seen, BlockFault,
+            MasterClockDisabled unless no_master_clock clear,
+            MasterDividerWrong unless master_divider_field carries self.master_divider_field(),
+            OversamplingWrong unless oversampling clear,
         }
 
         Ok(())
@@ -1328,54 +1303,19 @@ impl TransportPlan
     /// Checks the frame and the slots inside it.
     fn verify_block_frame(self, seen: &BlockReadback) -> Result<(), BlockFault>
     {
-        if seen.frame_length_field != self.frame_length_field()
+        refuse_unless!
         {
-            return Err(BlockFault::FrameLengthWrong);
-        }
-
-        if seen.frame_active_field != self.frame_active_field()
-        {
-            return Err(BlockFault::FrameActiveLengthWrong);
-        }
-
-        if !seen.frame_marks_channel
-        {
-            return Err(BlockFault::FrameDefinitionWrong);
-        }
-
-        if seen.frame_active_high
-        {
-            return Err(BlockFault::FramePolarityWrong);
-        }
-
-        if !seen.frame_leads_first_bit
-        {
-            return Err(BlockFault::FrameOffsetWrong);
-        }
-
-        if seen.first_bit_offset_field != 0
-        {
-            return Err(BlockFault::FirstBitOffsetWrong);
-        }
-
-        if seen.slot_size_bits != self.slot_size_field()
-        {
-            return Err(BlockFault::SlotSizeWrong);
-        }
-
-        if seen.slot_count_field != self.slot_count_field()
-        {
-            return Err(BlockFault::SlotCountWrong);
-        }
-
-        if seen.slot_enable_bits != self.slot_enable_field()
-        {
-            return Err(BlockFault::SlotsNotEnabled);
-        }
-
-        if seen.fifo_threshold_bits != self.fifo_threshold_field()
-        {
-            return Err(BlockFault::FifoThresholdWrong);
+            seen, BlockFault,
+            FrameLengthWrong unless frame_length_field carries self.frame_length_field(),
+            FrameActiveLengthWrong unless frame_active_field carries self.frame_active_field(),
+            FrameDefinitionWrong unless frame_marks_channel set,
+            FramePolarityWrong unless frame_active_high clear,
+            FrameOffsetWrong unless frame_leads_first_bit set,
+            FirstBitOffsetWrong unless first_bit_offset_field carries 0,
+            SlotSizeWrong unless slot_size_bits carries self.slot_size_field(),
+            SlotCountWrong unless slot_count_field carries self.slot_count_field(),
+            SlotsNotEnabled unless slot_enable_bits carries self.slot_enable_field(),
+            FifoThresholdWrong unless fifo_threshold_bits carries self.fifo_threshold_field(),
         }
 
         Ok(())
@@ -1384,84 +1324,30 @@ impl TransportPlan
     /// Checks one stream against the plan.
     fn verify_stream(self, seen: &StreamReadback, role: BlockRole) -> Result<(), StreamFault>
     {
-        if seen.request_bits != self.request_field(role)
+        refuse_unless!
         {
-            return Err(StreamFault::RequestWrong);
-        }
-
-        if seen.sync_enabled
-        {
-            return Err(StreamFault::SynchronisationEnabled);
-        }
-
-        if seen.direction_bits != self.direction_field()
-        {
-            return Err(StreamFault::DirectionWrong);
-        }
-
-        if !seen.circular
-        {
-            return Err(StreamFault::NotCircular);
-        }
-
-        if !seen.memory_increments
-        {
-            return Err(StreamFault::MemoryNotIncrementing);
-        }
-
-        if seen.peripheral_increments
-        {
-            return Err(StreamFault::PeripheralIncrementing);
-        }
-
-        if seen.memory_width_bits != self.width_field()
-        {
-            return Err(StreamFault::MemoryWidthWrong);
-        }
-
-        if seen.peripheral_width_bits != self.width_field()
-        {
-            return Err(StreamFault::PeripheralWidthWrong);
-        }
-
-        if seen.double_buffered
-        {
-            return Err(StreamFault::DoubleBuffered);
-        }
-
-        if seen.priority_bits != self.priority_field()
-        {
-            return Err(StreamFault::PriorityWrong);
-        }
-
-        if seen.any_interrupt_enabled
-        {
-            return Err(StreamFault::InterruptEnabled);
-        }
-
-        if seen.peripheral_address != self.data_address(role)
-        {
-            return Err(StreamFault::PeripheralAddressWrong);
-        }
-
-        if seen.memory_address != self.buffer_address(role)
-        {
-            return Err(StreamFault::MemoryAddressWrong);
-        }
-
-        // The counter is not compared for equality here. It counts down as the
-        // stream runs and reloads at the end of each lap, so what a running
-        // stream carries is a position inside the buffer. `verify_armed`
-        // compares it against the plan while the stream is stopped, and the
-        // advance check of `bring_up` is what proves it moves.
-        if seen.items > self.transfer_items()
-        {
-            return Err(StreamFault::CounterOutOfRange);
-        }
-
-        if !seen.enabled
-        {
-            return Err(StreamFault::NotEnabled);
+            seen, StreamFault,
+            RequestWrong unless request_bits carries self.request_field(role),
+            SynchronisationEnabled unless sync_enabled clear,
+            DirectionWrong unless direction_bits carries self.direction_field(),
+            NotCircular unless circular set,
+            MemoryNotIncrementing unless memory_increments set,
+            PeripheralIncrementing unless peripheral_increments clear,
+            MemoryWidthWrong unless memory_width_bits carries self.width_field(),
+            PeripheralWidthWrong unless peripheral_width_bits carries self.width_field(),
+            DoubleBuffered unless double_buffered clear,
+            PriorityWrong unless priority_bits carries self.priority_field(),
+            InterruptEnabled unless any_interrupt_enabled clear,
+            PeripheralAddressWrong unless peripheral_address carries self.data_address(role),
+            MemoryAddressWrong unless memory_address carries self.buffer_address(role),
+            // The counter is bounded rather than compared for equality. It
+            // counts down as the stream runs and reloads at the end of each
+            // lap, so what a running stream carries is a position inside the
+            // buffer. `verify_armed` compares it against the plan while the
+            // stream is stopped, and the advance check of `bring_up` is what
+            // proves it moves.
+            CounterOutOfRange unless items at most self.transfer_items(),
+            NotEnabled unless enabled set,
         }
 
         Ok(())
@@ -1495,19 +1381,12 @@ impl TransportPlan
     fn verify_armed_stream(self, seen: &StreamReadback, role: BlockRole)
         -> Result<(), StreamFault>
     {
-        if seen.peripheral_address != self.data_address(role)
+        refuse_unless!
         {
-            return Err(StreamFault::PeripheralAddressWrong);
-        }
-
-        if seen.memory_address != self.buffer_address(role)
-        {
-            return Err(StreamFault::MemoryAddressWrong);
-        }
-
-        if seen.items != self.transfer_items()
-        {
-            return Err(StreamFault::ItemCountWrong);
+            seen, StreamFault,
+            PeripheralAddressWrong unless peripheral_address carries self.data_address(role),
+            MemoryAddressWrong unless memory_address carries self.buffer_address(role),
+            ItemCountWrong unless items carries self.transfer_items(),
         }
 
         Ok(())
@@ -1522,44 +1401,17 @@ impl TransportPlan
 /// measurement, not a return value.
 fn verify_block_state(seen: &BlockReadback) -> Result<(), BlockFault>
 {
-    if seen.mono
+    refuse_unless!
     {
-        return Err(BlockFault::MonoWrong);
-    }
-
-    if seen.driven_before_start
-    {
-        return Err(BlockFault::OutputDriveWrong);
-    }
-
-    if seen.tristate
-    {
-        return Err(BlockFault::TristateWrong);
-    }
-
-    if seen.any_interrupt_enabled
-    {
-        return Err(BlockFault::InterruptEnabled);
-    }
-
-    if !seen.transfer_enabled
-    {
-        return Err(BlockFault::TransferDisabled);
-    }
-
-    if !seen.enabled
-    {
-        return Err(BlockFault::NotEnabled);
-    }
-
-    if seen.clock_configuration_rejected
-    {
-        return Err(BlockFault::ClockConfigurationRejected);
-    }
-
-    if seen.underrun
-    {
-        return Err(BlockFault::Underrun);
+        seen, BlockFault,
+        MonoWrong unless mono clear,
+        OutputDriveWrong unless driven_before_start clear,
+        TristateWrong unless tristate clear,
+        InterruptEnabled unless any_interrupt_enabled clear,
+        TransferDisabled unless transfer_enabled set,
+        NotEnabled unless enabled set,
+        ClockConfigurationRejected unless clock_configuration_rejected clear,
+        Underrun unless underrun clear,
     }
 
     Ok(())
@@ -1913,6 +1765,7 @@ mod tests
 
     use super::*;
     use crate::clock::AUDIO_PLAN;
+    use crate::readback::pin_cause_bytes;
     use core::cell::Cell;
 
     /// Words in the buffer the tests plan against, one tone period per channel.
@@ -2297,7 +2150,13 @@ mod tests
         }
     }
 
-    /// Breaks one field of a verified read-back per case and checks the fault.
+    /// Breaks one field of a verified read-back per case and checks the fault,
+    /// then sweeps the same table for the order the requirements are written
+    /// in.
+    ///
+    /// Every table passed here therefore stands in the order its requirements
+    /// are checked. A table that does not fails the sweep, which is what keeps
+    /// the two readings of one table from drifting apart.
     fn run_mutations(mutations: &[Mutation])
     {
         for (break_it, expected) in mutations
@@ -2306,6 +2165,32 @@ mod tests
             break_it(&mut seen);
 
             assert_eq!(plan().verify(&seen), Err(*expected));
+        }
+
+        run_precedence(mutations);
+    }
+
+    /// Breaks two fields of a verified read-back per pair and checks that the
+    /// fault of the earlier entry is the one returned.
+    ///
+    /// The entries stand in the order the requirements are written, so a pair
+    /// measures that order. One bad field cannot: it leaves every other
+    /// requirement holding, so the fault comes back whatever the order of the
+    /// rest. The sweep takes every pair rather than a chosen few, since a pair
+    /// nobody thought to name is where an order goes wrong.
+    fn run_precedence(ordered: &[Mutation])
+    {
+        for (earlier, (break_earlier, expected)) in ordered.iter().enumerate()
+        {
+            for (break_later, _) in ordered.iter().skip(earlier).skip(1)
+            {
+                let mut seen = verified_readback();
+
+                break_earlier(&mut seen);
+                break_later(&mut seen);
+
+                assert_eq!(plan().verify(&seen), Err(*expected));
+            }
         }
     }
 
@@ -2889,10 +2774,6 @@ mod tests
         let mutations: [Mutation; 8] =
         [
             (
-                |seen| seen.master.any_interrupt_enabled = true,
-                TransportFault::MasterBlock(BlockFault::InterruptEnabled),
-            ),
-            (
                 |seen| seen.master.mono = true,
                 TransportFault::MasterBlock(BlockFault::MonoWrong),
             ),
@@ -2903,6 +2784,10 @@ mod tests
             (
                 |seen| seen.master.tristate = true,
                 TransportFault::MasterBlock(BlockFault::TristateWrong),
+            ),
+            (
+                |seen| seen.master.any_interrupt_enabled = true,
+                TransportFault::MasterBlock(BlockFault::InterruptEnabled),
             ),
             (
                 |seen| seen.master.transfer_enabled = false,
@@ -3175,5 +3060,70 @@ mod tests
         assert_eq!(widest, 0x0510);
         assert!(widest < TRANSPORT_CODE_CEILING);
         assert_eq!(TRANSPORT_CODE_CEILING, 0xFFFF);
+    }
+
+    #[test]
+    fn every_sub_block_cause_byte_stays_where_a_probe_reads_it()
+    {
+        pin_cause_bytes!
+        (
+            BlockFault
+            {
+                ModeWrong = 0x01,
+                ProtocolWrong = 0x02,
+                DataSizeWrong = 0x03,
+                BitOrderWrong = 0x04,
+                ClockStrobingWrong = 0x05,
+                SynchronisationWrong = 0x06,
+                MonoWrong = 0x07,
+                OutputDriveWrong = 0x08,
+                TristateWrong = 0x09,
+                FifoThresholdWrong = 0x0A,
+                MasterClockDisabled = 0x0B,
+                MasterDividerWrong = 0x0C,
+                OversamplingWrong = 0x0D,
+                FrameLengthWrong = 0x0E,
+                FrameActiveLengthWrong = 0x0F,
+                FrameDefinitionWrong = 0x10,
+                FramePolarityWrong = 0x11,
+                FrameOffsetWrong = 0x12,
+                FirstBitOffsetWrong = 0x13,
+                SlotSizeWrong = 0x14,
+                SlotCountWrong = 0x15,
+                SlotsNotEnabled = 0x16,
+                TransferDisabled = 0x17,
+                NotEnabled = 0x18,
+                Underrun = 0x19,
+                ClockConfigurationRejected = 0x1A,
+                InterruptEnabled = 0x1B,
+            }
+        );
+    }
+
+    #[test]
+    fn every_stream_cause_byte_stays_where_a_probe_reads_it()
+    {
+        pin_cause_bytes!
+        (
+            StreamFault
+            {
+                RequestWrong = 0x01,
+                SynchronisationEnabled = 0x02,
+                DirectionWrong = 0x03,
+                NotCircular = 0x04,
+                MemoryNotIncrementing = 0x05,
+                PeripheralIncrementing = 0x06,
+                MemoryWidthWrong = 0x07,
+                PeripheralWidthWrong = 0x08,
+                DoubleBuffered = 0x09,
+                PriorityWrong = 0x0A,
+                InterruptEnabled = 0x0B,
+                PeripheralAddressWrong = 0x0C,
+                MemoryAddressWrong = 0x0D,
+                ItemCountWrong = 0x0E,
+                CounterOutOfRange = 0x0F,
+                NotEnabled = 0x10,
+            }
+        );
     }
 }

@@ -173,6 +173,7 @@
 use crate::clock::wait_polls;
 use crate::constants::{MICROSECONDS_PER_SECOND, SAMPLE_RATE_HZ};
 use crate::filter::{Biquad, BiquadState};
+use crate::readback::refuse_unless;
 use crate::release::{Laps, TonePermit};
 use crate::transport::
 {
@@ -1320,44 +1321,18 @@ impl InputPlan
     /// Checks the direction, the protocol and the synchronisation.
     fn verify_block_shape(self, seen: &InputBlockReadback) -> Result<(), InputBlockFault>
     {
-        if seen.mode_bits != self.mode_field()
+        refuse_unless!
         {
-            return Err(InputBlockFault::ModeWrong);
-        }
-
-        if seen.protocol_bits != self.output.protocol_field()
-        {
-            return Err(InputBlockFault::ProtocolWrong);
-        }
-
-        if seen.sync_bits != self.sync_field()
-        {
-            return Err(InputBlockFault::SynchronisationWrong);
-        }
-
-        if seen.sync_in_bits != self.sync_in_field()
-        {
-            return Err(InputBlockFault::SynchronisationSourceWrong);
-        }
-
-        if seen.sync_out_bits != SYNC_OUT_NONE
-        {
-            return Err(InputBlockFault::SynchronisationOutputWrong);
-        }
-
-        if seen.data_size_bits != self.output.data_size_field()
-        {
-            return Err(InputBlockFault::DataSizeWrong);
-        }
-
-        if seen.lsb_first
-        {
-            return Err(InputBlockFault::BitOrderWrong);
-        }
-
-        if seen.changes_on_falling_edge != self.output.clock_strobing_field()
-        {
-            return Err(InputBlockFault::ClockStrobingWrong);
+            seen, InputBlockFault,
+            ModeWrong unless mode_bits carries self.mode_field(),
+            ProtocolWrong unless protocol_bits carries self.output.protocol_field(),
+            SynchronisationWrong unless sync_bits carries self.sync_field(),
+            SynchronisationSourceWrong unless sync_in_bits carries self.sync_in_field(),
+            SynchronisationOutputWrong unless sync_out_bits carries SYNC_OUT_NONE,
+            DataSizeWrong unless data_size_bits carries self.output.data_size_field(),
+            BitOrderWrong unless lsb_first clear,
+            ClockStrobingWrong unless changes_on_falling_edge
+                carries self.output.clock_strobing_field(),
         }
 
         Ok(())
@@ -1366,54 +1341,21 @@ impl InputPlan
     /// Checks the frame and the slots inside it.
     fn verify_block_frame(self, seen: &InputBlockReadback) -> Result<(), InputBlockFault>
     {
-        if seen.frame_length_field != self.output.frame_length_field()
+        refuse_unless!
         {
-            return Err(InputBlockFault::FrameLengthWrong);
-        }
-
-        if seen.frame_active_field != self.output.frame_active_field()
-        {
-            return Err(InputBlockFault::FrameActiveLengthWrong);
-        }
-
-        if !seen.frame_marks_channel
-        {
-            return Err(InputBlockFault::FrameDefinitionWrong);
-        }
-
-        if seen.frame_active_high
-        {
-            return Err(InputBlockFault::FramePolarityWrong);
-        }
-
-        if !seen.frame_leads_first_bit
-        {
-            return Err(InputBlockFault::FrameOffsetWrong);
-        }
-
-        if seen.first_bit_offset_field != 0
-        {
-            return Err(InputBlockFault::FirstBitOffsetWrong);
-        }
-
-        if seen.slot_size_bits != self.output.slot_size_field()
-        {
-            return Err(InputBlockFault::SlotSizeWrong);
-        }
-
-        if seen.slot_count_field != self.output.slot_count_field()
-        {
-            return Err(InputBlockFault::SlotCountWrong);
-        }
-
-        if seen.slot_enable_bits != self.output.slot_enable_field()
-        {
-            return Err(InputBlockFault::SlotsNotEnabled);
-        }
-
-        if seen.fifo_threshold_bits != self.output.fifo_threshold_field()
-        {
-            return Err(InputBlockFault::FifoThresholdWrong);
+            seen, InputBlockFault,
+            FrameLengthWrong unless frame_length_field carries self.output.frame_length_field(),
+            FrameActiveLengthWrong unless frame_active_field
+                carries self.output.frame_active_field(),
+            FrameDefinitionWrong unless frame_marks_channel set,
+            FramePolarityWrong unless frame_active_high clear,
+            FrameOffsetWrong unless frame_leads_first_bit set,
+            FirstBitOffsetWrong unless first_bit_offset_field carries 0,
+            SlotSizeWrong unless slot_size_bits carries self.output.slot_size_field(),
+            SlotCountWrong unless slot_count_field carries self.output.slot_count_field(),
+            SlotsNotEnabled unless slot_enable_bits carries self.output.slot_enable_field(),
+            FifoThresholdWrong unless fifo_threshold_bits
+                carries self.output.fifo_threshold_field(),
         }
 
         Ok(())
@@ -1422,74 +1364,23 @@ impl InputPlan
     /// Checks the receiving stream against the plan and its own flags.
     fn verify_stream(self, seen: &InputStreamReadback) -> Result<(), InputStreamFault>
     {
-        if seen.request_bits != self.request_field()
+        refuse_unless!
         {
-            return Err(InputStreamFault::RequestWrong);
-        }
-
-        if seen.sync_enabled
-        {
-            return Err(InputStreamFault::SynchronisationEnabled);
-        }
-
-        if seen.direction_bits != self.direction_field()
-        {
-            return Err(InputStreamFault::DirectionWrong);
-        }
-
-        if !seen.circular
-        {
-            return Err(InputStreamFault::NotCircular);
-        }
-
-        if !seen.memory_increments
-        {
-            return Err(InputStreamFault::MemoryNotIncrementing);
-        }
-
-        if seen.peripheral_increments
-        {
-            return Err(InputStreamFault::PeripheralIncrementing);
-        }
-
-        if seen.memory_width_bits != self.output.width_field()
-        {
-            return Err(InputStreamFault::MemoryWidthWrong);
-        }
-
-        if seen.peripheral_width_bits != self.output.width_field()
-        {
-            return Err(InputStreamFault::PeripheralWidthWrong);
-        }
-
-        if seen.double_buffered
-        {
-            return Err(InputStreamFault::DoubleBuffered);
-        }
-
-        if seen.priority_bits != self.output.priority_field()
-        {
-            return Err(InputStreamFault::PriorityWrong);
-        }
-
-        if seen.error_interrupt_enabled
-        {
-            return Err(InputStreamFault::ErrorInterruptEnabled);
-        }
-
-        if seen.event_interrupt_enabled
-        {
-            return Err(InputStreamFault::EventInterruptEnabled);
-        }
-
-        if seen.peripheral_address != self.data_address()
-        {
-            return Err(InputStreamFault::PeripheralAddressWrong);
-        }
-
-        if seen.memory_address != self.buffer_address()
-        {
-            return Err(InputStreamFault::MemoryAddressWrong);
+            seen, InputStreamFault,
+            RequestWrong unless request_bits carries self.request_field(),
+            SynchronisationEnabled unless sync_enabled clear,
+            DirectionWrong unless direction_bits carries self.direction_field(),
+            NotCircular unless circular set,
+            MemoryNotIncrementing unless memory_increments set,
+            PeripheralIncrementing unless peripheral_increments clear,
+            MemoryWidthWrong unless memory_width_bits carries self.output.width_field(),
+            PeripheralWidthWrong unless peripheral_width_bits carries self.output.width_field(),
+            DoubleBuffered unless double_buffered clear,
+            PriorityWrong unless priority_bits carries self.output.priority_field(),
+            ErrorInterruptEnabled unless error_interrupt_enabled clear,
+            EventInterruptEnabled unless event_interrupt_enabled clear,
+            PeripheralAddressWrong unless peripheral_address carries self.data_address(),
+            MemoryAddressWrong unless memory_address carries self.buffer_address(),
         }
 
         verify_stream_state(seen, self)
@@ -1608,49 +1499,18 @@ impl CarryShift
 /// Checks the flags and the enable of the receiving sub-block.
 fn verify_block_state(seen: &InputBlockReadback) -> Result<(), InputBlockFault>
 {
-    if seen.mono
+    refuse_unless!
     {
-        return Err(InputBlockFault::MonoWrong);
-    }
-
-    if seen.tristate
-    {
-        return Err(InputBlockFault::TristateWrong);
-    }
-
-    if seen.any_interrupt_enabled
-    {
-        return Err(InputBlockFault::InterruptEnabled);
-    }
-
-    if !seen.transfer_enabled
-    {
-        return Err(InputBlockFault::TransferDisabled);
-    }
-
-    if !seen.enabled
-    {
-        return Err(InputBlockFault::NotEnabled);
-    }
-
-    if seen.overrun
-    {
-        return Err(InputBlockFault::Overrun);
-    }
-
-    if seen.frame_mismatch
-    {
-        return Err(InputBlockFault::FrameMismatch);
-    }
-
-    if seen.codec_not_ready
-    {
-        return Err(InputBlockFault::CodecNotReady);
-    }
-
-    if seen.fifo_level_bits == FIFO_LEVEL_EMPTY
-    {
-        return Err(InputBlockFault::FifoNeverFilled);
+        seen, InputBlockFault,
+        MonoWrong unless mono clear,
+        TristateWrong unless tristate clear,
+        InterruptEnabled unless any_interrupt_enabled clear,
+        TransferDisabled unless transfer_enabled set,
+        NotEnabled unless enabled set,
+        Overrun unless overrun clear,
+        FrameMismatch unless frame_mismatch clear,
+        CodecNotReady unless codec_not_ready clear,
+        FifoNeverFilled unless fifo_level_bits rejects FIFO_LEVEL_EMPTY,
     }
 
     Ok(())
@@ -1660,32 +1520,17 @@ fn verify_block_state(seen: &InputBlockReadback) -> Result<(), InputBlockFault>
 fn verify_stream_state(seen: &InputStreamReadback, plan: InputPlan)
     -> Result<(), InputStreamFault>
 {
-    if seen.transfer_error
+    refuse_unless!
     {
-        return Err(InputStreamFault::TransferError);
-    }
-
-    if seen.direct_mode_error
-    {
-        return Err(InputStreamFault::DirectModeError);
-    }
-
-    if seen.fifo_error
-    {
-        return Err(InputStreamFault::FifoError);
-    }
-
-    // The counter is a position inside the buffer once the stream runs, so what
-    // is required of it here is that it names one. `verify_armed` compares it
-    // against the plan while the stream is stopped.
-    if seen.items > plan.transfer_items()
-    {
-        return Err(InputStreamFault::CounterOutOfRange);
-    }
-
-    if !seen.enabled
-    {
-        return Err(InputStreamFault::NotEnabled);
+        seen, InputStreamFault,
+        TransferError unless transfer_error clear,
+        DirectModeError unless direct_mode_error clear,
+        FifoError unless fifo_error clear,
+        // The counter is a position inside the buffer once the stream runs, so
+        // what is required of it here is that it names one. `verify_armed`
+        // compares it against the plan while the stream is stopped.
+        CounterOutOfRange unless items at most plan.transfer_items(),
+        NotEnabled unless enabled set,
     }
 
     Ok(())
@@ -2560,6 +2405,7 @@ mod tests
     use crate::clock::AUDIO_PLAN;
     use crate::constants::LOW_MID_HZ;
     use crate::filter::{LINKWITZ_RILEY_SECTIONS, cascade_magnitude, linkwitz_riley_low_pass};
+    use crate::readback::pin_cause_bytes;
     use crate::transport::{TONE_SAMPLES, TONE_TABLE};
     use core::cell::Cell;
     use core::f64::consts::TAU;
@@ -3135,7 +2981,13 @@ mod tests
         }
     }
 
-    /// Breaks one field of a verified read-back per case and checks the fault.
+    /// Breaks one field of a verified read-back per case and checks the fault,
+    /// then sweeps the same table for the order the requirements are written
+    /// in.
+    ///
+    /// Every table passed here therefore stands in the order its requirements
+    /// are checked. A table that does not fails the sweep, which is what keeps
+    /// the two readings of one table from drifting apart.
     fn run_mutations(mutations: &[Mutation])
     {
         for (break_it, expected) in mutations
@@ -3144,6 +2996,32 @@ mod tests
             break_it(&mut seen);
 
             assert_eq!(plan().verify(&seen), Err(*expected));
+        }
+
+        run_precedence(mutations);
+    }
+
+    /// Breaks two fields of a verified read-back per pair and checks that the
+    /// fault of the earlier entry is the one returned.
+    ///
+    /// The entries stand in the order the requirements are written, so a pair
+    /// measures that order. One bad field cannot: it leaves every other
+    /// requirement holding, so the fault comes back whatever the order of the
+    /// rest. The sweep takes every pair rather than a chosen few, since a pair
+    /// nobody thought to name is where an order goes wrong.
+    fn run_precedence(ordered: &[Mutation])
+    {
+        for (earlier, (break_earlier, expected)) in ordered.iter().enumerate()
+        {
+            for (break_later, _) in ordered.iter().skip(earlier).skip(1)
+            {
+                let mut seen = verified_readback();
+
+                break_earlier(&mut seen);
+                break_later(&mut seen);
+
+                assert_eq!(plan().verify(&seen), Err(*expected));
+            }
         }
     }
 
@@ -5204,5 +5082,74 @@ mod tests
         assert_eq!(waits.seed_polls, wait_polls(64_000_000, 30_000));
         assert!(waits.stop_polls > 0);
         assert!(waits.start_polls > 0);
+    }
+
+    #[test]
+    fn every_sub_block_cause_byte_stays_where_a_probe_reads_it()
+    {
+        pin_cause_bytes!
+        (
+            InputBlockFault
+            {
+                ModeWrong = 0x01,
+                ProtocolWrong = 0x02,
+                DataSizeWrong = 0x03,
+                BitOrderWrong = 0x04,
+                ClockStrobingWrong = 0x05,
+                SynchronisationWrong = 0x06,
+                SynchronisationSourceWrong = 0x07,
+                MonoWrong = 0x08,
+                TristateWrong = 0x09,
+                FifoThresholdWrong = 0x0A,
+                FrameLengthWrong = 0x0B,
+                FrameActiveLengthWrong = 0x0C,
+                FrameDefinitionWrong = 0x0D,
+                FramePolarityWrong = 0x0E,
+                FrameOffsetWrong = 0x0F,
+                FirstBitOffsetWrong = 0x10,
+                SlotSizeWrong = 0x11,
+                SlotCountWrong = 0x12,
+                SlotsNotEnabled = 0x13,
+                TransferDisabled = 0x14,
+                NotEnabled = 0x15,
+                InterruptEnabled = 0x16,
+                Overrun = 0x17,
+                FrameMismatch = 0x18,
+                CodecNotReady = 0x19,
+                FifoNeverFilled = 0x1A,
+                SynchronisationOutputWrong = 0x1B,
+            }
+        );
+    }
+
+    #[test]
+    fn every_stream_cause_byte_stays_where_a_probe_reads_it()
+    {
+        pin_cause_bytes!
+        (
+            InputStreamFault
+            {
+                RequestWrong = 0x01,
+                SynchronisationEnabled = 0x02,
+                DirectionWrong = 0x03,
+                NotCircular = 0x04,
+                MemoryNotIncrementing = 0x05,
+                PeripheralIncrementing = 0x06,
+                MemoryWidthWrong = 0x07,
+                PeripheralWidthWrong = 0x08,
+                DoubleBuffered = 0x09,
+                PriorityWrong = 0x0A,
+                ErrorInterruptEnabled = 0x0B,
+                EventInterruptEnabled = 0x0C,
+                PeripheralAddressWrong = 0x0D,
+                MemoryAddressWrong = 0x0E,
+                ItemCountWrong = 0x0F,
+                CounterOutOfRange = 0x10,
+                NotEnabled = 0x11,
+                TransferError = 0x12,
+                DirectModeError = 0x13,
+                FifoError = 0x14,
+            }
+        );
     }
 }
