@@ -443,7 +443,7 @@ const fn window_microseconds(plan: &TransportPlan) -> u32
 }
 
 /// One transfer counter, and the reloads seen on it.
-struct Laps
+pub(crate) struct Laps
 {
     last: u32,
     count: u32,
@@ -452,7 +452,7 @@ struct Laps
 impl Laps
 {
     /// Starts the count from the reading the window opened on.
-    const fn opening(items: u32) -> Self
+    pub(crate) const fn opening(items: u32) -> Self
     {
         Self { last: items, count: 0 }
     }
@@ -463,7 +463,7 @@ impl Laps
     /// reload at the end of a lap in circular mode, so a reading above the one
     /// before it is a reload. Reading slower than a lap misses reloads and
     /// cannot manufacture one.
-    fn fold(&mut self, items: u32)
+    pub(crate) fn fold(&mut self, items: u32)
     {
         if items > self.last
         {
@@ -479,7 +479,7 @@ impl Laps
     /// Two reloads, not one. The first is reached from wherever the window
     /// found the counter, so it bounds nothing. The second is a whole buffer
     /// after the first, whatever that opening position was.
-    const fn lapped(&self) -> bool
+    pub(crate) const fn lapped(&self) -> bool
     {
         self.count > 1
     }
@@ -688,6 +688,17 @@ fn check_stream
     Ok(())
 }
 
+/// Builds a permit without running the gate.
+///
+/// The type has no public constructor, which is what makes one evidence that
+/// the gate ran, so a test of another module that needs one takes it from here
+/// rather than reaching into the field.
+#[cfg(test)]
+pub(crate) const fn tone_permit_for_test() -> TonePermit
+{
+    TonePermit(())
+}
+
 const _: () = assert!
 (
     Phase::Muted as u8 == 0,
@@ -704,7 +715,15 @@ mod tests
 
     use super::*;
     use crate::clock::AUDIO_PLAN;
-    use crate::transport::{BlockReadback, BlockRole, StreamReadback, TONE_SAMPLES};
+    use crate::transport::
+    {
+        BlockReadback,
+        BlockRole,
+        SYNC_OUT_BLOCK_A,
+        SYNC_OUT_NONE,
+        StreamReadback,
+        TONE_SAMPLES,
+    };
     use core::cell::{Cell, RefCell};
 
     /// Words in the buffer the tests plan against, one tone period per channel.
@@ -969,6 +988,10 @@ mod tests
         alarm_at: u32,
         alarm_polls: u32,
         alarm: fn(&mut TransportReadback),
+        /// `SYNCOUT` of the interface, at its reset value until the sequence
+        /// writes it. Derived rather than announced, so a sequence that stops
+        /// declaring the source reads back as one that never did.
+        sync_out_bits: Cell<u8>,
     }
 
     impl MockInterface
@@ -986,6 +1009,7 @@ mod tests
                 alarm_at: u32::MAX,
                 alarm_polls: 0,
                 alarm: |_| {},
+                sync_out_bits: Cell::new(SYNC_OUT_NONE),
             }
         }
 
@@ -1089,6 +1113,11 @@ mod tests
         {
         }
 
+        fn declare_sync_source(&mut self)
+        {
+            self.sync_out_bits.set(SYNC_OUT_BLOCK_A);
+        }
+
         fn open_pins(&mut self)
         {
         }
@@ -1132,6 +1161,7 @@ mod tests
                 slave: running_block(),
                 master_stream: self.master.reading(polls),
                 slave_stream: self.slave.reading(polls),
+                sync_out_bits: self.sync_out_bits.get(),
             };
 
             apply_flags(&mut seen, self.flags.get());

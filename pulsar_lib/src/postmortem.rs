@@ -26,7 +26,7 @@
 //! +0x14  BFAR       an address only while CFSR bit 15 is set.
 //! +0x18  ABFSR      0 ITCM, 1 DTCM, 2 AHBP, 3 AXIM, 4 EPPB, and 9 to 8 the
 //!                   AXI response type, which reads only while bit 3 is set.
-//! +0x1C  refusal    the code a stage of the start-up refused with. Bits 31
+//! +0x1C  refusal    the code the stage that refused wrote. Bits 31
 //!                   to 16 are the domain, which says WHICH stage, and bits 15
 //!                   to 0 the code that domain defines. Every domain is
 //!                   numbered from 1, so the word reads 0 if and only if no
@@ -41,17 +41,27 @@
 //!
 //! # Reading the refusal word
 //!
-//! The domains run in the order the start-up does. 1 is the guards the
+//! A domain number names a stage, not a rank in time. 1 is the guards the
 //! processing firmware runs before it starts anything, 2 the audio clock, 3 the
-//! output transport, 4 the gate that raises the converter mute line. The field
-//! is wider than the domains named here, and a word carrying one they do not
-//! name comes back as `Refusal::Unnamed` rather than being read as one of them.
+//! output transport, 4 the gate that raises the converter mute line, 5 the
+//! input path and the block structure that runs on it. The field is wider than
+//! the domains named here, and a word carrying one they do not name comes back
+//! as `Refusal::Unnamed` rather than being read as one of them.
 //!
-//! A clock, a transport and a release code are a place byte over a cause byte.
-//! The place says where the stage refused, the cause what that place refused
-//! with, and the enums that carry them are `pulsar_lib::clock::ClockFault`,
-//! `pulsar_lib::transport::TransportFault` and
-//! `pulsar_lib::release::ReleaseFault`. The guards refuse in one place, so a
+//! Domain 5 straddles the start-up at both ends, which is why its number says
+//! nothing about when it ran. Its bring-up half comes up BEFORE domain 4, since
+//! the gate watches transfers the input path has to be standing beside, and it
+//! refuses once and parks like the four others. Its handler half refuses
+//! whenever a transfer event is not the entry the arming asked for, which is
+//! long after the start-up finished. So a record carrying domain 5 says which
+//! of the two by its place byte and not by its domain.
+//!
+//! Every code but a guard one is a place byte over a cause byte. The place says
+//! where the stage refused, the cause what that place refused with, and the
+//! enums that carry them are `pulsar_lib::clock::ClockFault`,
+//! `pulsar_lib::transport::TransportFault`,
+//! `pulsar_lib::release::ReleaseFault` and
+//! `pulsar_lib::passthrough::PassthroughFault`. The guards refuse in one place, so a
 //! domain 1 code is a cause byte alone, and the table shows the place byte it
 //! always reads as.
 //!
@@ -68,6 +78,11 @@
 //!           place 3, 4 their streams   cause release::StreamAlarm
 //!           place 0x11 to 0x14         the same four sites, the same causes,
 //!                                      seen with the mute line already high
+//! domain 5  place 0 the sequence       cause passthrough::InputSequenceFault
+//!           place 1 the plan           cause passthrough::InputPlanError
+//!           place 2 the sub-block      cause passthrough::InputBlockFault
+//!           place 3 its stream         cause passthrough::InputStreamFault
+//!           place 4 one transfer event cause passthrough::EventFault
 //! ```
 //!
 //! The place byte of domain 4 splits once more, into a phase over a site. A
@@ -108,6 +123,7 @@
 //! `FaultRegisters`.
 
 use crate::clock::{CLOCK_CODE_CEILING, ClockFault};
+use crate::passthrough::{PASSTHROUGH_CODE_CEILING, PassthroughFault};
 use crate::release::{RELEASE_CODE_CEILING, ReleaseFault};
 use crate::transport::{TRANSPORT_CODE_CEILING, TransportFault};
 
@@ -170,7 +186,7 @@ macro_rules! refusal_domains
         $(,)?
     ) =>
     {
-        /// Stage of the start-up a refusal word belongs to.
+        /// Stage of the firmware a refusal word belongs to.
         ///
         /// The word carries one field naming the domain and one carrying the
         /// code that domain defines, so two stages that number a fault alike
@@ -231,6 +247,11 @@ refusal_domains!
     /// carries a phase as well as a site, so a word of this domain says
     /// whether the line had gone high when the gate refused.
     ReleaseGate = 0x0004, codes to RELEASE_CODE_CEILING,
+    /// The input path and the block structure that runs on it, whose codes
+    /// `pulsar_lib::passthrough::PassthroughFault::code` numbers. It is the one
+    /// domain a handler can refuse in as well as the start-up, since the events
+    /// it serves keep arriving once the start-up has finished.
+    Passthrough = 0x0005, codes to PASSTHROUGH_CODE_CEILING,
 }
 
 impl RefusalDomain
@@ -347,12 +368,21 @@ pub const fn release_refusal(fault: ReleaseFault) -> u32
     RefusalDomain::ReleaseGate.field() | fault.code()
 }
 
+/// Returns the refusal word a refused input path leaves.
+#[must_use]
+#[inline]
+pub const fn passthrough_refusal(fault: PassthroughFault) -> u32
+{
+    RefusalDomain::Passthrough.field() | fault.code()
+}
+
 const _: () = assert!
 (
     STARTUP_CODE_CEILING <= CODE_MASK
         && CLOCK_CODE_CEILING <= CODE_MASK
         && TRANSPORT_CODE_CEILING <= CODE_MASK
-        && RELEASE_CODE_CEILING <= CODE_MASK,
+        && RELEASE_CODE_CEILING <= CODE_MASK
+        && PASSTHROUGH_CODE_CEILING <= CODE_MASK,
     "no encoding reaches the domain field, so tagging a code leaves it bit for \
      bit and the field says which stage refused alone"
 );
@@ -397,8 +427,8 @@ pub struct FaultRegisters
     pub abfsr: u32,
 }
 
-/// One captured register set and the start-up refusal that led to it, sealed so
-/// a reader can tell the record from stale memory.
+/// One captured register set and the refusal that led to it, sealed so a reader
+/// can tell the record from stale memory.
 ///
 /// A record that holds says a fault path ran and sealed these words. It does
 /// not say a hardware fault occurred: a path entered from ordinary code seals
@@ -635,6 +665,7 @@ mod tests
 
     use super::*;
     use crate::clock::{ClockPlanError, TreeFault};
+    use crate::passthrough::InputSequenceFault;
     use crate::release::{BlockAlarm, Phase, SequenceRefusal};
     use crate::transport::{SequenceFault, TransportFault};
 
@@ -867,6 +898,7 @@ mod tests
                 (RefusalDomain::Clock, CLOCK_CODE_CEILING),
                 (RefusalDomain::Transport, TRANSPORT_CODE_CEILING),
                 (RefusalDomain::ReleaseGate, RELEASE_CODE_CEILING),
+                (RefusalDomain::Passthrough, PASSTHROUGH_CODE_CEILING),
             ]
         );
 
@@ -906,18 +938,21 @@ mod tests
         let transport = TransportFault::Sequence(SequenceFault::StreamNeverStopped);
         let release = ReleaseFault::Sequence(SequenceRefusal::TransfersNeverLapped);
         let startup = StartupFault::CoreHandleTaken;
+        let input = PassthroughFault::Sequence(InputSequenceFault::StreamNeverStopped);
 
         // The module documentation names this set as the reason the domain
         // field has to be read before the code.
         assert_eq!(clock.code(), 0x0001);
         assert_eq!(transport.code(), 0x0001);
         assert_eq!(release.code(), 0x0001);
+        assert_eq!(input.code(), 0x0001);
         assert_eq!(startup as u32, 0x0001);
 
         assert_eq!(clock_refusal(clock), RefusalDomain::Clock.field() | 0x0001);
         assert_eq!(transport_refusal(transport), RefusalDomain::Transport.field() | 0x0001);
         assert_eq!(release_refusal(release), RefusalDomain::ReleaseGate.field() | 0x0001);
         assert_eq!(startup_refusal(startup), RefusalDomain::Startup.field() | 0x0001);
+        assert_eq!(passthrough_refusal(input), RefusalDomain::Passthrough.field() | 0x0001);
 
         let words =
         [
@@ -925,6 +960,7 @@ mod tests
             transport_refusal(transport),
             release_refusal(release),
             startup_refusal(startup),
+            passthrough_refusal(input),
         ];
 
         for (index, word) in words.into_iter().enumerate()

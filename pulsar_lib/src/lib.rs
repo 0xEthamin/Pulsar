@@ -16,6 +16,7 @@ pub mod clock;
 pub mod constants;
 pub mod control;
 pub mod filter;
+pub mod passthrough;
 pub mod postmortem;
 pub mod protocol;
 pub mod release;

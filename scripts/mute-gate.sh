@@ -3,10 +3,11 @@
 #
 # The loudspeaker carries no analog filter and no analog mute, so the store that
 # drives XSMT low is the only thing between a fault and the drivers. The source
-# of pulsar_dsp claims six properties which neither a test nor the compiler
+# of pulsar_dsp claims seven properties which neither a test nor the compiler
 # checks:
 #
-#   1. every fault and interrupt vector points at a handler that mutes,
+#   1. every fault and interrupt vector points at a handler that mutes, or at
+#      one of the handlers this firmware serves on purpose,
 #   2. the mute store is the first instruction of the routine that carries it
 #      that is not a frame push, a register move or an immediate constant,
 #   3. the interrupt mask and its barrier follow that store immediately,
@@ -16,7 +17,10 @@
 #      register, it makes nine word stores through that register, at the nine
 #      record offsets, in rising offset order,
 #   6. each of the three start-up guards writes its own cause into the refusal
-#      word, and parks on the instruction after that write.
+#      word, and parks on the instruction after that write,
+#   7. no frame any handler this firmware serves on purpose runs builds a port
+#      address at all, and the handler reaches the routine that carries the
+#      mute, a refusal word store away from it.
 #
 # Each claim is checked here against the disassembly of the image that ships.
 #
@@ -24,6 +28,52 @@
 # at the hard fault handler or at the default handler trips this gate, and the
 # way through it is to say what that handler does about the drivers, not to add
 # its address to the allowed set.
+#
+# Claim 7 is that answer, for the one kind of handler that cannot mute on entry.
+# A firmware that processes audio has to serve a transfer interrupt, and a
+# handler that muted as its first instruction would mute on every block it was
+# armed to carry. So the handler is admitted, and what admits it is not its
+# address but two readings of what it GUARANTEES about the drivers.
+#
+# The first is that it cannot make the machine audible and cannot leave it
+# audible. The converter mute line is a port pin, every port of this part sits
+# under one high half word, and code that never builds that half word holds no
+# instruction that can drive any pin of any port, in either direction. It is
+# checked on the addresses the code BUILDS rather than on the stores it makes,
+# so a store through a register loaded anywhere is covered. A literal pool load
+# would carry an address this reading cannot see, so code that performs one
+# turns the claim red rather than passing unread.
+#
+# What the reading covers is every frame the handler RUNS, its callees included,
+# and that is the point rather than a refinement of it. A handler executes what
+# it calls, so a reading that stopped at the symbol would read the whole handler
+# only for as long as the compiler chose to inline everything under it. Inlining
+# is a decision of the compiler and not a property of this source: two functions
+# of this crate already carry inline(never) for this gate, and a lot that grows
+# the work under one handler moves that decision. The day it moved, a symbol
+# reading would cover a trampoline, find no port address in it, and pass over a
+# body it never read. So served_closure walks the calls and the tail branches
+# out of each frame, and the count of frames it read is printed with the claim.
+# It stops at the routine that carries the mute, which drives the pin low
+# because that is what it is for, and which claims 2 to 5 read instead.
+#
+# The second is that it reaches the mute at all. The handler has to call the
+# routine that carries the mute, and every such call has to be a refusal word
+# store away from it, which is the reading claim 6 makes of the entry function
+# and is made here by the same code. So a board parked from this vector says
+# which entry refused, and a handler that stops having a refusal path at all
+# stops passing.
+#
+# What claim 7 does NOT say is that this handler cannot hang. A flag it fails to
+# clear has it re-enter for ever on audio that stopped moving, with the
+# converters still unmuted, and nothing in this image bounds that. The watchdog
+# is what will, and it is not here yet. That gap is the price of the vector and
+# it is named rather than covered.
+#
+# The served handlers are listed by SYMBOL below, never by address, and claim 1
+# admits one only once claim 7 has passed on it. A handler that fails claim 7
+# fails claim 1 as well, so the two go red together rather than one covering the
+# other.
 #
 # Claim 2 reads every instruction between the vector and the mute store. A
 # handler that only forwards to the shared mute holds no store of its own, so
@@ -166,17 +216,67 @@
 # store, on the one path that reaches that store, and an arm whose word it
 # cannot read is counted as unread rather than guessed at.
 #
-# Where that store lands is read apart from the walk. The base register has to
-# be one the entry function loads with a single address, and that address plus
-# the offset of the store has to be the refusal word. A base the function loads
-# two ways is refused rather than resolved, and neither the address nor the
-# offset is taken on trust from the arm.
+# Where that store lands is read apart from the value, and two readings answer
+# it. They are not of equal strength, and the weaker one is described for what
+# it reads rather than for what it suggests.
+#
+# The STRAIGHT LINE reading is the backward walk above, run on the base register
+# instead of on the stored one: the address is built by the instructions between
+# it and the store, on the one path that reaches that store, crossing no call,
+# no branch and no block boundary. It is the reading claim 6 already makes of
+# the value, applied to the second operand. It is a proof, on the terms the
+# walk states.
+#
+# The WHOLE FUNCTION reading is a WITNESS and not a proof. All it reads is the
+# immediate halves: one movw and one movt naming that register, anywhere in the
+# body, and no second pair of either. So it answers that the function builds one
+# address in that register and builds no other one THAT WAY. Every other write
+# of that register is invisible to it. A mov from another register, a load, a
+# pop, an ldm or an ldrd landing in it and an arithmetic write to it are none of
+# them movw or movt, and the reading passes over each of them without a word.
+# The entry function of this image performs three: it builds the refusal word
+# address in r11 with a movw and a movt, and later writes r11 again with an
+# add.w, an ldm.w and an ldrd. So this reading is what says where six of its
+# eight arms store, and what it says of them is that the function builds that
+# address in that register, not that the register still holds it at the store.
+#
+# Reading the other writes instead was measured rather than argued: refusing a
+# register the function writes by any form but those two turns claim 6 red on
+# this image, whose refusal path is correct. Making the reading refuse them
+# would therefore mean pinning a register across the entry function to satisfy a
+# script, which is a mechanism to maintain on the diagnostic half of the gate.
+#
+# Two claims reach this reading, and only one of them is diagnostic. Claim 6
+# resolves every arm of the entry function through it. Claim 7 falls back on it
+# for the refusal store of a served handler, when the straight line walk ahead
+# of that store answers nothing, and claim 7 is one the mute rests on. So the
+# reading is not confined to the diagnostic half, and what confines it on THIS
+# image is measured rather than assumed: a traced run makes six calls, all six
+# from claim 6, because the served handler builds its refusal address in front
+# of its own store with a movw and a movt the straight line walk reads. The
+# fallback is dormant, not absent, and a compiler that emits another shape of
+# refusal arm in a served handler wakes it. What it would then answer is what it
+# answers for claim 6: that the handler builds one address in that register with
+# an immediate pair, never that the register still holds it at the store. The
+# claim would be the weaker for it, and it would say so nowhere, which is what
+# this paragraph is for.
+#
+# Which one answers depends on the shape the compiler emits. An arm that sits
+# behind a call that never returns has no register provably live across it, so
+# it rebuilds the address in front of its own store and the straight line
+# reading is the one that sees it. An arm reached by a branch from the top of
+# the function inherits a register built once, and the whole function reading is
+# the one that stands in there. An arm neither reading answers is refused.
+#
+# The offset is never taken on trust from the arm either way: the resolved
+# address plus the offset of the store has to be the refusal word.
 #
 # Three things claim 6 does not read. It matches the order the arms are emitted
 # in, never which guard branches to which block, so a compiler that reorders the
 # cold blocks turns it red and the path gets read. Nothing here proves the base
 # register still holds that address where the store runs, only that the function
-# builds no other address in it. And an arm whose word is not built from
+# builds no other address in it with an immediate pair. And an arm whose word is
+# not built from
 # immediates is unread: the clock arm, the transport arm and the release arm
 # compute theirs from the fault they carry, so no claim here says what value any
 # of the three writes. Where each of them writes it is read on the terms above,
@@ -224,6 +324,67 @@ RECORD_SECTION=.uninit
 RECORD_WORDS=9
 RECORD_BYTES=$((RECORD_WORDS * 4))
 
+# Handlers this firmware serves on purpose, by symbol and never by address, each
+# with what it serves. Admitting one costs the property claim 1 carries for
+# every other vector, that a spurious interrupt silences the machine on entry.
+# Claim 7 is what buys it back, and a name added here without a handler that
+# passes claim 7 turns both claims red.
+SERVED_HANDLERS=(
+    "DMA_STR2 the transfer events of the input path"
+)
+
+# Most frames claim 7 walks to from one served handler. The walk ends at the
+# routine that carries the mute, so what it counts is the code the handler runs
+# on its own account. A handler that reaches more than this is one a person
+# reads before it ships, and the ceiling is also what stops a mangled
+# disassembly walking for ever.
+CLOSURE_CEILING=64
+
+# Bytes of code a served handler may run on its own account, summed over the
+# frames of that same closure.
+#
+# The served vector is the one path of this firmware whose budget is a time
+# rather than a shape. The streams that replay the output buffers take one word
+# every 11.3 microseconds, so they read a block of 441 words in 5.000
+# milliseconds, and a handler slower than that is one they overtake inside the
+# block: the words behind the crossing go out holding the lap before, at up to
+# full scale, and the entry check refuses only at the entry that follows. The
+# damage leaves the machine before the silence does.
+#
+# No disassembly gives a time, so what is watched is the size that moves with
+# it. Four linked images calibrate this ceiling, each counted rather than
+# estimated, on an allowance of thirty core cycles for the three and a half
+# instructions the shipping carry spends on a word:
+#
+#   482 bytes, 1 frame   as it ships           3.6 instructions a word,  207 us
+#   442 bytes, 4 frames  accessors out of line   65 a word,             3779 us
+#   538 bytes, 2 frames  serve_event out of line 3.6 a word,             207 us
+#   968 bytes, 1 frame   three biquad stages   66.7 a word,             3876 us
+#
+# The first three are the same carry under three inlining decisions, and each of
+# them is a shape a compiler is free to emit. The fourth is the first shape that
+# puts arithmetic on every word. So the ceiling sits 31 per cent above the
+# largest of the three and 27 per cent below the fourth, which leaves an honest
+# refactor room and still catches the growth.
+#
+# It fires well before the cliff, and on purpose. The 968 byte image spends 78
+# per cent of the block period rather than passing it, and a two stage filter
+# would trip this while still inside the period. The tripwire is meant to stand
+# on the near side.
+#
+# Crossing it is not a fault. It is the point where a person counts the cost of
+# the carry per word against the block period again, and moves this number with
+# the count or does the work elsewhere. The frame count claim 7 prints answers
+# the other question, whether the accessors still fold, and neither number
+# answers for both: the biquad image above costs nineteen times the shipping
+# carry per word and leaves the frame count at one.
+SERVED_CODE_CEILING=704
+
+# High half word of every port of this part. RM0433 Rev 7 section 12.4 puts
+# GPIOA at 0x5802_0000 and GPIOK at 0x5802_2800, so one half word covers the
+# whole block, the port that carries the converter mute line included.
+PORT_BLOCK_HIGH='0x5802'
+
 # Word the start-up guards of main write their refusal into, owned by
 # pulsar_dsp. It is a private static, so the name a build keeps is the demangled
 # one and not the mangled one, whose hash moves with the crate metadata.
@@ -250,7 +411,9 @@ STARTUP_REFUSALS=(
 COMPUTED_REFUSALS=(
     "the audio clock bring-up"
     "the output transport bring-up"
+    "the input path bring-up"
     "the converter mute release gate"
+    "the arming of the input block structure"
 )
 
 # Instructions a frame may run ahead of the mute store, or ahead of the call
@@ -325,6 +488,13 @@ sym_addr()
 sym_size()
 {
     awk -v want="$1" '$4 == want { print $2; exit }' <<< "$sized_syms"
+}
+
+# Prints the hexadecimal size of the symbol at one load address, or nothing when
+# no symbol starts there or the one that does carries no size.
+sym_size_at()
+{
+    awk -v want="$1" '$1 == want { print $2; exit }' <<< "$sized_syms"
 }
 
 # Prints the hexadecimal load address and size of one output section.
@@ -886,10 +1056,11 @@ mute_routine()
     printf '%s' "$callee"
 }
 
-# Prints one line per call the entry function makes to the routine that carries
-# the mute: the refusal word the store ahead of that call carries, then the base
-# register and the offset that store reaches memory through. A word the walk
-# cannot read comes back as a dash. It reads the annotated body, because the
+# Prints one line per call one function makes to the routine that carries the
+# mute: the refusal word the store ahead of that call carries, then the base
+# register and the offset that store reaches memory through, then the address
+# the same backward walk resolves in that base register. A word or an address
+# the walk cannot read comes back as a dash. It reads the annotated body, because the
 # addresses are what the block boundaries are read off.
 #
 # The word is read backwards from the store, over the instructions that build
@@ -907,7 +1078,7 @@ mute_routine()
 park_arms()
 {
     local mute=$1
-    local index store src base off value
+    local index store src base off value carried
 
     read_walk "$2"
 
@@ -933,23 +1104,41 @@ park_arms()
 
         # A store the function enters from elsewhere is reached on a path this
         # walk has not read, whatever stands textually ahead of it.
-        if [ -n "${WALK_ENTERED[${WALK_SPOT[index - 1]}]-}" ] \
-            || ! value="$(walk_immediate "$src" "$((index - 1))")"
+        if [ -n "${WALK_ENTERED[${WALK_SPOT[index - 1]}]-}" ]
         then
-            printf -- '- %s %s\n' "$base" "$off"
+            printf -- '- %s %s -\n' "$base" "$off"
             continue
         fi
 
-        printf '%s %s %s\n' "$value" "$base" "$off"
+        if ! carried="$(walk_immediate "$base" "$((index - 1))")"
+        then
+            carried='-'
+        fi
+
+        if ! value="$(walk_immediate "$src" "$((index - 1))")"
+        then
+            printf -- '- %s %s %s\n' "$base" "$off" "$carried"
+            continue
+        fi
+
+        printf '%s %s %s %s\n' "$value" "$base" "$off" "$carried"
     done
 }
 
-# Prints the address the entry function loads one register with, or nothing when
-# it loads it with no address or with more than one.
+# Prints the address one function builds in one register out of an immediate
+# pair, or nothing when it builds none that way or more than one.
 #
 # The halves are collected over the whole function rather than paired where they
-# stand, so a register the function loads with two different addresses comes
-# back empty and the arm reaching memory through it is refused.
+# stand, so a register the function builds two different addresses in comes back
+# empty and the arm reaching memory through it is refused.
+#
+# What this reads is movw and movt and nothing else, so what it prints is a
+# witness that the function builds that address in that register, not a proof
+# that the register holds it where a store runs. A mov from another register, a
+# load, a pop, an ldm, an ldrd or an arithmetic write into the same register is
+# invisible here. Claim 6 resolves every arm through this, and claim 7 falls
+# back on it when its own straight line walk answers nothing. The header carries
+# what that costs and why the alternative was measured and put aside.
 loaded_address()
 {
     local reg=$1 lines=$2 lo hi
@@ -1005,12 +1194,16 @@ check_startup_refusals()
     resolved=()
     unread=()
 
-    while read -r word base off
+    while read -r word base off carried
     do
-        if ! carried="$(loaded_address "$base" "$lines")"
+        # Either reading of where the store lands is enough, and each is sound
+        # for its own reason. The straight line one comes off the walk, the
+        # whole function one off the halves the function builds anywhere.
+        if [ "$carried" = "-" ] && ! carried="$(loaded_address "$base" "$lines")"
         then
             fail "an arm of the entry function stores its refusal word through" \
-                "$base, which the function loads with no single address"
+                "$base, which neither the walk ahead of the store nor the" \
+                "function as a whole resolves to one address"
             return 1
         fi
 
@@ -1060,6 +1253,259 @@ check_startup_refusals()
     echo "PASS: the ${#resolved[@]} start-up guards write their own cause into" \
         "0x$slot, in the order they run, and park on the next instruction," \
         "beside the ${#unread[@]} stages that compute their word"
+}
+
+
+# Prints the load address of every function the handler at one address runs, the
+# handler first and one per line, or fails on a transfer of control it cannot
+# follow.
+#
+# Claim 7 has to read what the handler EXECUTES, and a handler executes its
+# callees. Reading the symbol alone reads the whole handler only for as long as
+# the compiler inlines everything under it, and inlining is a decision of the
+# compiler rather than a property of this source: two functions of this crate
+# already carry inline(never) for this gate. So a reading that stopped at the
+# symbol would cover a trampoline the day that decision changed, find no port
+# address in it, and pass. The claim would then be green over a body it never
+# read.
+#
+# The walk follows every direct call, and every branch whose target lies outside
+# the function it stands in, which is a tail call wearing a branch mnemonic. It
+# ends at the routine that carries the mute rather than descending into it:
+# driving the mute pin low is what that routine is for, and claims 2 to 5 are
+# what read it.
+#
+# A transfer of control this walk cannot follow turns the claim red rather than
+# leaving a branch of the descent unread. That covers a call through a register,
+# a branch through one, and a write to pc wearing an ordinary mnemonic. A table
+# branch is not one of those: it reaches its own function, whose body is read
+# whole. Neither is a return, which is a write to pc out of a register list or
+# out of lr.
+#
+# The ceiling is what stops a mangled disassembly walking for ever. A handler
+# that legitimately reaches more frames than this is a handler a person reads.
+served_closure()
+{
+    local start=$1 mute=$2
+    local -A seen owned
+    local -a queue
+    local index frame lines spot insn target key
+
+    seen=()
+    owned=()
+    queue=("$start")
+    seen["$start"]=1
+    index=0
+
+    while [ "$index" -lt "${#queue[@]}" ]
+    do
+        frame="${queue[index]}"
+        index=$((index + 1))
+
+        lines="$(annotated_body "$frame")"
+        if [ -z "$lines" ]
+        then
+            fail "the handler under claim 7 reaches 0x$frame, which has no body" \
+                "in the disassembly"
+            return 1
+        fi
+
+        printf '%s\n' "$frame"
+
+        owned=()
+        while read -r spot insn
+        do
+            printf -v key '%08x' "$((16#${spot%:}))"
+            owned["$key"]=1
+        done <<< "$lines"
+
+        while read -r spot insn
+        do
+            insn="${insn%% @ *}"
+            target=""
+
+            if [[ "$insn" =~ ^bl(\.w)?\ (0x[0-9a-f]+)( |$) ]]
+            then
+                target="${BASH_REMATCH[2]}"
+            elif [[ "$insn" =~ ^b${WALK_CONDITION}(\.n|\.w)?\ (0x[0-9a-f]+)( |$) ]]
+            then
+                target="${BASH_REMATCH[3]}"
+            elif [[ "$insn" =~ ^(cbz|cbnz)\ r[0-9]+,\ (0x[0-9a-f]+)( |$) ]]
+            then
+                target="${BASH_REMATCH[2]}"
+            elif [[ "$insn" =~ ^(blx|bx|blxns|bxns)\  ]] && [ "$insn" != "bx lr" ]
+            then
+                fail "the handler under claim 7 runs \"$insn\" at 0x${spot%:}," \
+                    "so it hands control to an address this gate cannot read"
+                return 1
+            elif [[ "$insn" =~ ^[a-z0-9.]+\ pc(,|$) ]]
+            then
+                fail "the handler under claim 7 runs \"$insn\" at 0x${spot%:}," \
+                    "so it hands control to an address this gate cannot read"
+                return 1
+            fi
+
+            if [ -z "$target" ]
+            then
+                continue
+            fi
+
+            printf -v key '%08x' "$((target))"
+
+            if [ -n "${owned[$key]-}" ] || [ "$key" = "$mute" ] \
+                || [ -n "${seen[$key]-}" ]
+            then
+                continue
+            fi
+
+            if [ "${#queue[@]}" -ge "$CLOSURE_CEILING" ]
+            then
+                fail "the handler under claim 7 reaches more than" \
+                    "$CLOSURE_CEILING frames, which is more than this gate reads"
+                return 1
+            fi
+
+            seen["$key"]=1
+            queue+=("$key")
+        done <<< "$lines"
+    done
+}
+
+# Checks claim 7 on one handler this firmware serves on purpose.
+#
+# Two readings, and the handler has to pass both. Neither of them is its
+# address, which is the whole point: a handler is admitted for what it
+# guarantees about the drivers, and the name below only says which one to read.
+#
+# It builds no port address. Every port of this part shares one high half word,
+# so a handler that never builds that half word holds no instruction able to
+# drive any pin of any port, the converter mute line included, in either
+# direction. The reading is over every frame served_closure walks to, and over
+# the addresses BUILT rather than the stores made, so a store through a register
+# loaded anywhere is covered and so is one made a call deep. A pc relative load
+# would carry an address it cannot see, so one turns this red rather than
+# passing unread.
+#
+# It reaches the mute. The handler calls the routine that carries the mute, and
+# every such call is a refusal word store away from it, read by the same code
+# that reads the arms of the entry function. So a board parked from this vector
+# says which entry refused, and a handler that loses its refusal path loses this
+# claim with it.
+check_served_handler()
+{
+    local name=$1 what=$2
+    local addr own walk mute arms slot word base off carried calls
+    local closure frame lines frames bytes size
+
+    addr="$(sym_addr "$name")"
+    if [ -z "$addr" ]
+    then
+        fail "the image has no $name symbol, which this gate names as a served" \
+            "handler"
+        return 1
+    fi
+
+    own="$(body "$addr")"
+    walk="$(annotated_body "$addr")"
+    if [ -z "$own" ] || [ -z "$walk" ]
+    then
+        fail "$name at 0x$addr has no body in the disassembly"
+        return 1
+    fi
+
+    if ! mute="$(mute_routine)"
+    then
+        return 1
+    fi
+
+    if ! closure="$(served_closure "$addr" "$mute")"
+    then
+        return 1
+    fi
+
+    lines=""
+    frames=0
+    bytes=0
+    while read -r frame
+    do
+        frames=$((frames + 1))
+        lines="$lines$(body "$frame")"$'\n'
+
+        size="$(sym_size_at "$frame")"
+        if [ -z "$size" ]
+        then
+            fail "$name reaches 0x$frame, which carries no symbol size, so the" \
+                "code this handler runs cannot be measured"
+            return 1
+        fi
+
+        bytes=$((bytes + 16#$size))
+    done <<< "$closure"
+
+    if [ "$bytes" -gt "$SERVED_CODE_CEILING" ]
+    then
+        fail "$name runs $bytes bytes of code across the $frames frame(s) of" \
+            "its closure, over the $SERVED_CODE_CEILING byte ceiling, so the" \
+            "cost of the carry against the 5.000 ms block period is due a" \
+            "measurement"
+        return 1
+    fi
+
+    if grep -qE '\[pc,' <<< "$lines"
+    then
+        fail "$name loads a literal, so an address it forms is one this gate" \
+            "cannot read"
+        return 1
+    fi
+
+    if grep -qiE "#${PORT_BLOCK_HIGH}\$|#${PORT_BLOCK_HIGH}[0-9a-f]{4}\$" <<< "$lines"
+    then
+        fail "$name builds an address in the port block at $PORT_BLOCK_HIGH," \
+            "so an instruction of it can drive the converter mute line"
+        return 1
+    fi
+
+    if ! arms="$(park_arms "0x$(printf '%x' "$((16#$mute))")" "$walk")" \
+        || [ -z "$arms" ]
+    then
+        fail "$name never calls the routine that carries the mute, so an entry" \
+            "it refuses leaves the machine running on it"
+        return 1
+    fi
+
+    slot="$(sym_addr "$REFUSAL_SYMBOL")"
+    if [ -z "$slot" ]
+    then
+        fail "the image has no $REFUSAL_SYMBOL symbol"
+        return 1
+    fi
+
+    calls=0
+    while read -r word base off carried
+    do
+        calls=$((calls + 1))
+
+        if [ "$carried" = "-" ] && ! carried="$(loaded_address "$base" "$own")"
+        then
+            fail "$name stores its refusal word through $base, which neither" \
+                "the walk ahead of the store nor the handler as a whole" \
+                "resolves to one address"
+            return 1
+        fi
+
+        if [ "$((16#$carried + off))" -ne "$((16#$slot))" ]
+        then
+            fail "$name stores its refusal word at 0x$carried plus $off, and" \
+                "$REFUSAL_SYMBOL is at 0x$slot"
+            return 1
+        fi
+    done <<< "$arms"
+
+    echo "PASS: $name, which serves $what, builds no port address across the" \
+        "$frames frame(s) and $bytes bytes of code it runs, under the" \
+        "$SERVED_CODE_CEILING byte ceiling, and reaches the mute routine on" \
+        "$calls refusal path(s), each a refusal word store into 0x$slot away" \
+        "from it"
 }
 
 # Checks claims 2 and 3 on one handler.
@@ -1309,6 +1755,10 @@ check_record_write()
 }
 
 status=0
+served_name=""
+served_what=""
+served_addr=""
+served_allowed=""
 
 hard_fault="$(sym_addr HardFault)"
 default_handler="$(sym_addr DefaultHandler)"
@@ -1319,9 +1769,29 @@ then
     exit 1
 fi
 
+# Claim 7 runs before claim 1, because what it answers is which addresses claim
+# 1 may admit besides the two muting handlers. A served handler that fails it is
+# not added to the allowed set, so both claims go red together and neither
+# covers the other.
+served_allowed=""
+
+for entry in "${SERVED_HANDLERS[@]}"
+do
+    served_name="${entry%% *}"
+    served_what="${entry#* }"
+
+    if check_served_handler "$served_name" "$served_what"
+    then
+        served_addr="$(sym_addr "$served_name")"
+        served_allowed="$served_allowed $(printf '%08x' "$((0x$served_addr + 1))")"
+    else
+        status=1
+    fi
+done
+
 # Claim 1. Every vector past the reset entry either points at the hard fault
-# handler or at the default handler, or is a reserved zero. Thumb entries carry
-# the low bit set.
+# handler, at the default handler or at a served handler claim 7 passed, or is a
+# reserved zero. Thumb entries carry the low bit set.
 allowed_a="$(printf '%08x' "$((0x$hard_fault + 1))")"
 allowed_b="$(printf '%08x' "$((0x$default_handler + 1))")"
 
@@ -1342,9 +1812,11 @@ do
     [ "$index" -lt "$FIRST_HANDLER_WORD" ] && continue
     [ "$word" = "00000000" ] && continue
     handlers=$((handlers + 1))
-    if [ "$word" != "$allowed_a" ] && [ "$word" != "$allowed_b" ]
+    if [ "$word" != "$allowed_a" ] && [ "$word" != "$allowed_b" ] \
+        && [[ " $served_allowed " != *" $word "* ]]
     then
-        echo "FAIL: vector word $index points at 0x$word, which is neither handler" >&2
+        echo "FAIL: vector word $index points at 0x$word, which is neither a" \
+            "muting handler nor a served handler this gate has read" >&2
         status=1
     fi
 done <<< "$words"
@@ -1355,7 +1827,8 @@ then
     status=1
 elif [ "$status" -eq 0 ]
 then
-    echo "PASS: all $handlers fault and interrupt vectors lead to a muting handler"
+    echo "PASS: all $handlers fault and interrupt vectors lead to a muting" \
+        "handler or to one of the ${#SERVED_HANDLERS[@]} served handlers above"
 fi
 
 check_record_slot || status=1

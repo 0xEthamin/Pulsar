@@ -64,7 +64,7 @@ use crate::constants::SAMPLE_RATE_HZ;
 /// ends one sample short of repeating. A circular replay of a whole number of
 /// copies therefore carries no discontinuity at the wrap and needs no phase
 /// accumulator.
-const TONE_SAMPLE_COUNT: u32 = 441;
+pub(crate) const TONE_SAMPLE_COUNT: u32 = 441;
 
 /// Samples in the tone table, as a length.
 pub const TONE_SAMPLES: usize = TONE_SAMPLE_COUNT as usize;
@@ -114,7 +114,7 @@ const SINE_TERMS: u32 = 9;
 /// One per converter channel. RM0433 section 51.4.7 requires an even count
 /// while the frame clock also identifies the channel side, which the I2S frame
 /// below has it do.
-const SLOTS_PER_FRAME: u8 = 2;
+pub(crate) const SLOTS_PER_FRAME: u8 = 2;
 
 /// Bit clock periods in one slot.
 const SLOT_BITS: u16 = 32;
@@ -143,6 +143,28 @@ pub const SYNC_ASYNCHRONOUS: u8 = 0b00;
 /// between the two sub-blocks, and section 51.4.4 releases the clock pins of
 /// the synchronous one back to the port.
 pub const SYNC_INTERNAL: u8 = 0b01;
+
+/// `SYNCOUT` putting sub-block A out as the source the other interface follows.
+///
+/// RM0433 section 51.6.1: "01: Block A used for further synchronization for
+/// others SAI". The same section requires the field written while both
+/// sub-blocks of this interface are disabled, which is why `bring_up` writes it
+/// between the step that stops them and the step that configures them.
+pub const SYNC_OUT_BLOCK_A: u8 = 0b01;
+
+/// `SYNCIN` value naming no interface to follow.
+///
+/// RM0433 section 51.4.4 table 420 numbers the interfaces from 0, so the field
+/// only means anything on an interface whose sub-blocks are set to follow one.
+/// The transmitting interface generates its own clocks, so it names none.
+pub const SYNC_IN_NO_SOURCE: u8 = 0b00;
+
+/// `SYNCOUT` value putting nothing out of an interface.
+///
+/// RM0433 section 51.6.1: "00: No signal to be synchronized with other SAI".
+/// It is also what a reset leaves in the field, so an interface reading this
+/// back is one that either was written it or was never written at all.
+pub const SYNC_OUT_NONE: u8 = 0b00;
 
 /// `SLOTSZ` selecting a 32 bit slot. RM0433 section 51.6.8.
 pub const SLOT_SIZE_32: u8 = 0b10;
@@ -451,8 +473,9 @@ pub enum BlockFault
     /// `WCKCFG` is set, so the part refuses the frame against the master clock
     /// it was asked to generate.
     ClockConfigurationRejected = 0x1A,
-    /// A sub-block interrupt is enabled, and no handler of this firmware serves
-    /// one, so it would reach the fault path and silence the machine.
+    /// A sub-block interrupt is enabled, and the vector these two sub-blocks
+    /// raise is not one this firmware serves, so it would reach the fault path
+    /// and silence the machine.
     InterruptEnabled = 0x1B,
 }
 
@@ -485,8 +508,9 @@ pub enum StreamFault
     DoubleBuffered = 0x09,
     /// `PL` does not carry the priority of the plan.
     PriorityWrong = 0x0A,
-    /// A stream interrupt is enabled, and no handler of this firmware serves
-    /// one, so it would reach the fault path and silence the machine.
+    /// A stream interrupt is enabled, and neither vector these two transmitting
+    /// streams raise is one this firmware serves, so it would reach the fault
+    /// path and silence the machine.
     InterruptEnabled = 0x0B,
     /// `PAR` does not address the data register of the sub-block the stream
     /// feeds.
@@ -528,6 +552,21 @@ pub enum SequenceFault
     TransferNeverAdvanced = 0x04,
 }
 
+/// Reason the interface as a whole is not running to plan.
+///
+/// These are the fields of `SAI_GCR`, which belongs to the interface rather
+/// than to either sub-block. The discriminant of a variant is the cause byte a
+/// fault record carries for it. Two variants that carried one number would not
+/// compile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum InterfaceFault
+{
+    /// `SYNCOUT` does not put sub-block A out as the synchronisation source, so
+    /// a sub-block of the other interface has no frame clock to follow.
+    SynchronisationOutputWrong = 0x01,
+}
+
 /// Where the output transport bring-up refused.
 ///
 /// The discriminant is the place byte of a fault code. Two places that carried
@@ -548,6 +587,8 @@ enum TransportPlace
     MasterStream = 0x04,
     /// The stream feeding the slave sub-block.
     SlaveStream = 0x05,
+    /// The interface, which is the register both sub-blocks share.
+    Interface = 0x06,
 }
 
 /// Reason the output transport is not running to plan.
@@ -566,6 +607,8 @@ pub enum TransportFault
     MasterStream(StreamFault),
     /// The stream feeding the slave sub-block does not carry the plan.
     SlaveStream(StreamFault),
+    /// The register the two sub-blocks share does not carry the plan.
+    Interface(InterfaceFault),
 }
 
 /// Widest word the transport encoding can carry.
@@ -607,6 +650,7 @@ impl TransportFault
             Self::SlaveBlock(_) => TransportPlace::SlaveBlock,
             Self::MasterStream(_) => TransportPlace::MasterStream,
             Self::SlaveStream(_) => TransportPlace::SlaveStream,
+            Self::Interface(_) => TransportPlace::Interface,
         }
     }
 
@@ -620,6 +664,7 @@ impl TransportFault
             Self::PlanRejected(error) => error as u8,
             Self::MasterBlock(fault) | Self::SlaveBlock(fault) => fault as u8,
             Self::MasterStream(fault) | Self::SlaveStream(fault) => fault as u8,
+            Self::Interface(fault) => fault as u8,
         }
     }
 }
@@ -864,6 +909,13 @@ pub struct TransportReadback
     pub master_stream: StreamReadback,
     /// The stream feeding the slave sub-block.
     pub slave_stream: StreamReadback,
+    /// `SYNCOUT` of `SAI_GCR`, which belongs to the interface and not to a
+    /// sub-block.
+    ///
+    /// It names the sub-block whose bit clock and frame clock leave the
+    /// interface for the other one. Nothing on this interface reads it, so what
+    /// it is checked against here is the plan alone.
+    pub sync_out_bits: u8,
 }
 
 /// The frame the converters take, and the buffers the streams replay.
@@ -993,6 +1045,16 @@ impl TransportPlan
     pub const fn slot_enable_field(self) -> u16
     {
         SLOTS_ENABLED
+    }
+
+    /// Returns the `SYNCOUT` field value.
+    ///
+    /// Sub-block A is the master transmitter, so its clocks are the ones the
+    /// receiving interface follows.
+    #[must_use]
+    pub const fn sync_out_field(self) -> u8
+    {
+        SYNC_OUT_BLOCK_A
     }
 
     /// Returns the `FTH` field value.
@@ -1163,13 +1225,19 @@ impl TransportPlan
     ///
     /// # Errors
     ///
-    /// `MasterBlock`, `SlaveBlock`, `MasterStream` or `SlaveStream`, carrying
-    /// the field of that place that disagreed. The two places a read-back
-    /// cannot reach, the sequence and the plan, are refused elsewhere. The
-    /// master sub-block is checked first, because it is the one whose clocks
-    /// the slave runs on.
+    /// `Interface`, `MasterBlock`, `SlaveBlock`, `MasterStream` or
+    /// `SlaveStream`, carrying the field of that place that disagreed. The two
+    /// places a read-back cannot reach, the sequence and the plan, are refused
+    /// elsewhere. The interface comes first, because the field it carries is
+    /// the one both sub-blocks share, and the master sub-block next, because it
+    /// is the one whose clocks the slave runs on.
     pub fn verify(self, seen: &TransportReadback) -> Result<(), TransportFault>
     {
+        if seen.sync_out_bits != self.sync_out_field()
+        {
+            return Err(TransportFault::Interface(InterfaceFault::SynchronisationOutputWrong));
+        }
+
         if let Err(fault) = self.verify_block(&seen.master, BlockRole::Master)
         {
             return Err(TransportFault::MasterBlock(fault));
@@ -1499,7 +1567,7 @@ fn verify_block_state(seen: &BlockReadback) -> Result<(), BlockFault>
 
 /// Returns whether `bytes` from `address` lie in the memory the buffers belong
 /// in.
-const fn reaches_memory(address: u32, bytes: u32) -> bool
+pub(crate) const fn reaches_memory(address: u32, bytes: u32) -> bool
 {
     let Some(end) = address.checked_add(bytes)
     else
@@ -1531,6 +1599,23 @@ pub trait AudioInterface
     /// RM0433 section 51.4.15 requires the master of a synchronous pair to be
     /// disabled before the block that runs off its clocks.
     fn stop_blocks(&mut self);
+
+    /// Writes both fields of the `SAI_GCR` of this interface, `SYNCOUT` to the
+    /// value that puts sub-block A out and `SYNCIN` to the value that follows
+    /// no other interface.
+    ///
+    /// Both, rather than one, because a warm restart can find either field
+    /// where a previous image left it, and a transmitting interface that also
+    /// follows one is an interface with no clock of its own.
+    ///
+    /// It puts the clocks of sub-block A out of the interface, where a
+    /// sub-block of the other interface can follow them. Nothing on this
+    /// interface needs it, so what it serves is the input path.
+    ///
+    /// RM0433 section 51.6.1 requires the field written while both sub-blocks
+    /// are disabled, which is what places this call between the step that stops
+    /// them and the step that configures them.
+    fn declare_sync_source(&mut self);
 
     /// Puts the interface pins on their alternate function.
     ///
@@ -1641,6 +1726,12 @@ impl TransportWaits
 /// and section 51.4.15 completes the frame in flight before the bit falls, so a
 /// warm restart can find one running.
 ///
+/// `SYNCOUT` is written there, on the far side of that proof and before any
+/// sub-block is configured, because section 51.6.1 requires it written with
+/// both of them disabled. It is the one step of this sequence the output path
+/// does not need: it puts the clocks of sub-block A where the input path can
+/// follow them, and the read-back compares it like every other field.
+///
 /// The pins open before anything drives them, and the two sub-blocks are then
 /// written whole while both are stopped, which is where section 51.6.2 requires
 /// `MODE`, `SYNCEN`, `CKSTR`, `LSBFIRST` and `DS` to be written, and where
@@ -1706,6 +1797,7 @@ where
         return Err(TransportFault::Sequence(SequenceFault::BlockNeverStopped));
     }
 
+    interface.declare_sync_source();
     interface.open_pins();
     interface.write_master(plan);
     interface.write_slave(plan);
@@ -1894,6 +1986,9 @@ mod tests
         stream_stays_enabled: bool,
         block_stays_enabled: bool,
         fifo_stays_empty: bool,
+        refuse_sync_source: bool,
+        watch_sync_source: bool,
+        sync_source_saw_running: Option<bool>,
         refuse_slave_sync: bool,
         transfer_stalls: bool,
         short_master_count: bool,
@@ -1922,6 +2017,7 @@ mod tests
                     slave: reset_block(),
                     master_stream: reset_stream(),
                     slave_stream: reset_stream(),
+                    sync_out_bits: 0,
                 },
                 status: 0,
                 polls: Cell::new(0),
@@ -1930,6 +2026,9 @@ mod tests
                 stream_stays_enabled: false,
                 block_stays_enabled: false,
                 fifo_stays_empty: false,
+                refuse_sync_source: false,
+                watch_sync_source: false,
+                sync_source_saw_running: None,
                 refuse_slave_sync: false,
                 transfer_stalls: false,
                 short_master_count: false,
@@ -2081,6 +2180,24 @@ mod tests
 
             self.image.master.enabled = false;
             self.image.slave.enabled = false;
+        }
+
+        /// Writes the field the way the register block does, unless the case
+        /// asks for a source that never took.
+        fn declare_sync_source(&mut self)
+        {
+            if self.watch_sync_source
+            {
+                self.sync_source_saw_running =
+                    Some(self.image.master.enabled || self.image.slave.enabled);
+            }
+
+            if self.refuse_sync_source
+            {
+                return;
+            }
+
+            self.image.sync_out_bits = SYNC_OUT_BLOCK_A;
         }
 
         fn open_pins(&mut self)
@@ -2626,6 +2743,45 @@ mod tests
 
             assert_eq!(plan().verify(&seen), Ok(()));
         }
+    }
+
+    #[test]
+    fn a_synchronisation_source_that_never_took_refuses_the_bring_up()
+    {
+        let mut interface = MockInterface::healthy();
+        interface.refuse_sync_source = true;
+
+        assert_eq!
+        (
+            bring_up(&mut interface, &plan(), &waits()),
+            Err(TransportFault::Interface(InterfaceFault::SynchronisationOutputWrong))
+        );
+    }
+
+    #[test]
+    fn the_synchronisation_source_is_declared_while_both_sub_blocks_are_stopped()
+    {
+        // RM0433 section 51.6.1 requires SYNCOUT written with the sub-blocks
+        // disabled, so the step is refused if either is still running when it
+        // lands.
+        let mut interface = MockInterface::healthy();
+        interface.watch_sync_source = true;
+
+        assert_eq!(bring_up(&mut interface, &plan(), &waits()), Ok(()));
+        assert_eq!(interface.sync_source_saw_running, Some(false));
+    }
+
+    #[test]
+    fn a_synchronisation_source_naming_another_sub_block_is_refused()
+    {
+        let mut seen = verified_readback();
+        seen.sync_out_bits = 0b10;
+
+        assert_eq!
+        (
+            plan().verify(&seen),
+            Err(TransportFault::Interface(InterfaceFault::SynchronisationOutputWrong))
+        );
     }
 
     #[test]
