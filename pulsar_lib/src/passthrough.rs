@@ -17,11 +17,14 @@
 //! # What the carry does to a frame
 //!
 //! It reads the sample the first slot of the frame carries, runs it through the
-//! three cascades of the crossover, and writes the three answers plus one
-//! silent word across the four converter channels: the low way and the mid way
-//! into the two slots of the master frame, the high way and the channel no way
-//! drives into the two slots of the slave frame. `FilterChain` is those three
-//! cascades and the history behind every section of them.
+//! three cascades of the crossover and through the output stage, and writes the
+//! three words that stage answers plus one silent word across the four
+//! converter channels: the low way and the mid way into the two slots of the
+//! master frame, the high way and the channel no way drives into the two slots
+//! of the slave frame. `FilterChain` is those three cascades and the history
+//! behind every section of them, and the output stage beside it carries the
+//! alignment of the three ways, the wall on the high way and the conversion
+//! back to a buffer word.
 //!
 //! The loop lives here rather than behind the interface so that a host test
 //! walks it, the fan-out onto the four channels included. A register block owns
@@ -99,32 +102,33 @@
 //! The streams take 11.34 microseconds a word at this frame rate, so a frame is
 //! 22.68 microseconds, a block of 441 words is 5.000 milliseconds, and a new
 //! event lands every 5.000 milliseconds. The carry runs once a frame and spends
-//! 256 instructions, 75 accesses to the memory the buffers and the cascades sit
-//! in, and 52 to the stack, which comes to 14.2 to 15.4 microseconds a frame on
-//! the clock the part boots on. A block of 221 frames is therefore 3.14 to 3.39
-//! milliseconds, 63 to 68 per cent of the period, and it leaves the carry 1.5
-//! to 1.6 times faster than the streams it has to stay ahead of.
+//! 273 instructions, 75 accesses to the memory the buffers and the cascades sit
+//! in, 7 to the literal pool of the code, and 48 to the stack. MEASURED on the
+//! part with the cycle counter of the data watchpoint unit, on the clock it
+//! boots on, one entry of the carry spends up to 141595 cycles over some 2200
+//! entries, which is 2.21 milliseconds and 44 per cent of the period. Over the
+//! 221 frames of a block that is 10.0 microseconds a frame, the work done once a
+//! block included, and it leaves the carry 2.3 times faster than the streams it
+//! has to stay ahead of.
 //!
-//! Those figures are a count of instructions and of memory accesses on the
-//! linked image, not a reading taken on the part, and the three costs they are
-//! converted with are named rather than left to a reader to reconstruct. An
-//! instruction is taken at one core cycle, and an access to the stack at one
-//! more, the stack sitting in the data memory coupled to the core. An access to
-//! the memory the buffers and the cascades sit in is taken at eight to nine core
-//! cycles, which is what the allowance this firmware already runs on works out
-//! to and which no manual of this part states. A frame is therefore
-//! `256 + 75 * c + 52` cycles at 64 MHz, and it would take 15 cycles an access
-//! to bring the carry down to the speed of the streams. The margin on that
-//! unsourced number is a factor of two rather than the factor of seven one
-//! section left. A bench closes it.
+//! The counts come off the linked image and the cycles off the part, and the
+//! two together give the cost of an access. An instruction is taken at one core
+//! cycle, and an access to the stack at one more, the stack sitting in the data
+//! memory coupled to the core. A frame is then `273 + 82 * c + 48` cycles at
+//! 64 MHz, the reads of the literal pool charged at the rate `c` of the memory
+//! the buffers and the cascades sit in, and the measured frame puts `c` at 3.9
+//! cycles. It would take 13.8 cycles an access to bring the carry down to the
+//! speed of the streams, three and a half times the measured rate.
 //!
-//! Those 75 accesses are one number for one quantity, made in 71 transactions,
-//! two of which are three word bursts. 70 of them are the cascades: 30
-//! coefficient reads and 40 writes of the four history words each of the ten
-//! sections carries. The other 5 are the buffers, one source read and the four
-//! output words. One further read comes from the literal pool of the code, and
-//! it is the float zero the out of range answer of the source accessor needs,
-//! which the vector unit cannot encode as an immediate.
+//! Those 75 accesses are one number for one quantity, made in 75 transactions of
+//! one word each. 70 of them are the cascades: 30 coefficient reads and 40
+//! writes of the four history words each of the ten sections carries. The other
+//! 5 are the buffers, one source read and the four output words. The 7 reads of
+//! the literal pool reach five words, the constants the vector unit cannot
+//! encode as an immediate: the gain of the mid way, the gain of the high way,
+//! the two sides of the ceiling, and the float zero, which answers both a value
+//! that is not a number and a source index out of range. The gain of the low
+//! way is unity, which the vector unit does encode, so it costs no read.
 //!
 //! The cascade of a way is folded into the loop, and that is what holds the
 //! count there: it hoists the twenty coefficients of the low way into registers
@@ -132,8 +136,9 @@
 //! whichever way that falls, each being live into the next sample of its own
 //! section. Left out of line, every section reads its five coefficients and its
 //! four history words back through a pointer on every sample, which is 135
-//! accesses a frame rather than 75, and at that cost the carry is no longer
-//! faster than the streams at all: 8.8 cycles an access inverts it.
+//! accesses a frame rather than 75. That form is not measured: by the count it
+//! reaches the speed of the streams at 8.6 cycles an access, 2.2 times the
+//! measured rate, against 3.5 times for the folded carry.
 //!
 //! A carry starts writing where the read pointer has just left, so it has 433
 //! words of clearance ahead of it, 4.91 milliseconds, at an entry taken on
@@ -201,6 +206,7 @@
 use crate::clock::wait_polls;
 use crate::constants::{MICROSECONDS_PER_SECOND, SAMPLE_RATE_HZ};
 use crate::filter::{FilterError, Way, WayCascade, way_sections};
+use crate::output::{WaySamples, WayWords};
 use crate::readback::refuse_unless;
 use crate::release::{Laps, TonePermit};
 use crate::transport::
@@ -268,10 +274,10 @@ const HALVES: u32 = 2;
 /// taken on time starts 433 words and 4.91 milliseconds ahead of it, and the
 /// floor is what a handler entered late enough runs into.
 ///
-/// A carry of one block takes 3.14 to 3.39 milliseconds on the clock the part
-/// boots on, which is LONGER than the 624 microseconds an entry at the floor
+/// A carry of one block takes up to 2.21 milliseconds, MEASURED on the clock the
+/// part boots on, which is LONGER than the 624 microseconds an entry at the floor
 /// leaves. What answers that is the rate rather than the total: the carry
-/// spends 14.2 to 15.4 microseconds on a frame against the 22.68 the streams
+/// spends up to 10.0 microseconds on a frame against the 22.68 the streams
 /// spend reading one, so from the tightest entry this admits it starts 55 words
 /// ahead of the read pointer and gains on it at every frame. The total would
 /// only matter to a carry that ran no faster than the streams, and the module
@@ -1881,35 +1887,25 @@ const _: () = assert!
 ///
 /// # What bounds the samples it returns
 ///
-/// A cascade overshoots. A crossover half answers a full scale step above full
-/// scale, so a signal near the ceiling leaves a way past it, and the conversion
-/// back to a buffer word SATURATES there. What a conversion that wrapped would
-/// answer is a sample of the opposite sign at full scale, which is a step of
-/// two full scales into a way with no analog filter in front of it.
+/// Nothing here. A cascade overshoots: a crossover half answers a full scale
+/// step above full scale, so a signal near the top of the format leaves a way
+/// past it. What each way answers is handed to the output stage, which carries
+/// the alignment of the three ways, the wall on the high way and the conversion
+/// back to a buffer word. The conversion SATURATES, so a sample past the format
+/// cannot come back round to the opposite sign, which would be a step of two
+/// full scales into a way with no analog filter in front of it.
 ///
-/// The saturation stands at the conversion and nowhere else: the history a
-/// section feeds back is the value it computed. Feeding back the bounded value
-/// instead would put a limiter inside the feedback of a filter, which is no
-/// longer the filter the coefficients describe and no longer a shape
-/// `cascade_magnitude` can be compared against.
+/// Every bound stands in that stage and none of them inside the recurrence: the
+/// history a section feeds back is the value it computed. Feeding back a
+/// bounded value instead would put a limiter inside the feedback of a filter,
+/// which is no longer the filter the coefficients describe and no longer a
+/// shape `cascade_magnitude` can be compared against.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FilterChain
 {
     low: LowCascade,
     mid: MidCascade,
     high: HighCascade,
-}
-
-/// The word each way answers for one sample of the source.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct WayWords
-{
-    /// What the low way answered.
-    low: u32,
-    /// What the mid way answered.
-    mid: u32,
-    /// What the high way answered.
-    high: u32,
 }
 
 impl FilterChain
@@ -1947,10 +1943,13 @@ impl FilterChain
         )
     }
 
-    /// Runs one source word through the three ways.
+    /// Runs one source word through the three ways and the output stage.
     ///
     /// The word crosses the sample format once and each way once, so the three
-    /// answers come off one reading of the source rather than three.
+    /// answers come off one reading of the source rather than three. What each
+    /// way answers then crosses the output stage, which carries the alignment
+    /// of the three ways, the ceiling of the high way and the conversion back
+    /// to a word.
     #[expect
     (
         clippy::cast_precision_loss,
@@ -1961,12 +1960,15 @@ impl FilterChain
     {
         let sample = word.cast_signed() as f32;
 
-        WayWords
-        {
-            low: to_word(self.low.step(sample)),
-            mid: to_word(self.mid.step(sample)),
-            high: to_word(self.high.step(sample)),
-        }
+        WayWords::of
+        (
+            WaySamples
+            {
+                low: self.low.step(sample),
+                mid: self.mid.step(sample),
+                high: self.high.step(sample),
+            }
+        )
     }
 
     /// Returns a chain whose every section answers a sample unchanged.
@@ -1985,25 +1987,6 @@ impl FilterChain
             high: HighCascade::of_section(section),
         }
     }
-}
-
-/// Returns the buffer word `value` makes, bounded to the sample format.
-///
-/// The bound is the conversion itself. A float to integer cast in this language
-/// saturates: a value above the largest `i32` gives that largest one, a value
-/// below the smallest gives that smallest one, and a value that is not a number
-/// gives zero, which is silence. So the sample cannot come back round to the
-/// opposite sign, and the one place that could break it is a change of this
-/// line to a conversion that wraps.
-#[expect
-(
-    clippy::cast_possible_truncation,
-    reason = "the cast is the saturation, and inside the format it drops the \
-              fraction of the sample and nothing else"
-)]
-fn to_word(value: f32) -> u32
-{
-    (value as i32).cast_unsigned()
 }
 
 /// Carries the frames of one block of the receiving buffer into both output
@@ -2062,12 +2045,11 @@ fn to_word(value: f32) -> u32
 /// The streams that replay the output buffers take one word every 11.34
 /// microseconds at this frame rate, so a frame is 22.68, and this loop has a
 /// whole block to run in, which is 441 words and 5.000 milliseconds. Folded
-/// into the handler it spends 256 instructions, 75 accesses to the memory the
-/// buffers and the cascades sit in and 52 to the stack on a frame, which is
-/// 14.2 to 15.4 microseconds at one cycle an instruction, one more a stack
-/// access and eight to nine an access to that memory. A block of 221 frames
-/// therefore costs 3.14 to 3.39 milliseconds and the carry moves a frame 1.5 to
-/// 1.6 times faster than the streams read one.
+/// into the handler it spends 273 instructions, 75 accesses to the memory the
+/// buffers and the cascades sit in, 7 to the literal pool and 48 to the stack on
+/// a frame. MEASURED on the part, a block of 221 frames costs up to 2.21
+/// milliseconds, 10.0 microseconds a frame, and the carry moves a frame 2.3
+/// times faster than the streams read one.
 ///
 /// A loop that costs more than 5.000 milliseconds a block never catches up
 /// again, and the streams then overtake it inside the block: the words behind
@@ -2099,9 +2081,9 @@ where
         let index = first.saturating_add(step.saturating_mul(slots));
         let ways = chain.carry(interface.read_word(index));
 
-        interface.write_word(BlockRole::Master, at.saturating_add(LOW_SLOT), ways.low);
-        interface.write_word(BlockRole::Master, at.saturating_add(MID_SLOT), ways.mid);
-        interface.write_word(BlockRole::Slave, at.saturating_add(HIGH_SLOT), ways.high);
+        interface.write_word(BlockRole::Master, at.saturating_add(LOW_SLOT), ways.low());
+        interface.write_word(BlockRole::Master, at.saturating_add(MID_SLOT), ways.mid());
+        interface.write_word(BlockRole::Slave, at.saturating_add(HIGH_SLOT), ways.high());
         interface.write_word(BlockRole::Slave, at.saturating_add(SPARE_SLOT), SILENT_WORD);
 
         at = at.saturating_add(slots);
@@ -2650,7 +2632,7 @@ mod tests
     use crate::transport::{TONE_SAMPLES, TONE_TABLE};
     use core::cell::Cell;
     use core::f64::consts::TAU;
-    use libm::{cos, round, sin, sqrt};
+    use libm::{cos, log10, round, sin, sqrt};
 
     /// Words in each buffer of the tests, one tone period per channel.
     const TEST_WORDS: u32 = TONE_SAMPLES as u32 * 2;
@@ -2742,6 +2724,8 @@ mod tests
     {
         /// What a failure calls it.
         name: &'static str,
+        /// Which way of the crossover it is.
+        way: Way,
         /// The sections the way fills, in the order they run.
         sections: [Biquad; CROSSOVER_SECTIONS],
         /// How many of them the build wrote.
@@ -2757,6 +2741,17 @@ mod tests
         /// Words one of its samples may stand from the double precision
         /// evaluation of the same recurrence.
         feedback_words: f64,
+        /// Whether that square drive takes the way as far as its own bound.
+        ///
+        /// The low way and the mid way are bounded by the conversion, at the
+        /// format, and a full scale square in the pass band of either overshoots
+        /// past it. The high way is bounded by the wall, and its alignment holds
+        /// this square drive 2.04 dB under it. That is a reading on one
+        /// waveform: the loudest peak a source the format carries puts on this
+        /// way stands 0.52 dB under the wall. The wall is where the machine goes
+        /// when the alignment is wrong, so a square reaching it while the
+        /// alignment is right would be the defect rather than the measurement.
+        reaches_its_bound: bool,
     }
 
     impl WayUnderTest
@@ -2765,6 +2760,33 @@ mod tests
         fn active(&self) -> &[Biquad]
         {
             self.sections.get(..self.count).unwrap_or(&[])
+        }
+
+        /// Returns the gain the output stage leaves on this way.
+        fn trim(&self) -> f64
+        {
+            f64::from(crate::output::trim_for_test(self.way))
+        }
+
+        /// Returns the word this way comes out at for a sample past every
+        /// bound, on the side `positive` names.
+        ///
+        /// It is READ OFF the output stage, by handing that stage an infinity,
+        /// rather than written down beside it. So the bound a test compares
+        /// against is the bound the machine holds, and moving the wall moves
+        /// both at once.
+        fn bound(&self, positive: bool) -> i32
+        {
+            let sample = if positive { f32::INFINITY } else { f32::NEG_INFINITY };
+
+            way_word(self.way, staged_sample(sample)).cast_signed()
+        }
+
+        /// Returns the magnitude a sample of this way cannot pass, as the
+        /// output stage answers it on the side `positive` names.
+        fn bound_magnitude(&self, positive: bool) -> f64
+        {
+            f64::from(self.bound(positive).unsigned_abs())
         }
     }
 
@@ -2783,7 +2805,7 @@ mod tests
     }
 
     /// Everything about one way that does not come out of a build.
-    type WaySetting = (&'static str, Way, BlockRole, u32, f64, u32, f64);
+    type WaySetting = (&'static str, Way, BlockRole, u32, f64, u32, f64, bool);
 
     /// The low way, on the first slot of the master converter.
     const LOW_UNDER_TEST: WaySetting =
@@ -2795,6 +2817,7 @@ mod tests
         LOW_RESPONSE_WORDS,
         LOW_SQUARE_CYCLES,
         LOW_FEEDBACK_WORDS,
+        true,
     );
 
     /// The mid way, on the other slot of the same converter.
@@ -2807,6 +2830,7 @@ mod tests
         MID_RESPONSE_WORDS,
         MID_SQUARE_CYCLES,
         MID_FEEDBACK_WORDS,
+        true,
     );
 
     /// The high way, on the first slot of the slave converter.
@@ -2819,13 +2843,23 @@ mod tests
         HIGH_RESPONSE_WORDS,
         HIGH_SQUARE_CYCLES,
         HIGH_FEEDBACK_WORDS,
+        false,
     );
 
     /// Builds the cascade of one way, failing the test on a refusal.
     fn built_way(setting: WaySetting) -> WayUnderTest
     {
-        let (name, way, role, slot, response_words, square_cycles, feedback_words) =
-            setting;
+        let
+        (
+            name,
+            way,
+            role,
+            slot,
+            response_words,
+            square_cycles,
+            feedback_words,
+            reaches_its_bound
+        ) = setting;
         let mut sections = [Biquad::SILENT; CROSSOVER_SECTIONS];
 
         let Ok(count) = crossover_sections(way, &mut sections)
@@ -2837,6 +2871,7 @@ mod tests
         WayUnderTest
         {
             name,
+            way,
             sections,
             count,
             role,
@@ -2844,6 +2879,7 @@ mod tests
             response_words,
             square_cycles,
             feedback_words,
+            reaches_its_bound,
         }
     }
 
@@ -2897,6 +2933,81 @@ mod tests
         for (slot, word) in out.iter_mut().zip(buffer.iter())
         {
             *slot = narrowed(*word);
+        }
+
+        out
+    }
+
+    /// Returns the words the output stage leaves for a source carrying `word`,
+    /// read through cascades that change nothing.
+    ///
+    /// A transparent chain hands the same sample to all three ways, so what
+    /// comes back is the stage alone: the alignment of the three ways, the wall
+    /// on the high way and the conversion. The tests of PLACEMENT below expect
+    /// their words through this rather than through a second copy of the
+    /// alignment, and the figures the alignment stands at are read where they
+    /// are written.
+    fn staged(word: u32) -> WayWords
+    {
+        staged_sample(source_sample(word))
+    }
+
+    /// Returns the sample the carry reads `word` as.
+    #[expect
+    (
+        clippy::cast_precision_loss,
+        reason = "the carry crosses single precision at the same step, and this \
+                  is what makes the two answer alike"
+    )]
+    fn source_sample(word: u32) -> f32
+    {
+        word.cast_signed() as f32
+    }
+
+    /// Returns the words the output stage leaves when all three ways answer
+    /// `sample`.
+    fn staged_sample(sample: f32) -> WayWords
+    {
+        WayWords::of(WaySamples { low: sample, mid: sample, high: sample })
+    }
+
+    /// Returns the word `way` leaves out of `words`.
+    fn way_word(way: Way, words: WayWords) -> u32
+    {
+        match way
+        {
+            Way::Low => words.low(),
+            Way::Mid => words.mid(),
+            Way::High => words.high(),
+        }
+    }
+
+    /// Returns the image `role` holds once the source `buffer` has crossed a
+    /// transparent chain and the output stage, frame for frame.
+    ///
+    /// The sample of a frame is the word its first slot carries, which is the
+    /// source contract, so a buffer seeded with two different slots comes back
+    /// carrying the first of them on every channel.
+    fn staged_buffer(buffer: &[u32; TEST_WORDS as usize], role: BlockRole)
+        -> [u32; TEST_WORDS as usize]
+    {
+        let mut out = [0_u32; TEST_WORDS as usize];
+
+        for index in 0..TEST_WORDS
+        {
+            let first = index - index % WORDS_PER_FRAME;
+            let words = staged(carried_word(buffer, first + LOW_SLOT));
+            let slot = index % WORDS_PER_FRAME;
+
+            let word = match (role, slot)
+            {
+                (BlockRole::Master, LOW_SLOT) => words.low(),
+                (BlockRole::Master, _) => words.mid(),
+                (BlockRole::Slave, HIGH_SLOT) => words.high(),
+                (BlockRole::Slave, _) => SILENT_WORD,
+            };
+
+            place(&mut out, index, word);
         }
 
         out
@@ -4257,9 +4368,14 @@ mod tests
     /// Every half of the expectation is a closed form, and none of them calls
     /// the code under test. The destination comes from the distance the mock is
     /// armed at, less the pipeline the data crosses, rather than from
-    /// `CarryShift`. The value comes from `narrowed`, since a transparent
-    /// cascade changes nothing but the single precision the sample crosses. The
-    /// four channels come from the four constants the fan-out turns.
+    /// `CarryShift`. The value comes from the output stage, since a transparent
+    /// cascade changes nothing but the single precision the sample crosses and
+    /// the stage is what stands between that and a buffer. The four channels
+    /// come from the four constants the fan-out turns.
+    ///
+    /// The three channels a way reaches therefore hold three DIFFERENT words,
+    /// each at the alignment of its own way, so a fan-out that sent one way to
+    /// the channel of another shows here as well as in the response.
     ///
     /// The tests that use this measure WHERE a word lands and which channels it
     /// reaches. What the real cascades do to a sample is measured against
@@ -4278,11 +4394,11 @@ mod tests
         {
             let index = plan.carry_start(half) + frame * WORDS_PER_FRAME;
             let at = (index + plan.arming_position() - PIPELINE_WORDS) % TEST_WORDS;
-            let word = narrowed(0xC0DE_0000 | index);
+            let ways = staged(0xC0DE_0000 | index);
 
-            place(master, at + LOW_SLOT, word);
-            place(master, at + MID_SLOT, word);
-            place(slave, at + HIGH_SLOT, word);
+            place(master, at + LOW_SLOT, ways.low());
+            place(master, at + MID_SLOT, ways.mid());
+            place(slave, at + HIGH_SLOT, ways.high());
             place(slave, at + SPARE_SLOT, SILENT_WORD);
         }
     }
@@ -4484,11 +4600,15 @@ mod tests
     /// its narrowing at 60 Hz, and the two do not compare.
     const LOW_RESPONSE_WORDS: f64 = 250_000.0;
 
-    /// The same bound for the mid way. MEASURED at 1346 words, at 400 Hz.
+    /// The same bound for the mid way. MEASURED at 1272 words, at 400 Hz.
     const MID_RESPONSE_WORDS: f64 = 3_000.0;
 
-    /// The same bound for the high way. MEASURED at 216 words, at 1800 Hz.
-    const HIGH_RESPONSE_WORDS: f64 = 500.0;
+    /// The same bound for the high way. MEASURED at 51 words, at 1800 Hz.
+    ///
+    /// A way is read at the level it leaves the machine at, so the alignment
+    /// brings its departure down with its amplitude and this bound stands two
+    /// orders under the one the low way needs.
+    const HIGH_RESPONSE_WORDS: f64 = 120.0;
 
     /// Periods per lap of the full scale square the low way is driven with
     /// where the bound of the conversion is measured.
@@ -4510,22 +4630,22 @@ mod tests
     /// Words a carried sample of the low way may stand from the double
     /// precision evaluation of the same recurrence, over its own square drive.
     ///
-    /// MEASURED over the samples the format holds, on the whole lap, at 383667
-    /// words. This is a little over twice it.
+    /// MEASURED over the samples this way carries whole, on the whole lap, at
+    /// 383667 words. This is a little over twice it.
     ///
     /// What separates a bound at the conversion from a bound INSIDE the feedback
     /// is the measurement beside it: the same drive through a cascade whose
-    /// feedback is bounded to the format moves a sample of this way by
-    /// 2157154502 words, five thousand times the bound here.
+    /// feedback is held to the format, section by section, moves a sample of
+    /// this way by 2157154502 words, two thousand times the bound here.
     const LOW_FEEDBACK_WORDS: f64 = 800_000.0;
 
-    /// The same bound for the mid way. MEASURED at 28289 words, against
-    /// 3263917836 for a bounded feedback.
+    /// The same bound for the mid way. MEASURED at 26763 words, against
+    /// 3081337085 for a bounded feedback.
     const MID_FEEDBACK_WORDS: f64 = 60_000.0;
 
-    /// The same bound for the high way. MEASURED at 2216 words, against
-    /// 3274757570 for a bounded feedback.
-    const HIGH_FEEDBACK_WORDS: f64 = 5_000.0;
+    /// The same bound for the high way. MEASURED at 528 words, against
+    /// 1420841441 for a bounded feedback.
+    const HIGH_FEEDBACK_WORDS: f64 = 1_200.0;
 
     /// Returns the word every slot of a frame holds at `index` of lap `lap`.
     ///
@@ -4548,8 +4668,11 @@ mod tests
     /// Returns the word a full scale square of `cycles` periods a lap holds at
     /// `index` of lap `lap`.
     ///
-    /// It swings the whole format at every edge, which is the input that takes a
-    /// way furthest past the format on its overshoot.
+    /// It swings the whole format at every edge. In the pass band of the low way
+    /// or the mid way the overshoot of those edges takes that way past the
+    /// format. The input that puts the loudest peak on a way is another one: it
+    /// carries the sign pattern of the impulse response of that way read
+    /// backwards.
     fn square_word(lap: u32, index: u32, cycles: u32) -> u32
     {
         let half = LAP_FRAMES / (2 * cycles);
@@ -4676,7 +4799,7 @@ mod tests
     /// not a reading at one point.
     ///
     /// 1800 Hz is in it because that is where the high way departs furthest from
-    /// its design, 216 words against the 180 of the next worst point, and
+    /// its design, 51 words against the 43 of the next worst point, and
     /// because it is the lowest frequency the compression driver is rated from.
     /// A set that stepped over it would name a bound the band breaks.
     const SWEEP_CYCLES: [u32; 19] =
@@ -4707,6 +4830,11 @@ mod tests
         // Each way is read off the channel the fan-out puts it on, so a chain
         // that ran the right cascades and sent them to the wrong channels fails
         // this rather than passing on three shapes nobody located.
+        //
+        // The design a way is read against carries the alignment of that way,
+        // because the alignment is part of what leaves the machine. A stage that
+        // dropped it, or that put one way at the gain of another, moves the
+        // whole band of that way and fails every point of the sweep on it.
         let mut points = 0_u32;
 
         for cycles in SWEEP_CYCLES
@@ -4745,7 +4873,7 @@ mod tests
                     BlockRole::Slave => &slave,
                 };
 
-                let designed = designed_magnitude(way.active(), cycles) * drive;
+                let designed = designed_magnitude(way.active(), cycles) * drive * way.trim();
                 let measured = amplitude_at(carried, way.slot, cycles);
                 let gap = (measured - designed).abs();
 
@@ -5017,9 +5145,9 @@ mod tests
                 let index = frame * WORDS_PER_FRAME;
                 let ways = straight.carry(sine_word(lap, index, 7, SWEEP_AMPLITUDE));
 
-                place(&mut want_master, index + LOW_SLOT, ways.low);
-                place(&mut want_master, index + MID_SLOT, ways.mid);
-                place(&mut want_slave, index + HIGH_SLOT, ways.high);
+                place(&mut want_master, index + LOW_SLOT, ways.low());
+                place(&mut want_master, index + MID_SLOT, ways.mid());
+                place(&mut want_slave, index + HIGH_SLOT, ways.high());
                 place(&mut want_slave, index + SPARE_SLOT, SILENT_WORD);
             }
         }
@@ -5124,7 +5252,12 @@ mod tests
         // Each way is driven with a full scale square in its own pass band,
         // which takes it past the format on the overshoot of every edge. The two
         // runs part company there, and the parting shows in the ringing that
-        // follows, where the output is back inside the format and readable.
+        // follows, where the output is back inside the bound of the way and
+        // readable.
+        //
+        // The reference carries the alignment of the way, since the alignment
+        // stands between the recurrence and the buffer, and the bound a sample
+        // is read against is the one the output stage answers for that way.
         let mut compared = 0_u32;
 
         for way in ways_under_test()
@@ -5157,12 +5290,14 @@ mod tests
 
             for frame in 0..LAP_FRAMES
             {
-                let reference = want.get(frame as usize).copied().unwrap_or(0.0);
+                let reference = want.get(frame as usize).copied().unwrap_or(0.0)
+                    * way.trim();
 
-                // Only the samples the format holds are compared. Where the
-                // recurrence stands past it the conversion saturates on purpose,
-                // and the test beside this one is what reads those.
-                if reference.abs() >= f64::from(i32::MAX)
+                // Only the samples this way carries whole are compared. Where
+                // the recurrence stands past the bound of the way the stage
+                // holds it there on purpose, and the test beside this one is
+                // what reads those.
+                if reference.abs() >= way.bound_magnitude(reference > 0.0)
                 {
                     continue;
                 }
@@ -5186,7 +5321,8 @@ mod tests
             assert!
             (
                 inside > 0,
-                "{} held no sample inside the format, so this compared nothing",
+                "{} held no sample inside its own bound, so this compared \
+                 nothing",
                 way.name
             );
         }
@@ -5195,18 +5331,27 @@ mod tests
     }
 
     #[test]
-    fn an_overshoot_saturates_instead_of_coming_back_round()
+    fn an_overshoot_is_held_at_the_bound_of_its_own_way()
     {
         // A cascade answers a step above the step. Driven at full scale it
         // therefore leaves the format, and what it must NOT do there is come
         // back round to the opposite sign, which is a swing of two full scales
         // into a way with no analog filter in front of it.
         //
-        // Every sample whose unbounded reference stands past the format is read
-        // against the bound on its OWN side, so a conversion that wrapped
-        // answers the opposite bound and fails. Each way is required to have
-        // reached the bound, since a drive that never left the format would pass
-        // this while measuring nothing about it.
+        // Every sample whose reference stands past the bound of its way is read
+        // against that bound on its OWN side, so a conversion that wrapped
+        // answers the opposite bound and fails.
+        //
+        // The two bounds are not the same bound. The low way and the mid way
+        // are held by the conversion, at the format. The high way is held by the
+        // wall, 4.12 dB under it, and its alignment keeps it under that, so this
+        // drive is not expected to reach it and each way declares which of the
+        // two it is rather than every way being required to reach its own.
+        //
+        // How far under the wall this way stands is NOT a distance this drive
+        // can give. A square in the pass band is one waveform out of every
+        // waveform the format carries, and the reading below is what bounds
+        // them all.
         for way in ways_under_test()
         {
             let mut master = [0_u32; TEST_WORDS as usize];
@@ -5234,32 +5379,30 @@ mod tests
                 |lap, index| square_word(lap, index, cycles)
             );
             let mut bounded = 0_u32;
+            let mut loudest = 0.0_f64;
 
             for frame in 0..LAP_FRAMES
             {
-                let reference = want.get(frame as usize).copied().unwrap_or(0.0);
+                let reference = want.get(frame as usize).copied().unwrap_or(0.0)
+                    * way.trim();
+                let positive = reference > 0.0;
 
-                if reference.abs() < f64::from(i32::MAX)
+                loudest = loudest.max(reference.abs());
+
+                if reference.abs() < way.bound_magnitude(positive)
                 {
                     continue;
                 }
 
                 let index = frame * WORDS_PER_FRAME + way.slot;
                 let answered = carried_word(carried, index).cast_signed();
-                let expected = if reference > 0.0
-                {
-                    i32::MAX
-                }
-                else
-                {
-                    i32::MIN
-                };
 
                 bounded = bounded.saturating_add(1);
 
                 assert_eq!
                 (
-                    answered, expected,
+                    answered,
+                    way.bound(positive),
                     "{} frame {frame} came out at {answered} where the \
                      recurrence stands at {reference}, which is what a \
                      conversion that wrapped produces",
@@ -5267,14 +5410,146 @@ mod tests
                 );
             }
 
-            assert!
+            assert_eq!
             (
                 bounded > 0,
-                "the drive never took {} past the format, so this measures \
-                 nothing about the bound",
-                way.name
+                way.reaches_its_bound,
+                "{} reached its bound on {bounded} samples of the lap, and its \
+                 loudest stands at {loudest} words against a bound of {}",
+                way.name,
+                way.bound_magnitude(true)
             );
         }
+    }
+
+    /// Returns the loudest word the high way leaves for a full scale square of
+    /// `half` samples to the half period, read through the output stage.
+    ///
+    /// The first four periods are dropped, so what comes back is the steady
+    /// state rather than the answer to switching the drive on.
+    fn loudest_square_word(half: u32) -> i32
+    {
+        let Ok(mut cascade) = HighCascade::of(Way::High)
+        else
+        {
+            panic!("the high way did not build");
+        };
+        let mut loudest = 0_i32;
+
+        for step in 0..(64 * half)
+        {
+            let sample = if (step / half).is_multiple_of(2) { i32::MIN } else { i32::MAX };
+            let answered =
+                staged_sample(cascade.step(source_sample(sample.cast_unsigned()))).high();
+
+            if step >= 8 * half
+            {
+                loudest = loudest.max(answered.cast_signed().abs());
+            }
+        }
+
+        loudest
+    }
+
+    #[test]
+    fn no_source_the_format_carries_reaches_the_wall_of_the_high_way()
+    {
+        // The 8.38 dB the alignment leaves is the distance from one SAMPLE at
+        // full scale. What the wall has to stand above is a PEAK, and a cascade
+        // answers a weighted sum of the samples behind it, so the loudest peak
+        // it can be made to answer over every source the format carries is the
+        // sum of the magnitudes of its impulse response. The source that
+        // attains that sum carries the sign pattern of the response read
+        // backwards, which is why the figure below is a bound REACHED and not
+        // one computed and hoped to be loose.
+        //
+        // The reading above drives this way with a square, which is one
+        // waveform out of that set and not the worst of it, so a distance read
+        // off a square is a point and not a bound. That is the whole reason
+        // this stands beside it.
+        const TAIL: usize = 1_024;
+        const SQUARE_HALVES: u32 = 64;
+
+        let Ok(mut impulse) = HighCascade::of(Way::High)
+        else
+        {
+            panic!("the high way did not build");
+        };
+        let mut positive = [false; TAIL];
+        let mut norm = 0.0_f64;
+
+        for (index, sign) in positive.iter_mut().enumerate()
+        {
+            let answer = impulse.step(if index == 0 { 1.0 } else { 0.0 });
+
+            *sign = answer >= 0.0;
+            norm += f64::from(answer.abs());
+        }
+
+        let Ok(mut driven) = HighCascade::of(Way::High)
+        else
+        {
+            panic!("the high way did not build");
+        };
+        let mut worst = 0_i32;
+
+        for sign in positive.iter().rev()
+        {
+            let sample = if *sign { i32::MAX } else { i32::MIN };
+            let answered =
+                staged_sample(driven.step(source_sample(sample.cast_unsigned()))).high();
+
+            worst = worst.max(answered.cast_signed().abs());
+        }
+
+        // The wall is read off the stage rather than written down here, so it
+        // is the wall the machine holds and moving it moves this reading with
+        // it.
+        let wall = staged_sample(f32::INFINITY).high().cast_signed();
+        let margin_db = 20.0 * log10(f64::from(wall) / f64::from(worst));
+
+        assert!((norm - 2.472_951).abs() < 1.0e-5, "the L1 norm of the high way reads {norm}");
+        assert_eq!(worst, 1_259_346_816, "the source that attains the norm left {worst} words");
+        assert!(worst < wall, "a source the format carries reached the wall at {worst} words");
+        assert!
+        (
+            (margin_db - 0.516).abs() < 0.005,
+            "the loudest peak this way can answer stands {margin_db} dB under the wall"
+        );
+
+        // And the square family is walked, to show what a reading taken on one
+        // waveform is worth. The loudest square of the family stands UNDER the
+        // bound above, and it stands OVER the square the reading beside this one
+        // drives with, so that drive is not the worst square either and a
+        // distance read off it is a point twice over. The family peaks at eight
+        // samples to the half period. Past the peak it falls to a trough at 18,
+        // rises to a second crest at 35, and from 128 up to 512 it holds between
+        // 768089920 and 768090304 words, all under the peak. The walk runs to
+        // 64, eight times the half period of the peak, and the loudest square it
+        // reads is the loudest of every half period up to 512.
+        let named_half = LAP_FRAMES / (2 * HIGH_SQUARE_CYCLES);
+        let mut loudest_square = 0_i32;
+
+        for half in 1..=SQUARE_HALVES
+        {
+            let answered = loudest_square_word(half);
+
+            loudest_square = loudest_square.max(answered);
+        }
+
+        assert!
+        (
+            loudest_square_word(named_half) < loudest_square,
+            "the square of {named_half} samples a half is the loudest of the \
+             family, at {loudest_square} words"
+        );
+
+        assert!
+        (
+            loudest_square < worst,
+            "the loudest square left {loudest_square} words where the bound over \
+             every source stands at {worst}"
+        );
     }
 
     #[test]
@@ -5630,37 +5905,30 @@ mod tests
             // word rather than the seeded one, and it returns the same one at
             // every lap after that.
             //
-            // The seed holds the same sample in both slots of a frame, so both
-            // slots of the master come back carrying it: the low way and the mid
-            // way answer one source sample and a transparent chain hands both
-            // the same value. The slave holds the high way on its first slot and
-            // silence on the other, which is the fan-out read over a closed
-            // link.
+            // What each channel comes back holding is that word at the alignment
+            // of its own way, and the link closes on the slot the low way
+            // leaves in, which carries unity. So the content that re-enters the
+            // chain is the seed itself and the picture stands still lap after
+            // lap, while the two channels the alignment brings down hold a
+            // quieter word that does not fall any further.
             let seed = narrowed_buffer(&interface.master);
+            let want_master = staged_buffer(&seed, BlockRole::Master);
+            let want_slave = staged_buffer(&seed, BlockRole::Slave);
 
             assert_eq!(run_loop(&mut interface, 12, shift, &mut transparent_chain()), Ok(()));
 
             for index in 0..TEST_WORDS as usize
             {
-                let want = seed.get(index).copied();
-
                 assert_eq!
                 (
                     interface.master.get(index).copied(),
-                    want,
+                    want_master.get(index).copied(),
                     "master word {index} moved over twelve laps at offset {offset}"
                 );
                 assert_eq!
                 (
                     interface.slave.get(index).copied(),
-                    if index as u32 % WORDS_PER_FRAME == HIGH_SLOT
-                    {
-                        want
-                    }
-                    else
-                    {
-                        Some(SILENT_WORD)
-                    },
+                    want_slave.get(index).copied(),
                     "slave word {index} moved over twelve laps at offset {offset}"
                 );
             }
@@ -5756,13 +6024,22 @@ mod tests
 
             seed_tone(&mut interface);
 
-            let bound = largest_step(&narrowed_buffer(&interface.master), 0);
+            // The tone each channel is read against is the tone at the
+            // alignment of that channel, since the stage under the carry brings
+            // two of the three down. A channel is compared against its own,
+            // which leaves the reading here about the JOIN and about nothing
+            // else.
+            let seed = narrowed_buffer(&interface.master);
+            let want_master = staged_buffer(&seed, BlockRole::Master);
+            let want_slave = staged_buffer(&seed, BlockRole::Slave);
 
-            assert!(bound > 0, "the seeded tone moves");
             assert_eq!(run_loop(&mut interface, 12, shift, &mut transparent_chain()), Ok(()));
 
             for slot in 0..WORDS_PER_FRAME as usize
             {
+                let bound = largest_step(&want_master, slot);
+
+                assert!(bound > 0, "the seeded tone moves on master slot {slot}");
                 assert_eq!
                 (
                     largest_step(&interface.master, slot),
@@ -5775,10 +6052,13 @@ mod tests
             // The slave carries the high way on one slot and silence on the
             // other, so only the driven one is read against the tone and the
             // other is read against nothing moving at all.
+            let high_bound = largest_step(&want_slave, HIGH_SLOT as usize);
+
+            assert!(high_bound > 0, "the seeded tone moves on the high channel");
             assert_eq!
             (
                 largest_step(&interface.slave, HIGH_SLOT as usize),
-                bound,
+                high_bound,
                 "the slave channel of the high way at offset {offset} carries a \
                  step the tone does not"
             );
