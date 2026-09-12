@@ -7,14 +7,14 @@
 //! The converters come out of reset muted, held there by the pull-down on their
 //! XSMT pin. One stage of this binary raises XSMT, the release gate, and it
 //! does so only after the audio clock read back as planned, the transport read
-//! back as planned, both transfer counters reloaded twice with no error flag
-//! raised over that window, which is a whole lap of their buffers whatever
-//! position they were found at, and a buffer of zeros was held over the
-//! converter unmute ramp. One vector serves the transfer events of the input
-//! path and drives that pin low only on an entry it refuses, which is what the
-//! third gap below covers. Every other path here drives it low once the core
-//! reaches its first instruction, and the two gaps after that are where it does
-//! not.
+//! back as planned, the crossover chain stood in the memory the carry reads,
+//! both transfer counters reloaded twice with no error flag raised over that
+//! window, which is a whole lap of their buffers whatever position they were
+//! found at, and a buffer of zeros was held over the converter unmute ramp. One
+//! vector serves the transfer events of the input path and drives that pin low
+//! only on an entry it refuses, which is what the third gap below covers. Every
+//! other path here drives it low once the core reaches its first instruction,
+//! and the two gaps after that are where it does not.
 //!
 //! Once it has risen, the machine is audible until something drives the pin
 //! back down or a reset returns it to its pull-down. A core lockup does
@@ -312,16 +312,19 @@ fn keep_core_visible_in_sleep()
 /// one.
 ///
 /// The input path comes up between the transport and the gate, on the same
-/// witness. It configures the receiving sub-block, its stream and PD11, and it
-/// starts that stream where the shift the two read pointers leave lands in the
-/// band a carry can work in. It writes no output buffer and leaves PE7
-/// alone, so the gate that follows still finds the buffers holding zeros.
+/// witness. It configures the receiving sub-block, its stream and PD11, it
+/// parks the crossover chain in the memory the carry reads, and it starts that
+/// stream where the shift the two read pointers leave lands in the band a carry
+/// can work in. It writes no output buffer and leaves PE7 alone, so the gate
+/// that follows still finds the buffers holding zeros, and what it returns is
+/// the witness that the chain is parked.
 ///
-/// The release gate runs on the same witness again. It watches the transfers,
-/// puts PE7 under the port and raises it, and holds the buffers of zeros over
-/// the converter unmute ramp. This is the first time this firmware makes the
-/// machine audible, and the permit it returns is what the tone write needs, so
-/// nothing non-zero can reach the converters ahead of it.
+/// The release gate takes that witness and the clock one by reference and reads
+/// neither. It watches the transfers, puts PE7 under the port and raises it,
+/// and holds the buffers of zeros over the converter unmute ramp. This is the
+/// first time this firmware makes the machine audible, and the permit it
+/// returns is what the tone write needs, so nothing non-zero can reach the
+/// converters ahead of it.
 ///
 /// The arming runs last and takes that permit by value. It waits for the tone
 /// to travel a whole lap of the receiving buffer, then enables the two transfer
@@ -399,15 +402,20 @@ fn main() -> !
 
     let mut input = passthrough::observe(&part.SAI2, &part.DMA1, &part.DMAMUX1, &part.GPIOD);
 
-    if let Err(fault) = passthrough::start(&audio_clock, &mut input, BOOT_CORE_CLOCK_HZ)
+    let filters = match passthrough::start(&audio_clock, &mut input, BOOT_CORE_CLOCK_HZ)
     {
-        REFUSAL.store(postmortem::passthrough_refusal(fault), Ordering::Relaxed);
-        silence_and_park()
-    }
+        Ok(witness) => witness,
+        Err(fault) =>
+        {
+            REFUSAL.store(postmortem::passthrough_refusal(fault), Ordering::Relaxed);
+            silence_and_park()
+        }
+    };
 
     let released = release::start
     (
         &audio_clock,
+        &filters,
         &part.RCC,
         &part.SAI1,
         &part.DMA1,

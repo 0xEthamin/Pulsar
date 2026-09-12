@@ -9,10 +9,10 @@
 //!
 //! What carries this clock to a pin is the output transport, which enables the
 //! audio interface and puts PE2 to PE6 on their alternate function. It runs
-//! only on the witness returned here, and so does the gate that raises the
-//! converter mute line, so a run that ends in a refusal leaves the kernel
-//! clock reaching nothing and the converters where they were, even though the
-//! PLL can be left going.
+//! only on the witness returned here, and the gate that raises the converter
+//! mute line takes it as one of its witnesses, so a run that ends in a refusal
+//! leaves the kernel clock reaching nothing and the converters where they were,
+//! even though the PLL can be left going.
 
 use pulsar_lib::clock::
 {

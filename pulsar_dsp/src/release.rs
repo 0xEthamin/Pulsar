@@ -28,6 +28,7 @@ use stm32h7::stm32h743v::gpioc::pupdr::PULL;
 use stm32h7::stm32h743v::{DMA1, DMAMUX1, GPIOE, RCC, SAI1};
 
 use crate::clock::AudioClock;
+use crate::passthrough::PublishedChain;
 use crate::transport;
 
 /// `MODER` value putting a pin on general purpose output. RM0433 section
@@ -193,9 +194,11 @@ fn enable_port_clock(rcc: &RCC)
 /// Raises the converter mute line once the transport has proved it runs.
 ///
 /// `clock` is the witness that the audio kernel clock came up and read back as
-/// planned. The gate does not read it. Taking it by reference is what leaves
-/// the order to the compiler: a refused clock builds no witness, so there is
-/// nothing to hand over, and this cannot run ahead of the clock it depends on.
+/// planned, and `filters` the witness that the crossover chain stands in the
+/// memory the carry reads. The gate reads neither. Taking them by reference is
+/// what leaves the order to the compiler: a refused clock and a refused chain
+/// each build no witness, so there is nothing to hand over, and this cannot run
+/// ahead of either stage it depends on.
 ///
 /// `core_clock_hz` sizes the window budget, and naming a clock above the one
 /// the core runs at only lengthens it.
@@ -226,10 +229,19 @@ fn enable_port_clock(rcc: &RCC)
 /// store lands and refuses rather than guessing, which is the behaviour it
 /// documents. Keeping this out of line keeps the arms readable. It costs one
 /// call on a path taken once.
+#[expect
+(
+    clippy::too_many_arguments,
+    reason = "the eight are two witnesses that order this call, the five \
+              register blocks it reaches and the core clock frequency that \
+              sizes its window, and a type grouping the blocks would leave \
+              the blocks this call reaches unnamed where it is read"
+)]
 #[inline(never)]
 pub(crate) fn start
 (
     clock: &AudioClock,
+    filters: &PublishedChain,
     rcc: &RCC,
     sai: &SAI1,
     dma: &DMA1,
@@ -249,6 +261,7 @@ pub(crate) fn start
         &mut interface,
         &mut line,
         clock,
+        filters,
         &plan,
         ReleaseWaits::for_transport(&plan, core_clock_hz)
     )

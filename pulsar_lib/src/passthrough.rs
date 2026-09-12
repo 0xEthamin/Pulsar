@@ -2322,14 +2322,14 @@ where
 
 /// Puts the block structure into service.
 ///
-/// `permit` is the release gate having verified the clocks, watched the
-/// transfers over a whole lap and held a buffer of zeros over the converter
-/// unmute ramp. It is taken BY VALUE, carried through this sequence and spent
-/// on `InputInterface::enable_events`, which is the one door onto the vector.
-/// So the interrupt that lets anything write the output buffers continuously
-/// cannot be enabled by any path that does not hold the permit, and the permit
-/// has no public constructor. That is the third term of the gate held by the
-/// type rather than by a comment.
+/// `permit` is the release gate having watched the transfers over a whole lap
+/// and held a buffer of zeros over the converter unmute ramp, once the clock
+/// and the chain had reported. It is taken BY VALUE, carried through this
+/// sequence and spent on `InputInterface::enable_events`, which is the one door
+/// onto the vector. So the interrupt that lets anything write the output
+/// buffers continuously cannot be enabled by any path that does not hold the
+/// permit, and the permit has no public constructor. That is the third term of
+/// the gate held by the type rather than by a comment.
 ///
 /// The seed wait comes first. In local loopback the link carries what this
 /// board sends, so a passthrough started over an output buffer of zeros carries

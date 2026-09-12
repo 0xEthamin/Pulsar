@@ -12,12 +12,11 @@
 //!
 //! # The terms
 //!
-//! XSMT rises only once every stage feeding the converter has reported ready,
-//! and a stage that does not exist yet is named rather than assumed away. On
-//! the finished machine that is four terms: clocks verified, transfers
-//! running, the buffer filled with zeros, filters initialised. This gate
-//! carries three of them, and the fourth is absent because no filter exists in
-//! the firmware yet. It joins here, and never leaves, once one does.
+//! XSMT rises only once every stage feeding the converter has reported ready.
+//! That is four terms: clocks verified, transfers running, the buffer filled
+//! with zeros, filters initialised. This gate carries all four, and a stage
+//! added between a sample and a converter adds its term here rather than
+//! leaning on the stage ahead of it.
 //!
 //! **Clocks verified** is the witness the clock bring-up returns after
 //! comparing its read-back field by field against its plan. The type that
@@ -66,6 +65,14 @@
 //! the raise, and the hold covers the unmute ramp of the converter. `TonePermit`
 //! is what a caller needs to write a non-zero sample, and only a completed
 //! sequence builds one.
+//!
+//! **Filters initialised** is the witness the input bring-up returns once the
+//! crossover chain stands in the memory the carry reads. The type that carries
+//! it belongs to the firmware that parks that chain, so this module names
+//! `InitialisedFilters` rather than that type, and `open` takes one by
+//! reference for the reason it takes the clock one: a refused chain builds no
+//! witness, so there is nothing to hand over and a run that never published a
+//! chain never reaches the raise.
 //!
 //! # What the converter does with a long silence
 //!
@@ -119,6 +126,16 @@ const WINDOW_LAPS: u32 = 3;
 /// and on nothing else: what it claims is a field by field read-back against a
 /// validated plan, and a lock bit is not one.
 pub trait VerifiedClock
+{
+}
+
+/// Attests that the crossover chain stands in the memory the carry reads.
+///
+/// The type carrying the attestation belongs to the firmware that parks that
+/// chain, so this trait is what the gate names. Implement it on that type and
+/// on nothing else: what it claims is a built chain published where the carry
+/// reads it, and a chain a caller merely holds is not one.
+pub trait InitialisedFilters
 {
 }
 
@@ -367,7 +384,7 @@ impl ReleaseFault
 /// Permission to write a non-zero sample into a buffer the streams replay.
 ///
 /// `open` is the only thing that builds one, and it builds one only after the
-/// three terms held and the hold ran to the end. The field is private, so no
+/// four terms held and the hold ran to the end. The field is private, so no
 /// other module and no other crate can construct one, and the type is neither
 /// `Copy` nor `Clone`, so what a caller holds is the one the gate returned.
 ///
@@ -511,9 +528,10 @@ impl Laps
 /// zeros did not run for the whole ramp, and the line goes back down before
 /// the fault is returned.
 ///
-/// `_clock` is not read. It is the witness that the audio kernel clock came up
-/// to its plan, and taking it by reference is what leaves the order to the
-/// compiler rather than to a comment.
+/// `_clock` and `_filters` are not read. They are the witnesses that the audio
+/// kernel clock came up to its plan and that the crossover chain stands in the
+/// memory the carry reads, and taking them by reference is what leaves the
+/// order to the compiler rather than to a comment.
 ///
 /// # Errors
 ///
@@ -522,11 +540,12 @@ impl Laps
 /// mute line had been raised when it was seen. A refusal leaves the line low
 /// and builds no `TonePermit`, so a caller that answers a refusal by staying
 /// silent is silent.
-pub fn open<I, M, W>
+pub fn open<I, M, W, F>
 (
     interface: &mut I,
     line: &mut M,
     _clock: &W,
+    _filters: &F,
     plan: &TransportPlan,
     waits: ReleaseWaits
 ) -> Result<TonePermit, ReleaseFault>
@@ -534,6 +553,7 @@ where
     I: AudioInterface + ?Sized,
     M: ConverterMute + ?Sized,
     W: VerifiedClock + ?Sized,
+    F: InitialisedFilters + ?Sized,
 {
     interface.clear_fifo_errors();
 
@@ -807,6 +827,13 @@ mod tests
     struct TestClock;
 
     impl VerifiedClock for TestClock
+    {
+    }
+
+    /// A filter witness, which the gate takes and does not read.
+    struct TestFilters;
+
+    impl InitialisedFilters for TestFilters
     {
     }
 
@@ -1199,7 +1226,15 @@ mod tests
     fn run(interface: &mut MockInterface) -> (Result<TonePermit, ReleaseFault>, MockLine)
     {
         let mut line = MockLine::new();
-        let outcome = open(interface, &mut line, &TestClock, &plan(), waits());
+        let outcome = open
+        (
+            interface,
+            &mut line,
+            &TestClock,
+            &TestFilters,
+            &plan(),
+            waits()
+        );
 
         (outcome, line)
     }
@@ -1778,7 +1813,15 @@ mod tests
         let mut interface = MockInterface::healthy();
         let mut line = MockLine::new();
         let waits = ReleaseWaits { lap_polls: 0 };
-        let outcome = open(&mut interface, &mut line, &TestClock, &plan(), waits);
+        let outcome = open
+        (
+            &mut interface,
+            &mut line,
+            &TestClock,
+            &TestFilters,
+            &plan(),
+            waits
+        );
 
         assert_eq!
         (

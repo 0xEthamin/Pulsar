@@ -74,7 +74,7 @@ use pulsar_lib::passthrough::
     bring_up,
 };
 use pulsar_lib::clock::{AUDIO_PLAN, ClockPlan};
-use pulsar_lib::release::TonePermit;
+use pulsar_lib::release::{InitialisedFilters, TonePermit};
 use pulsar_lib::transport::{BlockRole, STREAM_PRIORITY, SYNC_OUT_NONE, TRANSFER_WORD};
 use stm32h7::stm32h743v::dma1::st::cr::{DIR, PL, PSIZE};
 use stm32h7::stm32h743v::dmamux1::ccr::DMAREQ_ID;
@@ -904,28 +904,136 @@ fn fill_silence()
     }
 }
 
-/// Writes `chain` into the parked one.
+/// The two publications of the crossover chain, and the witness the second one
+/// builds.
 ///
-/// The write is volatile, so it stands where it is written rather than being
-/// moved across the calls that follow it or dropped as a value nothing in this
-/// crate reads. What reads it is one handler, and what orders the two is the
-/// unmask that stands after every call to this.
-#[expect
-(
-    unsafe_code,
-    reason = "the chain is reached by raw pointer, since the handler that reads \
-              it holds no reference this function could borrow from"
-)]
-fn publish_chain(chain: &FilterChain)
+/// The write is private to this module and neither publication reaches it on
+/// its own terms. `park_silent` runs first and hands back a handle onto that
+/// memory, `ParkedChain::publish` spends the handle, builds the chain itself
+/// and returns the witness of the write that publishes it. So a witness comes
+/// out of the write of the built chain rather than standing beside it, and no
+/// caller picks what that write carries.
+///
+/// Nothing here forbids a second parking after a publication. What such a run
+/// leaves is a silent chain and a witness that attests the write it came out
+/// of, which is why the witness is read as one write at one instant and not as
+/// the state of that memory from then on.
+mod chain
 {
-    // SAFETY: nothing else touches the chain while this runs. Every call to
-    // this stands ahead of the unmask that puts the handler on the vector, and
-    // the handler is the only other access.
-    unsafe
+    use core::ptr;
+
+    use super::
     {
-        ptr::write_volatile((&raw mut FILTER_CHAIN).cast::<FilterChain>(), *chain);
+        FILTER_CHAIN,
+        FilterChain,
+        InitialisedFilters,
+        PassthroughFault,
+        built_chain,
+    };
+
+    /// Witness that the built crossover chain stands in the memory the carry
+    /// reads.
+    ///
+    /// `ParkedChain::publish` is the only thing that builds one, and it returns
+    /// it from the write that publishes that chain. The field is private to
+    /// this module, so no caller can put one beside a publication it did not
+    /// come out of, and the publication that stops the ways builds none: a
+    /// stopped way is not a filtered way.
+    ///
+    /// It attests that one write, at one instant, and says nothing about the
+    /// memory afterwards. Where that write lands is not attested either. This
+    /// crate is a `[[bin]]` built for the part, so no host test reaches the
+    /// pointer the write goes through, and a write that lands elsewhere builds
+    /// a witness just the same. A bench probe is what settles that.
+    ///
+    /// A stage that needs the ways filtered takes this by reference, which
+    /// leaves the start order to the compiler rather than to a comment.
+    pub(crate) struct PublishedChain(());
+
+    /// The release gate takes one of these and reads nothing out of it. What it
+    /// needs is that one exists, since `start` is the only thing that builds one
+    /// and it builds one only once the chain is where the handler reads it.
+    impl InitialisedFilters for PublishedChain
+    {
+    }
+
+    /// The parked chain, and the handle a publication spends to write over it.
+    ///
+    /// `park_silent` is the only thing that builds one. A handle dropped rather
+    /// than spent is a silent chain nothing replaced, so this is `must_use`.
+    #[must_use]
+    pub(super) struct ParkedChain(());
+
+    impl ParkedChain
+    {
+        /// Builds the crossover chain, publishes it over the parked one and
+        /// returns the witness of that write.
+        ///
+        /// Building the chain here rather than taking it is what puts one
+        /// chain on the path that reaches a witness. A caller holds no way to
+        /// hand this a chain that stops the ways, so a witness of a silent
+        /// publication cannot be written. The handle goes by value, so one
+        /// parking answers one publication.
+        ///
+        /// # Errors
+        ///
+        /// `FilterRefused`, whatever the build refused with. A refusal writes
+        /// nothing and returns no witness, so the parked silent chain stands.
+        #[expect
+        (
+            clippy::unused_self,
+            reason = "the handle carries no data, so spending it is the whole \
+                      of what this takes from it, and that is the order the \
+                      witness stands on"
+        )]
+        pub(super) fn publish(self) -> Result<PublishedChain, PassthroughFault>
+        {
+            write_chain(&built_chain()?);
+
+            Ok(PublishedChain(()))
+        }
+    }
+
+    /// Parks cascades that stop the signal, and returns the handle onto them.
+    ///
+    /// It builds no witness. The memory the carry would read holds a way the
+    /// signal does not cross from here on, which is not a way with a filter on
+    /// it, so nothing a stage downstream takes comes out of this.
+    pub(super) fn park_silent() -> ParkedChain
+    {
+        write_chain(&FilterChain::silent());
+
+        ParkedChain(())
+    }
+
+    /// Writes `chain` into the parked one.
+    ///
+    /// `write_volatile` is what keeps the write, since nothing in this crate
+    /// reads the memory back. It carries no store sequence of its own: a chain
+    /// is 360 bytes, so the image reaches that memory through a call to the
+    /// runtime copy routine, the same symbol an ordinary move of a chain goes
+    /// through, and what holds the write in place is a call the compiler
+    /// cannot see into. What reads the memory is one handler, and what orders
+    /// the two is the unmask that stands after every call to this.
+    #[expect
+    (
+        unsafe_code,
+        reason = "the chain is reached by raw pointer, since the handler that \
+                  reads it holds no reference this function could borrow from"
+    )]
+    fn write_chain(chain: &FilterChain)
+    {
+        // SAFETY: nothing else touches the chain while this runs. Every call to
+        // this stands ahead of the unmask that puts the handler on the vector,
+        // and the handler is the only other access.
+        unsafe
+        {
+            ptr::write_volatile((&raw mut FILTER_CHAIN).cast::<FilterChain>(), *chain);
+        }
     }
 }
+
+pub(crate) use chain::PublishedChain;
 
 /// Returns the crossover the carry runs on every frame.
 ///
@@ -1023,6 +1131,10 @@ pub(crate) fn plan(clock: &AudioClock) -> InputPlan
 /// been read back. Nothing is enabled that could write an output buffer, and
 /// XSMT is untouched.
 ///
+/// What comes back is the witness that the built chain is in that memory. The
+/// release gate takes it and reads nothing out of it, so what it buys is the
+/// order: a run that never published a chain hands the gate nothing.
+///
 /// # Errors
 ///
 /// A `PassthroughFault` naming where the bring-up refused and what that place
@@ -1046,27 +1158,28 @@ pub(crate) fn start
     clock: &AudioClock,
     input: &mut Input<'_>,
     core_clock_hz: u32
-) -> Result<(), PassthroughFault>
+) -> Result<PublishedChain, PassthroughFault>
 {
     fill_silence();
-    publish_chain(&FilterChain::silent());
+
+    let parked = chain::park_silent();
 
     let plan = plan(clock);
     let shift = bring_up(input, &plan, &InputWaits::for_plan(&plan, core_clock_hz))?;
 
-    publish_chain(&built_chain()?);
+    let published = parked.publish()?;
     CARRY_SHIFT.store(shift.words(), Ordering::Release);
 
-    Ok(())
+    Ok(published)
 }
 
 /// Puts the block structure into service.
 ///
 /// `permit` is taken BY VALUE. The release gate builds one only after it has
-/// verified the clocks, watched the transfers over a whole lap and held a
-/// buffer of zeros over the converter unmute ramp, and consuming it here is
-/// what stops the interrupt going up while anything else could still write an
-/// output buffer.
+/// watched the transfers over a whole lap and held a buffer of zeros over the
+/// converter unmute ramp, once the clock and the chain had reported, and
+/// consuming it here is what stops the interrupt going up while anything else
+/// could still write an output buffer.
 ///
 /// # Errors
 ///
