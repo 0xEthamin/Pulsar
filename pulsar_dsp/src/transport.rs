@@ -880,10 +880,10 @@ fn tone(index: usize) -> u32
 
 /// Writes the tone into both buffers, over the silence they were filled with.
 ///
-/// `_permit` is what the release gate returns once the clocks were verified,
-/// the transfers were watched over a whole lap of the buffer, and the mute line
-/// had been high for the whole converter unmute ramp with zeros going out.
-/// Taking it is what stops a caller deciding for itself that the gate ran.
+/// `_permit` is what the release gate returns once the clock and the chain had
+/// reported, the transfers were watched over a whole lap of the buffer, and the
+/// mute line had been high for the whole converter unmute ramp with zeros going
+/// out. Taking it is what stops a caller deciding for itself that the gate ran.
 ///
 /// The streams are already replaying these buffers, so the write puts a step
 /// at whatever position the transfer controllers have reached. That step is
