@@ -209,8 +209,8 @@ static CARRY_SHIFT: AtomicU32 = AtomicU32::new(u32::MAX);
 /// disassembly is what says so: the loop reads and writes this static on every
 /// frame, 30 coefficient reads and 40 writes of the four history words each
 /// section carries, which is 70 of the 75 accesses a frame makes to this memory
-/// and the buffers together, and the largest term of the 14.2 to 15.4
-/// microseconds a frame the carry spends. The remaining 5 are the source word
+/// and the buffers together, and about 270 of the 640 cycles a frame the carry
+/// spends at the rate measured on the part. The remaining 5 are the source word
 /// and the four output words.
 ///
 /// The 20 coefficients of the low way are the ones the compiler hoists into
@@ -219,7 +219,7 @@ static CARRY_SHIFT: AtomicU32 = AtomicU32::new(u32::MAX);
 /// the loop keeps them out of here.
 ///
 /// It is paid rather than moved because the budget holds: the streams take
-/// 22.68 microseconds a frame, so the carry still moves 1.5 to 1.6 times faster
+/// 22.68 microseconds a frame, so the carry, measured at 10.0, moves 2.3 times faster
 /// than the thing it has to stay ahead of. Moving these statics to the tightly
 /// coupled memory would move the fault record and the refusal word with them,
 /// which is the machine form of the mute path, so it is a measurement of its
@@ -769,11 +769,11 @@ impl InputInterface for Input<'_>
     ///
     /// The carry walks a whole block through this accessor and the one below,
     /// and the loop that walks it is generic, so the two fold into it and the
-    /// whole of a frame is one straight line of 256 instructions with no call
+    /// whole of a frame is one straight line of 273 instructions with no call
     /// in it, counted on the linked image. The budget it is held against is the
     /// 5.000 milliseconds the transmitting streams take to read a block, since a
     /// carry slower than that is one they overtake, and the folded carry spends
-    /// 3.14 to 3.39 milliseconds of it.
+    /// up to 2.21 milliseconds of it, MEASURED on the part.
     #[expect
     (
         unsafe_code,
@@ -785,9 +785,9 @@ impl InputInterface for Input<'_>
     (
         clippy::inline_always,
         reason = "the carry reaches this once a frame, and the fold is what \
-                  leaves the whole frame one straight line of 256 instructions \
+                  leaves the whole frame one straight line of 273 instructions \
                   with no call in it, counted on the linked image, which is \
-                  3140 to 3390 microseconds a block on a block the streams \
+                  up to 2210 microseconds a block on a block the streams \
                   read in 5000"
     )]
     #[inline(always)]
@@ -822,9 +822,9 @@ impl InputInterface for Input<'_>
     (
         clippy::inline_always,
         reason = "the carry reaches this four times a frame, and the fold is \
-                  what leaves the whole frame one straight line of 256 \
+                  what leaves the whole frame one straight line of 273 \
                   instructions with no call in it, counted on the linked \
-                  image, which is 3140 to 3390 microseconds a block on a block \
+                  image, which is up to 2210 microseconds a block on a block \
                   the streams read in 5000"
     )]
     #[inline(always)]

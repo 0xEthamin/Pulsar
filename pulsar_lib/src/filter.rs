@@ -466,14 +466,14 @@ impl<const N: usize> WayCascade<N>
     /// through it on every sample: MEASURED on the linked image at 135 accesses
     /// a frame to the memory the cascades and the buffers sit in, against 75
     /// folded. That memory is the slow one, and the carry has to move a frame
-    /// faster than the transmitting streams read one, so the fold is what the
-    /// real-time budget of the caller rests on rather than a preference. Out of
-    /// line the carry is no longer faster than the streams at all.
+    /// faster than the transmitting streams read one. Folded, the carry reaches
+    /// the speed of the streams at 3.5 times the access cost measured on the
+    /// part. Out of line the count puts that at 2.2 times, a form that is not
+    /// measured.
     ///
     /// What the fold buys is the READS. Folded, the twenty coefficients of the
     /// low way are hoisted into registers for the whole block, and thirty of the
-    /// fifty are still read back each frame, six of those thirty words arriving
-    /// in two three word bursts.
+    /// fifty are still read back each frame, one word to a transaction.
     /// The forty history words are written back to memory on every frame either
     /// way, since each is live into the next sample of its own section, and
     /// only their reads come from registers.
@@ -483,7 +483,7 @@ impl<const N: usize> WayCascade<N>
         reason = "the carry reaches this once a way per frame, and the fold is \
                   what takes the accesses to the memory the cascades and the \
                   buffers sit in from 135 a frame to 75, MEASURED on the linked \
-                  image, which is what keeps the carry faster than the streams"
+                  image, which widens the lead of the carry over the streams"
     )]
     #[inline(always)]
     pub(crate) fn step(&mut self, input: f32) -> f32
