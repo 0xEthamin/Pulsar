@@ -1,10 +1,11 @@
 //! Input path of the processing board, at the register.
 //!
 //! `pulsar_lib::passthrough` holds the plan, the buffer rules, the bring-up
-//! sequence, the decision one transfer event produces, and the loop that walks
-//! one half of the receiving buffer into the two output buffers. This module is
-//! the register block that sequence runs on, the buffer the receiving stream
-//! fills, and the two accessors that loop reaches memory through.
+//! sequence, the decision one transfer event produces, the crossover chain, and
+//! the loop that walks one half of the receiving buffer into the two output
+//! buffers. This module is the register block that sequence runs on, the buffer
+//! the receiving stream fills, the memory the chain is parked in, and the two
+//! accessors that loop reaches memory through.
 //!
 //! It touches neither PE7 nor XSMT, and it writes no output buffer until the
 //! release gate has handed its permit to `arm`.
@@ -29,12 +30,13 @@
 //! # What runs after the bring-up
 //!
 //! One interrupt, and it is the first this firmware serves. The receiving
-//! stream raises its line at each half of its buffer, and the handler walks
-//! that half into both output buffers, at the positions those words were sent
-//! from, through `pulsar_lib::passthrough::carry_block` and the two accessors
-//! below it. Where that is comes off the distance between the two transfer
-//! counters, less the pipeline of the FIFOs and the shift registers that no
-//! counter reports, which the bring-up measures and leaves in `CARRY_SHIFT`.
+//! stream raises its line at each half of its buffer, and the handler walks the
+//! frames of that half through the crossover and out across the four converter
+//! channels, at the positions those frames were sent from, through
+//! `pulsar_lib::passthrough::carry_block` and the two accessors below it. Where
+//! that is comes off the distance between the two transfer counters, less the
+//! pipeline of the FIFOs and the shift registers that no counter reports, which
+//! the bring-up measures and leaves in `CARRY_SHIFT`.
 //!
 //! That vector no longer reaches the handler that silences the machine, so this
 //! module carries the net for it: `pulsar_lib::passthrough::next_block` refuses
@@ -53,7 +55,7 @@ use pulsar_lib::passthrough::
     CarryShift,
     Event,
     EventFault,
-    FilterStage,
+    FilterChain,
     Half,
     INPUT_REQUEST,
     InputBlockReadback,
@@ -72,8 +74,6 @@ use pulsar_lib::passthrough::
     bring_up,
 };
 use pulsar_lib::clock::{AUDIO_PLAN, ClockPlan};
-use pulsar_lib::constants::{LOW_MID_HZ, SAMPLE_RATE_HZ};
-use pulsar_lib::filter::{Biquad, LINKWITZ_RILEY_SECTIONS, linkwitz_riley_low_pass};
 use pulsar_lib::release::TonePermit;
 use pulsar_lib::transport::{BlockRole, STREAM_PRIORITY, SYNC_OUT_NONE, TRANSFER_WORD};
 use stm32h7::stm32h743v::dma1::st::cr::{DIR, PL, PSIZE};
@@ -190,10 +190,10 @@ static mut INPUT_BUFFER: MaybeUninit<[u32; BUFFER_WORDS]> = MaybeUninit::uninit(
 /// the value this opens on once the interrupt exists.
 static CARRY_SHIFT: AtomicU32 = AtomicU32::new(u32::MAX);
 
-/// The section the carry runs, and the history it carries between entries.
+/// The three cascades the carry runs, and the history behind each section.
 ///
 /// This is the first state of this firmware that outlives one entry into a
-/// handler. `pulsar_lib` owns the type and forbids `unsafe`, so a stage is
+/// handler. `pulsar_lib` owns the type and forbids `unsafe`, so a chain is
 /// owned by whoever calls the carry and lent to it. A handler has no caller, so
 /// this module is where the one the handler uses is parked.
 ///
@@ -204,35 +204,42 @@ static CARRY_SHIFT: AtomicU32 = AtomicU32::new(u32::MAX);
 /// the refusal word and the fault record, and that record is placed to sit
 /// clear of the startup zero fill, so a static added beside them moves both.
 ///
-/// The memory this sits in is NOT free to the carry, and the disassembly is
-/// what says so. The compiler picks the history of a slot by its address inside
-/// this stage, so it keeps both histories here rather than in registers and the
-/// loop reads four words and writes four words of this static on EVERY sample.
-/// That is eight of the eleven memory accesses a word costs, and it is the
-/// largest term of the 1.8 to 2.0 microseconds a word the carry spends.
+/// It is 360 bytes, four history words then five coefficients for each section
+/// of a way, and the memory it sits in is NOT free to the carry. The
+/// disassembly is what says so: the loop reads and writes this static on every
+/// frame, 30 coefficient reads and 40 writes of the four history words each
+/// section carries, which is 70 of the 75 accesses a frame makes to this memory
+/// and the buffers together, and the largest term of the 14.2 to 15.4
+/// microseconds a frame the carry spends. The remaining 5 are the source word
+/// and the four output words.
 ///
-/// It is paid rather than removed because the budget holds: the streams take
-/// 11.3 microseconds a word, so the carry still moves about six times faster
-/// than the thing it has to stay ahead of. Holding the histories in registers
-/// instead was measured at 916 bytes of served handler against 772, so it
-/// trades bytes of a handler the build gate bounds for time the block period
-/// has to spare.
+/// The 20 coefficients of the low way are the ones the compiler hoists into
+/// registers for a whole block. The 40 history words are written back every
+/// frame, each being live into the next sample of its own section, so no form of
+/// the loop keeps them out of here.
+///
+/// It is paid rather than moved because the budget holds: the streams take
+/// 22.68 microseconds a frame, so the carry still moves 1.5 to 1.6 times faster
+/// than the thing it has to stay ahead of. Moving these statics to the tightly
+/// coupled memory would move the fault record and the refusal word with them,
+/// which is the machine form of the mute path, so it is a measurement of its
+/// own rather than a step of this one.
 ///
 /// # What keeps an unwritten one out of the carry
 ///
-/// `start` writes a silent stage into it before it touches anything else, and
+/// `start` writes a silent chain into it before it touches anything else, and
 /// the built one over that, and both writes stand ahead of the call that
-/// unmasks the line. So a handler can only be entered after the stage is
+/// unmasks the line. So a handler can only be entered after the chain is
 /// written, and a start-up that refuses leaves it silent AND enables no
 /// interrupt.
 #[expect
 (
     unsafe_code,
-    reason = "the stage is placed by section and named for a debugger"
+    reason = "the chain is placed by section and named for a debugger"
 )]
 #[unsafe(no_mangle)]
-#[unsafe(link_section = ".axisram.FILTER_STAGE")]
-static mut FILTER_STAGE: MaybeUninit<FilterStage> = MaybeUninit::uninit();
+#[unsafe(link_section = ".axisram.FILTER_CHAIN")]
+static mut FILTER_CHAIN: MaybeUninit<FilterChain> = MaybeUninit::uninit();
 
 /// The receiving sub-block, its transfer stream and the pin that feeds it.
 pub(crate) struct Input<'a>
@@ -761,13 +768,12 @@ impl InputInterface for Input<'_>
     /// # Why this is inlined
     ///
     /// The carry walks a whole block through this accessor and the one below,
-    /// and the loop that walks it is generic, so the two fold into it and a
-    /// word costs 31 instructions. Left out of line the same word costs 88 and
-    /// three calls, both counted on the linked image, for the same 11 memory
-    /// accesses either way. The budget both are held against is the 5.000
-    /// milliseconds the transmitting streams take to read a block, since a
+    /// and the loop that walks it is generic, so the two fold into it and the
+    /// whole of a frame is one straight line of 256 instructions with no call
+    /// in it, counted on the linked image. The budget it is held against is the
+    /// 5.000 milliseconds the transmitting streams take to read a block, since a
     /// carry slower than that is one they overtake, and the folded carry spends
-    /// 806 to 896 microseconds of it.
+    /// 3.14 to 3.39 milliseconds of it.
     #[expect
     (
         unsafe_code,
@@ -775,13 +781,14 @@ impl InputInterface for Input<'_>
                   reference to a static a transfer controller also writes \
                   would claim exclusive access this firmware does not have"
     )]
-#[expect
+    #[expect
     (
         clippy::inline_always,
-        reason = "the carry reaches this once a word, and a word costs 31 \
-                  instructions folded against 88 and three calls left out of \
-                  line, both counted on the linked image, which is 806 to 896 \
-                  microseconds a block, on a block the streams read in 5000"
+        reason = "the carry reaches this once a frame, and the fold is what \
+                  leaves the whole frame one straight line of 256 instructions \
+                  with no call in it, counted on the linked image, which is \
+                  3140 to 3390 microseconds a block on a block the streams \
+                  read in 5000"
     )]
     #[inline(always)]
     fn read_word(&self, index: u32) -> u32
@@ -811,13 +818,14 @@ impl InputInterface for Input<'_>
     /// word reaches is `pulsar_lib::passthrough::carry_block`, which calls this
     /// once per role, so no step of the fan-out lives in this crate where no
     /// host test walks it.
-#[expect
+    #[expect
     (
         clippy::inline_always,
-        reason = "the carry reaches this twice a word, and a word costs 31 \
-                  instructions folded against 88 and three calls left out of \
-                  line, both counted on the linked image, which is 806 to 896 \
-                  microseconds a block, on a block the streams read in 5000"
+        reason = "the carry reaches this four times a frame, and the fold is \
+                  what leaves the whole frame one straight line of 256 \
+                  instructions with no call in it, counted on the linked \
+                  image, which is 3140 to 3390 microseconds a block on a block \
+                  the streams read in 5000"
     )]
     #[inline(always)]
     fn write_word(&mut self, role: BlockRole, index: u32, word: u32)
@@ -896,7 +904,7 @@ fn fill_silence()
     }
 }
 
-/// Writes `stage` into the parked one.
+/// Writes `chain` into the parked one.
 ///
 /// The write is volatile, so it stands where it is written rather than being
 /// moved across the calls that follow it or dropped as a value nothing in this
@@ -905,50 +913,40 @@ fn fill_silence()
 #[expect
 (
     unsafe_code,
-    reason = "the stage is reached by raw pointer, since the handler that reads \
+    reason = "the chain is reached by raw pointer, since the handler that reads \
               it holds no reference this function could borrow from"
 )]
-fn publish_stage(stage: FilterStage)
+fn publish_chain(chain: &FilterChain)
 {
-    // SAFETY: nothing else touches the stage while this runs. Every call to
+    // SAFETY: nothing else touches the chain while this runs. Every call to
     // this stands ahead of the unmask that puts the handler on the vector, and
     // the handler is the only other access.
     unsafe
     {
-        ptr::write_volatile((&raw mut FILTER_STAGE).cast::<FilterStage>(), stage);
+        ptr::write_volatile((&raw mut FILTER_CHAIN).cast::<FilterChain>(), *chain);
     }
 }
 
-/// Returns the section the carry filters every sample with.
+/// Returns the crossover the carry runs on every frame.
 ///
-/// One section of the four pole Linkwitz-Riley low-pass at the corner between
-/// the low way and the mid way. The pair is built and the first of the two
-/// taken, so this is a section of the crossover the machine ships rather than a
-/// shape derived a second way, and the chain that follows cascades it instead
-/// of replacing it.
+/// `pulsar_lib` builds the three ways and this crate calls it, so the
+/// coefficients are derived once and nothing here re-derives a corner. The
+/// corners and the sample rate are constants of the build, so nothing the part
+/// does at run time reaches the refusal below.
 ///
 /// # Errors
 ///
-/// `FilterRefused` when the coefficient build refuses. The corner and the rate
-/// are constants of this build, so nothing the part does at run time reaches
-/// it, and a refusal answers with silence rather than with an unfiltered way.
-fn built_section() -> Result<Biquad, PassthroughFault>
+/// `FilterRefused`, whatever the build refused with. A refusal leaves the
+/// parked chain silent rather than carrying a way with no filter on it.
+fn built_chain() -> Result<FilterChain, PassthroughFault>
 {
-    let mut sections = [Biquad::SILENT; LINKWITZ_RILEY_SECTIONS];
-
-    let Ok(count) = linkwitz_riley_low_pass(LOW_MID_HZ, SAMPLE_RATE_HZ, &mut sections)
+    let Ok(chain) = FilterChain::built()
     else
     {
         return Err(PassthroughFault::Sequence(InputSequenceFault::FilterRefused));
     };
 
-    let Some(section) = sections.first().filter(|_| count == sections.len())
-    else
-    {
-        return Err(PassthroughFault::Sequence(InputSequenceFault::FilterRefused));
-    };
-
-    Ok(*section)
+    Ok(chain)
 }
 
 /// Returns the plan the handler serves its events on.
@@ -1013,11 +1011,11 @@ pub(crate) fn plan(clock: &AudioClock) -> InputPlan
 /// The buffer is filled with silence before the stream that writes it is
 /// enabled, which is what keeps power-on noise out of the carry.
 ///
-/// The filter stage is published twice. A silent one goes down first, so the
-/// memory the carry would read holds a section that stops the signal from the
+/// The filter chain is published twice. A silent one goes down first, so the
+/// memory the carry would read holds cascades that stop the signal from the
 /// first instruction of this sequence, and the built one replaces it once the
 /// path is up. Both stand ahead of the call that unmasks the line, so no entry
-/// can find a stage that was never written.
+/// can find a chain that was never written.
 ///
 /// Once this returns, PD11 carries the data line of a receiver following the
 /// frame the transmitter emits, one transfer stream fills the buffer, and the
@@ -1051,12 +1049,12 @@ pub(crate) fn start
 ) -> Result<(), PassthroughFault>
 {
     fill_silence();
-    publish_stage(FilterStage::silent());
+    publish_chain(&FilterChain::silent());
 
     let plan = plan(clock);
     let shift = bring_up(input, &plan, &InputWaits::for_plan(&plan, core_clock_hz))?;
 
-    publish_stage(FilterStage::of(built_section()?));
+    publish_chain(&built_chain()?);
     CARRY_SHIFT.store(shift.words(), Ordering::Release);
 
     Ok(())
@@ -1113,8 +1111,8 @@ pub(crate) fn start_blocks
 (
     unsafe_code,
     reason = "the handler reaches the register blocks by stealing them and the \
-              filter stage by raw pointer, since the singletons the entry \
-              function took cannot be borrowed from a vector and the stage has \
+              filter chain by raw pointer, since the singletons the entry \
+              function took cannot be borrowed from a vector and the chain has \
               no owner in thread mode"
 )]
 pub(crate) fn serve_event() -> Result<(), PassthroughFault>
@@ -1128,14 +1126,14 @@ pub(crate) fn serve_event() -> Result<(), PassthroughFault>
         (SAI2::steal(), DMA1::steal(), DMAMUX1::steal(), GPIOD::steal())
     };
 
-    // SAFETY: `start` writes the stage twice before it returns and `arm`
-    // unmasks this line afterwards, so the memory holds a stage before this
+    // SAFETY: `start` writes the chain twice before it returns and `arm`
+    // unmasks this line afterwards, so the memory holds a chain before this
     // handler can be entered at all. Thread mode touches it no more once the
     // block structure is armed, and this is the only handler this firmware
     // serves, so this reference is the only one that exists while it lives.
-    let stage = unsafe
+    let chain = unsafe
     {
-        &mut *(&raw mut FILTER_STAGE).cast::<FilterStage>()
+        &mut *(&raw mut FILTER_CHAIN).cast::<FilterChain>()
     };
 
     let mut input = observe(&sai, &dma, &mux, &port);
@@ -1147,5 +1145,5 @@ pub(crate) fn serve_event() -> Result<(), PassthroughFault>
         return Err(PassthroughFault::Event(EventFault::CarryShiftUnpublished));
     };
 
-    pulsar_lib::passthrough::serve(&mut input, &plan, shift, stage)
+    pulsar_lib::passthrough::serve(&mut input, &plan, shift, chain)
 }

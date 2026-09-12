@@ -6,17 +6,41 @@
 //!
 //! The build runs in double precision and narrows once, because the audio path
 //! carries single precision floats. The subsonic high-pass carries the
-//! narrowing worst: its poles sit closest to
-//! z = 1, at radius 0.9961 and 0.9984, so rounding a coefficient moves them the
-//! furthest. It reads 0.0101 dB away from its double precision design at 60 Hz
-//! and 0.0040 dB at 100 Hz, both inside its pass band, and the gap widens as
-//! the frequency falls, 0.0442 dB at 10 Hz where the filter is 38 dB down and
-//! 0.0478 dB at 1 Hz where it is 118 dB down. The four Linkwitz-Riley filters
-//! stay under 0.0003 dB from 0.1 Hz to Nyquist, and their high-passes widen
-//! below that as the narrowed numerator cancels.
+//! narrowing worst: its poles sit closest to z = 1, at radius 0.99606 and
+//! 0.99837, so rounding a coefficient moves them the furthest. The narrowed
+//! filter reads ABOVE its double precision design inside the pass band, by
+//! 0.01006 dB at 60 Hz and 0.00404 dB at 100 Hz, and BELOW it further down, by
+//! 0.04422 dB at 10 Hz where the filter is 38 dB down and 0.04781 dB at 1 Hz
+//! where it is 118 dB down. The four Linkwitz-Riley filters stay under
+//! 0.0003 dB from 0.1 Hz to Nyquist, and their high-passes widen below that as
+//! the narrowed numerator cancels.
 //! `the_coefficients_match_a_double_precision_build` is what bounds the
 //! narrowing, by pinning each coefficient to two units in the last place of an
 //! external double precision reference.
+//!
+//! # Where the double precision runs, and what a bit comparison then covers
+//!
+//! The part has no double precision unit. Every operation of the build above
+//! therefore runs as a software routine on it, `__aeabi_dadd`, `__aeabi_dmul`,
+//! `__aeabi_ddiv`, `__aeabi_dsub`, `__aeabi_d2f`, `__aeabi_f2d` and the
+//! comparisons, while a host runs the same operations in hardware. The
+//! ALGORITHM is one: the cookbook formulas here, and `libm` for the sine and
+//! the cosine, on both sides.
+//!
+//! So a coefficient read back out of the part and compared bit for bit against
+//! a coefficient computed elsewhere is a comparison of two implementations of
+//! double precision arithmetic as well as of one algorithm. It holds only while
+//! those software routines are correctly rounded, which nothing here proves.
+//! The prediction that makes it usable rather than a guess: the four pole
+//! Linkwitz-Riley low-pass at `LOW_MID_HZ` is the one cascade a part running
+//! one section and a part running the whole crossover both build, so its five
+//! coefficients must come back IDENTICAL between the two. A difference there is
+//! a difference in `__aeabi_ddiv` and not in this module.
+//!
+//! `Biquad::step` is unaffected, and that is the other half of the split: it
+//! runs in single precision, which the part has in hardware, so the difference
+//! equation computes the same bits on a host and on the part and the frequency
+//! response stays measurable off the board.
 //!
 //! Narrowing also decides stability. A rounded pair whose poles sit near the
 //! unit circle can land on or outside it, so every section faces the Jury
@@ -91,6 +115,9 @@ pub enum FilterError
     /// band, and a quality factor near the largest the format carries, both
     /// round to a pair that fails it.
     UnstableDesign,
+    /// The sections a cascade carries room for are not the sections its way
+    /// fills, so a slot would run with no coefficients in it.
+    WayLengthWrong,
 }
 
 /// One way of the loudspeaker.
@@ -346,8 +373,10 @@ pub fn crossover_sections(way: Way, out: &mut [Biquad]) -> Result<usize, FilterE
 /// Returns the sections `way` fills.
 ///
 /// `crossover_sections` reads it before it writes anything, which is what makes
-/// a refusal on the buffer length leave that buffer as it was.
-const fn way_sections(way: Way) -> usize
+/// a refusal on the buffer length leave that buffer as it was. `WayCascade`
+/// takes it as its length, so the count a way fills and the count the cascade
+/// running that way holds room for are one number rather than two that agree.
+pub(crate) const fn way_sections(way: Way) -> usize
 {
     match way
     {
@@ -366,6 +395,124 @@ where
 {
     let rest = out.get_mut(written..).ok_or(FilterError::OutputTooShort)?;
     Ok(written.saturating_add(build(rest)?))
+}
+
+/// The cascade of one way, and the history behind each of its sections.
+///
+/// # Why the length is the type
+///
+/// `N` is how many sections the way fills, which `way_sections` gives, so a
+/// cascade holds room for its way and for nothing else. `of` refuses unless the
+/// build wrote every one of those sections, so a way whose count does not fall
+/// on `N` produces no cascade at all and the caller is left holding `silent`.
+/// A count that disagreed would otherwise leave a slot running coefficients
+/// nothing designed.
+///
+/// # What an unbuilt one carries
+///
+/// `silent` puts `Biquad::SILENT` in every section, which stops the signal.
+/// There is no value of this type that passes a sample through unfiltered: a
+/// slot no build reached carries silence rather than the full range of a way
+/// with no filter on it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct WayCascade<const N: usize>
+{
+    sections: [Biquad; N],
+    states: [BiquadState; N],
+}
+
+impl<const N: usize> WayCascade<N>
+{
+    /// Returns a cascade that stops the signal, with no history behind it.
+    pub(crate) const fn silent() -> Self
+    {
+        Self
+        {
+            sections: [Biquad::SILENT; N],
+            states: [BiquadState::AT_REST; N],
+        }
+    }
+
+    /// Returns the cascade `way` fills, with no history behind it.
+    ///
+    /// # Errors
+    ///
+    /// `OutputTooShort` when the way fills more sections than `N`,
+    /// `WayLengthWrong` when it fills fewer, and `UnstableDesign` when a
+    /// narrowed section places a pole on or outside the unit circle.
+    pub(crate) fn of(way: Way) -> Result<Self, FilterError>
+    {
+        let mut sections = [Biquad::SILENT; N];
+
+        if crossover_sections(way, &mut sections)? != N
+        {
+            return Err(FilterError::WayLengthWrong);
+        }
+
+        Ok(Self { sections, states: [BiquadState::AT_REST; N] })
+    }
+
+    /// Runs one sample through every section, in the order the design lists
+    /// them, and advances the history of each.
+    ///
+    /// The value returned can stand above the input, since a crossover half
+    /// overshoots a step. Bounding it belongs to whatever converts the sample
+    /// back to the format a buffer carries.
+    ///
+    /// # Why this is inlined
+    ///
+    /// Out of line, the caller hands over a pointer to the cascade and every
+    /// section reads its five coefficients and its four history words back
+    /// through it on every sample: MEASURED on the linked image at 135 accesses
+    /// a frame to the memory the cascades and the buffers sit in, against 75
+    /// folded. That memory is the slow one, and the carry has to move a frame
+    /// faster than the transmitting streams read one, so the fold is what the
+    /// real-time budget of the caller rests on rather than a preference. Out of
+    /// line the carry is no longer faster than the streams at all.
+    ///
+    /// What the fold buys is the READS. Folded, the twenty coefficients of the
+    /// low way are hoisted into registers for the whole block, and thirty of the
+    /// fifty are still read back each frame, six of those thirty words arriving
+    /// in two three word bursts.
+    /// The forty history words are written back to memory on every frame either
+    /// way, since each is live into the next sample of its own section, and
+    /// only their reads come from registers.
+    #[expect
+    (
+        clippy::inline_always,
+        reason = "the carry reaches this once a way per frame, and the fold is \
+                  what takes the accesses to the memory the cascades and the \
+                  buffers sit in from 135 a frame to 75, MEASURED on the linked \
+                  image, which is what keeps the carry faster than the streams"
+    )]
+    #[inline(always)]
+    pub(crate) fn step(&mut self, input: f32) -> f32
+    {
+        let mut value = input;
+
+        for (section, state) in self.sections.iter().zip(self.states.iter_mut())
+        {
+            value = section.step(state, value);
+        }
+
+        value
+    }
+
+    /// Returns a cascade of `N` copies of `section`.
+    ///
+    /// What it is for is a test that measures where a loop PUTS a word, which
+    /// needs a shape that passes the value unchanged to read it at all. No
+    /// design produces such a shape and no other module of the build can reach
+    /// this.
+    #[cfg(test)]
+    pub(crate) fn of_section(section: Biquad) -> Self
+    {
+        Self
+        {
+            sections: [section; N],
+            states: [BiquadState::AT_REST; N],
+        }
+    }
 }
 
 /// Builds the cookbook low-pass section.
@@ -1605,6 +1752,143 @@ mod tests
             Err(FilterError::OutputTooShort)
         );
         assert_eq!(crossover_sections(Way::Low, &mut []), Err(FilterError::OutputTooShort));
+
+        assert_eq!(WayCascade::<3>::of(Way::Low), Err(FilterError::OutputTooShort));
+        assert_eq!(WayCascade::<5>::of(Way::Low), Err(FilterError::WayLengthWrong));
+    }
+
+    #[test]
+    fn a_cascade_whose_length_is_not_its_way_is_refused()
+    {
+        // The length lives in the type, so the one way a cascade and its way
+        // can disagree is a type carrying another count. Both directions are
+        // read: a length under the way refuses on the buffer, a length over it
+        // refuses on the count, and neither leaves a cascade with a slot
+        // nothing designed.
+        for way in [Way::Low, Way::Mid, Way::High]
+        {
+            let mut sections = [Biquad::SILENT; CROSSOVER_SECTIONS];
+            let count = built(crossover_sections(way, &mut sections), "a way");
+
+            assert_eq!(count, way_sections(way), "{way:?} fills a count of its own");
+        }
+
+        assert_eq!(WayCascade::<1>::of(Way::High), Err(FilterError::OutputTooShort));
+        assert_eq!(WayCascade::<3>::of(Way::High), Err(FilterError::WayLengthWrong));
+        assert_eq!(WayCascade::<3>::of(Way::Mid), Err(FilterError::OutputTooShort));
+        assert_eq!(WayCascade::<5>::of(Way::Mid), Err(FilterError::WayLengthWrong));
+    }
+
+    #[test]
+    fn a_cascade_carries_the_sections_of_its_way_in_the_order_they_run()
+    {
+        // The cascade against the build it comes from, section by section, so a
+        // cascade that reordered its way or dropped one of its sections reads
+        // as a coefficient that is not the one specified rather than as a
+        // response a tolerance might swallow.
+        let mut expected = [Biquad::SILENT; CROSSOVER_SECTIONS];
+
+        let count = built(crossover_sections(Way::Low, &mut expected), "the low way");
+        assert_cascade(WayCascade::<4>::of(Way::Low), &expected[..count]);
+
+        let count = built(crossover_sections(Way::Mid, &mut expected), "the mid way");
+        assert_cascade(WayCascade::<4>::of(Way::Mid), &expected[..count]);
+
+        let count = built(crossover_sections(Way::High, &mut expected), "the high way");
+        assert_cascade(WayCascade::<2>::of(Way::High), &expected[..count]);
+    }
+
+    /// Compares the sections of a built cascade against `expected`.
+    fn assert_cascade<const N: usize>
+    (
+        built: Result<WayCascade<N>, FilterError>,
+        expected: &[Biquad]
+    )
+    {
+        let Ok(cascade) = built
+        else
+        {
+            panic!("a cascade of {N} sections refused its way");
+        };
+
+        assert_eq!(cascade.sections.len(), expected.len());
+
+        for (index, (section, reference)) in
+            cascade.sections.iter().zip(expected.iter()).enumerate()
+        {
+            assert_eq!(section, reference, "cascade section {index}");
+        }
+
+        for state in cascade.states
+        {
+            assert_eq!(state, BiquadState::AT_REST, "a built cascade carries history");
+        }
+    }
+
+    #[test]
+    #[expect
+    (
+        clippy::float_cmp,
+        reason = "the two computations run the same operations in the same \
+                  order, so what this measures is bit equality and a margin \
+                  would let a cascade sharing one history pass"
+    )]
+    fn a_cascade_answers_what_its_sections_answer_one_after_the_other()
+    {
+        // The cascade against a walk of the same sections held apart, over a
+        // run long enough for each history to matter. A cascade that shared one
+        // history between two sections, or ran them in the other order, parts
+        // company from this within a few samples.
+        let Ok(mut cascade) = WayCascade::<4>::of(Way::Low)
+        else
+        {
+            panic!("the low way refused");
+        };
+
+        let mut sections = [Biquad::SILENT; CROSSOVER_SECTIONS];
+        let count = built(crossover_sections(Way::Low, &mut sections), "the low way");
+        let mut states = [BiquadState::AT_REST; CROSSOVER_SECTIONS];
+
+        for step in 0..2_000_u32
+        {
+            let input = if step < 1_000
+            {
+                1.0e6_f32
+            }
+            else
+            {
+                -5.0e5
+            };
+            let mut want = input;
+
+            for index in 0..count
+            {
+                want = sections[index].step(&mut states[index], want);
+            }
+
+            assert_eq!(cascade.step(input), want, "sample {step}");
+        }
+    }
+
+    #[test]
+    #[expect
+    (
+        clippy::float_cmp,
+        reason = "silence is exactly zero rather than nearly zero, and a margin \
+                  here would admit a cascade that passes a signal at the level \
+                  it names"
+    )]
+    fn a_silent_cascade_passes_nothing_however_long_it_is_driven()
+    {
+        // What an unbuilt cascade holds, which is what the machine runs when a
+        // start-up refuses. It has to stop the signal for as long as it is
+        // driven, not only on the first sample.
+        let mut cascade = WayCascade::<4>::silent();
+
+        for step in 0..1_000_u32
+        {
+            assert_eq!(cascade.step(1.0e9), 0.0, "sample {step}");
+        }
     }
 
     #[test]
