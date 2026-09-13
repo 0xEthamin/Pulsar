@@ -1,14 +1,16 @@
 //! Output stage of the processing board, between the crossover and a buffer.
 //!
-//! The sample a way answers crosses the sensitivity trim of that way, then the
+//! The sample a way answers crosses the gain of that way, the product of its
+//! sensitivity trim and the peak reserve formed once at compile time, then the
 //! ceiling, which stands on the high way alone, then the conversion to the word
-//! a buffer carries. Two of the three ways therefore cross two stages and the
-//! high way crosses three, and the order is most of the design.
+//! a buffer carries. The low and mid ways cross the gain and the conversion, the
+//! high way crosses the wall between the two, and the order is most of the
+//! design.
 //!
 //! `WayWords::of` is the whole of it and it is the only way to build the three
 //! words. It takes the three samples the cascades answered and nothing else, so
-//! a word that skipped the trim or the ceiling is not a value this module can
-//! produce.
+//! a word that skipped the trim, the reserve or the ceiling is not a value this
+//! module can produce.
 //!
 //! # The trim, which is where the design aims
 //!
@@ -24,6 +26,28 @@
 //! than a calibration: half a decibel between two datasheets means nothing
 //! until a measurement microphone has read the three in the cabinet.
 //!
+//! # The reserve, which is room for the peak between two samples
+//!
+//! A converter rebuilds a continuous wave from the samples, and its
+//! reconstruction filter can peak between two samples above both of them. The
+//! reserve takes two decibels off every way on top of its trim, so a way whose
+//! trimmed samples stand inside the format reaches the converter with room for
+//! a peak up to two decibels over its largest word. It is a constant of this
+//! stage and of no level setting, so no edit of a setting takes it away.
+//!
+//! It does not hold the overshoot of the cascades themselves, which is larger
+//! than the reserve on two ways. The loudest peak a source the format carries
+//! puts on a way is the L1 norm of its impulse response, and after the trim and
+//! the reserve that peak stands 5.42 dB over the format on the low way and
+//! 1.73 dB over it on the mid way. On those two ways the conversion saturates
+//! every sample a cascade takes past the format, on its own side of zero, and
+//! that saturation distorts those samples. The reserve leaves them no room
+//! between two samples. On the high way the same peak stands under the wall,
+//! which the section below reads.
+//!
+//! It stands on the three ways alike, since taken off two ways out of three it
+//! would move the alignment the trims hold by its own size.
+//!
 //! # The ceiling, which is the wall behind the target
 //!
 //! The high way drives a compression driver whose diaphragm is not replaceable,
@@ -33,29 +57,31 @@
 //! sample, which is what makes it hold for a waveform of any shape rather than
 //! for a sine.
 //!
-//! With the trim in place a full scale SAMPLE reaches 8.38 dB under the wall,
-//! and the wall does nothing while the machine works. What it is for is the day
-//! the trim is not what it should be: a sign error, a coefficient that lands at
-//! unity, a preset that adds gain behind it, or someone rebalancing the
-//! loudspeaker by removing it. In each of those the driver sees past its
-//! maximum rating, and the wall holds it at the figure below.
+//! With the trim and the reserve in place a full scale SAMPLE reaches 10.38 dB
+//! under the wall, and the wall does nothing while the machine works. What it
+//! is for is the day the gain is not what it should be: a sign error, a
+//! coefficient that lands at unity, a preset that adds gain behind it, or
+//! someone rebalancing the loudspeaker by removing the trim. In each of those
+//! the driver sees past the power it is rated for, and the wall holds it at the
+//! figure below. The wall binds on what the trim and the reserve leave, so its
+//! level does not move with either of them.
 //!
-//! That 8.38 dB is the margin on one SAMPLE and not the margin on a peak, and
+//! That 10.38 dB is the margin on one SAMPLE and not the margin on a peak, and
 //! the two are far apart. A cascade answers a weighted sum of the samples
 //! behind it, so the loudest peak any source the format carries can put on a
 //! way is the sum of the magnitudes of its impulse response, the L1 norm of
 //! that response, and the input that attains it carries the sign pattern of the
 //! response read backwards. For the high way that norm is 2.47295, MEASURED off
 //! the coefficients the cascade holds, and driving the cascade with the input
-//! that attains it leaves 1259346816 words after the trim against the
-//! 1336379648 of the wall. The margin on a peak is therefore 0.52 dB, and a
-//! stage placed in front of the wall that adds gain has half a decibel to spend
-//! rather than eight.
+//! that attains it leaves 1000334656 words after the trim and the reserve
+//! against the 1336379648 of the wall. The margin on a peak is therefore
+//! 2.52 dB, and a stage placed in front of the wall that adds gain has two and
+//! a half decibels to spend rather than ten.
 //!
-//! The wall stands at 2.6242 times what a full scale source leaves after the
-//! trim, and the norm is under that, so NO source the format carries reaches
-//! the wall. That holds over every input rather than over one waveform, which
-//! is what separates it from a reading taken on a square.
+//! The wall stands at 3.3037 times what a full scale source leaves after the
+//! trim and the reserve, and the norm is under that, so NO source the format
+//! carries reaches the wall. That holds over every input rather than over one
+//! waveform, which is what separates it from a reading taken on a square.
 //!
 //! It is the same shape as the pull-down on the converter mute line. It does
 //! nothing until the rest has failed.
@@ -69,19 +95,19 @@
 //! under it. The wall stands at 4.120 dB under full scale, a rounding on the
 //! quiet side of that, which is 19.9945 Vrms and 49.97 W.
 //!
-//! Once the trim has acted a full scale SAMPLE leaves the same way at 0.23714
-//! of full scale, which is 7.62 Vrms and 7.26 W into the same 8 ohms. That is
-//! the level of one sample and not the level of a peak: the loudest peak a
-//! source the format carries puts on this way stands at 0.58643 of full scale,
-//! which the same conversion reads as 18.8 Vrms and 44 W, with the wall above
-//! it at 0.62230 and 49.97 W.
+//! Once the trim and the reserve have acted a full scale SAMPLE leaves the same
+//! way at 0.18836 of full scale, which is 6.05 Vrms and 4.58 W into the same 8
+//! ohms. That is the level of one sample and not the level of a peak: the
+//! loudest peak a source the format carries puts on this way stands at 0.46582
+//! of full scale, which the same conversion reads as 15.0 Vrms and 28.0 W, with
+//! the wall above it at 0.62230 and 49.97 W.
 //!
 //! # What is NOT here
 //!
 //! The thermal limiter of the high way, which is a separate mechanism living
 //! UNDER this wall and acting on the average of the square of the signal over
-//! about a second. A wall on one sample cannot tell a transient from a tone
-//! held for ten seconds, and those two burn a voice coil differently.
+//! 0.3 seconds. A wall on one sample cannot tell a transient from a tone held
+//! for ten seconds, and those two burn a voice coil differently.
 
 /// Sample amplitude one converter full scale stands at.
 ///
@@ -93,9 +119,8 @@ const FULL_SCALE_WORDS: f32 = 2_147_483_648.0;
 /// Gain the low way leaves with.
 ///
 /// The alignment of the three ways is taken against this one, so it carries
-/// unity. The multiplication stands rather than being left out, so that the
-/// three ways cross one stage and no way can be written in a shape that has no
-/// place for its own alignment.
+/// unity. It stands in the gain of the low way rather than being left out, so
+/// the three gains share one shape.
 const LOW_TRIM: f32 = 1.0;
 
 /// Gain the mid way leaves with, half a decibel down.
@@ -103,6 +128,22 @@ const MID_TRIM: f32 = 0.944_060_86;
 
 /// Gain the high way leaves with, twelve and a half decibels down.
 const HIGH_TRIM: f32 = 0.237_137_38;
+
+/// Gain every way leaves with on top of its trim, two decibels down.
+///
+/// The module documentation carries what it is room for. On the high way it
+/// acts ahead of the wall, so the wall stands at the same level whatever the
+/// reserve is.
+const PEAK_RESERVE: f32 = 0.794_328_2;
+
+/// Gain the stage applies to the low way, its trim and the peak reserve.
+const LOW_GAIN: f32 = LOW_TRIM * PEAK_RESERVE;
+
+/// Gain the stage applies to the mid way, its trim and the peak reserve.
+const MID_GAIN: f32 = MID_TRIM * PEAK_RESERVE;
+
+/// Gain the stage applies to the high way, its trim and the peak reserve.
+const HIGH_GAIN: f32 = HIGH_TRIM * PEAK_RESERVE;
 
 /// Fraction of full scale the ceiling of the high way stands at.
 ///
@@ -132,8 +173,8 @@ pub(crate) struct WaySamples
 /// The word each way leaves in a buffer.
 ///
 /// The fields are read through the three methods and written by `of` alone, so
-/// every value of this type crossed the trim, the ceiling of the high way and
-/// the conversion, in that order.
+/// every value of this type crossed the gain of its way, the product of its trim
+/// and the peak reserve, then the ceiling on the high way, then the conversion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WayWords
 {
@@ -150,15 +191,15 @@ impl WayWords
     /// Returns the words `samples` leave the machine with.
     ///
     /// It takes the samples the cascades answered and nothing else, so a word
-    /// that skipped the trim, or a high word that skipped the wall, is not a
-    /// value this function can be made to return.
+    /// that skipped the trim or the reserve, or a high word that skipped the
+    /// wall, is not a value this function can be made to return.
     pub(crate) fn of(samples: WaySamples) -> Self
     {
         Self
         {
-            low: to_word(samples.low * LOW_TRIM),
-            mid: to_word(samples.mid * MID_TRIM),
-            high: to_word(under_ceiling(samples.high * HIGH_TRIM)),
+            low: to_word(samples.low * LOW_GAIN),
+            mid: to_word(samples.mid * MID_GAIN),
+            high: to_word(under_ceiling(samples.high * HIGH_GAIN)),
         }
     }
 
@@ -181,19 +222,19 @@ impl WayWords
     }
 }
 
-/// Returns the gain the alignment leaves on `way`.
+/// Returns the gain the stage applies to `way`, its trim and the peak reserve.
 ///
 /// It is here for the tests of the loop under this stage, which read a response
 /// in words and need the figure the stage applies rather than a second copy of
 /// it beside it.
 #[cfg(test)]
-pub(crate) const fn trim_for_test(way: crate::filter::Way) -> f32
+pub(crate) const fn gain_for_test(way: crate::filter::Way) -> f32
 {
     match way
     {
-        crate::filter::Way::Low => LOW_TRIM,
-        crate::filter::Way::Mid => MID_TRIM,
-        crate::filter::Way::High => HIGH_TRIM,
+        crate::filter::Way::Low => LOW_GAIN,
+        crate::filter::Way::Mid => MID_GAIN,
+        crate::filter::Way::High => HIGH_GAIN,
     }
 }
 
@@ -265,6 +306,13 @@ const _: () = assert!
 
 const _: () = assert!
 (
+    PEAK_RESERVE > 0.0 && PEAK_RESERVE < 1.0,
+    "a reserve at or above unity leaves no room over the largest sample, and a \
+     reserve at or below zero is a mute or a sign error"
+);
+
+const _: () = assert!
+(
     HIGH_CEILING_WORDS > 0.0 && HIGH_CEILING_WORDS < FULL_SCALE_WORDS,
     "the ceiling of the high way stands inside the format, so the wall binds \
      before the conversion does"
@@ -272,10 +320,10 @@ const _: () = assert!
 
 const _: () = assert!
 (
-    HIGH_TRIM * FULL_SCALE_WORDS < HIGH_CEILING_WORDS,
-    "the trim of the high way no longer holds a full scale sample under the \
-     ceiling, so the wall has become the operating point instead of the wall \
-     behind it"
+    HIGH_GAIN * FULL_SCALE_WORDS < HIGH_CEILING_WORDS,
+    "the trim and the reserve of the high way no longer hold a full scale \
+     sample under the ceiling, so the wall has become the operating point \
+     instead of the wall behind it"
 );
 
 #[cfg(test)]
@@ -296,7 +344,7 @@ mod tests
     )]
 
     use super::*;
-    use libm::{log10f, powf, sqrtf};
+    use libm::{log10, log10f, powf, sqrtf};
 
     /// Decibels a trim may stand from the figure it is written for.
     ///
@@ -333,8 +381,18 @@ mod tests
     ///
     /// It opens and stops at the same place, so it breaks the chain of the
     /// stretches rather than shortening it silently.
-    const EMPTY_STRETCH: Swept =
-        Swept { opens_at: 0, stops_at: 0, patterns: 0, low: 0, mid: 0, high: 0 };
+    const EMPTY_STRETCH: Swept = Swept
+    {
+        opens_at: 0,
+        stops_at: 0,
+        patterns: 0,
+        low: 0,
+        mid: 0,
+        high: 0,
+        low_flipped: 0,
+        mid_flipped: 0,
+        high_flipped: 0,
+    };
 
     /// What the words of one way reached over a stretch of the sweep.
     #[derive(Clone, Copy)]
@@ -352,6 +410,12 @@ mod tests
         mid: u32,
         /// Largest magnitude the high channel answered.
         high: u32,
+        /// Patterns the low channel answered with a word of the opposite sign.
+        low_flipped: u64,
+        /// Patterns the mid channel answered with a word of the opposite sign.
+        mid_flipped: u64,
+        /// Patterns the high channel answered with a word of the opposite sign.
+        high_flipped: u64,
     }
 
     /// Returns the decibels `gain` stands at.
@@ -372,6 +436,21 @@ mod tests
         WayWords::of(WaySamples { low: value, mid: value, high: value })
     }
 
+    /// Returns one if `word` stands on the other side of zero from `value`, and
+    /// zero otherwise.
+    ///
+    /// The gain of every way is positive, so a word on the other side of zero
+    /// from the value it came from is a sample that came back round. The rule
+    /// reads the sign of the value and the sign of the word and nothing of the
+    /// stage between them. A value that is not a number has no sign and a word
+    /// of zero has none either, so neither reads as flipped.
+    fn flipped(value: f32, word: u32) -> u64
+    {
+        let word = word.cast_signed();
+
+        u64::from((value > 0.0 && word < 0) || (value < 0.0 && word > 0))
+    }
+
     /// Runs the stage over every bit pattern from `from` up to `upto`.
     ///
     /// `stops_at` is written from inside the walk and not from `upto`, so it
@@ -381,25 +460,29 @@ mod tests
     ///
     /// The join of the stretches and the count show that the walk crosses every
     /// pattern. They do not show that the stage runs on the pattern the walk
-    /// stands on. A body that hands the stage a pattern derived from the current
-    /// one, or a constant, keeps both and passes every reading of the test. A
-    /// body that runs the stage on no pattern fails it, because the high channel
-    /// never reaches the ceiling. What ties one crossing of the stage to each
-    /// pattern is the shape of the loop body below, which a reader checks and
-    /// no assertion does.
+    /// stands on. A body that hands the stage, and the reading of the sign, a
+    /// pattern derived from the current one, or a constant, keeps both and
+    /// passes every reading of the test. A body that runs the stage on no
+    /// pattern fails it, because the high channel never reaches the ceiling.
+    /// What ties one crossing of the stage to each pattern is the shape of the
+    /// loop body below, which a reader checks and no assertion does.
     fn sweep(from: u64, upto: u64) -> Swept
     {
         let mut swept = Swept { opens_at: from, stops_at: from, ..EMPTY_STRETCH };
 
         for pattern in from..upto
         {
-            let words = words_of(f32::from_bits(pattern as u32));
+            let value = f32::from_bits(pattern as u32);
+            let words = words_of(value);
 
             swept.patterns += 1;
             swept.stops_at = pattern + 1;
             swept.low = swept.low.max(magnitude(words.low()));
             swept.mid = swept.mid.max(magnitude(words.mid()));
             swept.high = swept.high.max(magnitude(words.high()));
+            swept.low_flipped += flipped(value, words.low());
+            swept.mid_flipped += flipped(value, words.mid());
+            swept.high_flipped += flipped(value, words.high());
         }
 
         swept
@@ -422,6 +505,47 @@ mod tests
         assert_eq!(LOW_TRIM.to_bits(), powf(10.0, 0.0).to_bits());
         assert_eq!(MID_TRIM.to_bits(), powf(10.0, -0.5 / 20.0).to_bits());
         assert_eq!(HIGH_TRIM.to_bits(), powf(10.0, -12.5 / 20.0).to_bits());
+    }
+
+    #[test]
+    fn the_peak_reserve_is_written_as_the_nearest_float_to_two_decibels()
+    {
+        assert_eq!(PEAK_RESERVE.to_bits(), powf(10.0, -2.0 / 20.0).to_bits());
+    }
+
+    #[test]
+    fn every_way_leaves_the_stage_two_decibels_under_its_own_trim()
+    {
+        // Read off the words the stage answers rather than off its gains, and
+        // against the trim of each way, so what is read is the distance the
+        // reserve alone puts between the two. A gain that lost the reserve on
+        // one way reads zero on that way, and a recalibrated trim moves both
+        // sides of the reading at once. The drive stands under the wall of the
+        // high way, so every way answers its gain and nothing else.
+        let drive = 1.0e9_f32;
+        let words = words_of(drive);
+        let reserve = |word: u32, trim: f32|
+        {
+            20.0 * log10(f64::from(word.cast_signed()) / f64::from(drive))
+                - 20.0 * log10(f64::from(trim))
+        };
+        let epsilon = f64::from(TRIM_EPSILON_DB);
+
+        for (name, word, trim) in
+        [
+            ("low", words.low(), LOW_TRIM),
+            ("mid", words.mid(), MID_TRIM),
+            ("high", words.high(), HIGH_TRIM),
+        ]
+        {
+            let read = reserve(word, trim);
+
+            assert!
+            (
+                (read + 2.0).abs() < epsilon,
+                "the {name} way leaves the stage {read} dB from its own trim"
+            );
+        }
     }
 
     #[test]
@@ -468,29 +592,29 @@ mod tests
     }
 
     #[test]
-    fn the_trim_leaves_the_high_way_eight_decibels_under_its_own_ceiling()
+    fn the_trim_and_the_reserve_leave_the_high_way_ten_decibels_under_its_own_ceiling()
     {
-        // A full scale sample reaches 7.26 W where the wall stands at 49.97 W.
+        // A full scale sample reaches 4.58 W where the wall stands at 49.97 W.
         // That is the distance from one SAMPLE. The loudest peak the chain can
-        // answer on this way reaches 44 W, 0.52 dB under the wall, and
+        // answer on this way reaches 28.0 W, 2.52 dB under the wall, and
         // `no_source_the_format_carries_reaches_the_wall_of_the_high_way` reads
         // it.
-        let top = HIGH_TRIM * FULL_SCALE_WORDS;
+        let top = HIGH_GAIN * FULL_SCALE_WORDS;
         let headroom = decibels(HIGH_CEILING_WORDS / top);
-        let volts = 2.1 * 15.3 * HIGH_TRIM;
+        let volts = 2.1 * 15.3 * HIGH_GAIN;
 
-        assert!((headroom - 8.38).abs() < 0.01);
-        assert!((volts * volts / 8.0 - 7.26).abs() < 0.01);
+        assert!((headroom - 10.38).abs() < 0.01, "the headroom reads {headroom} dB");
+        assert!((volts * volts / 8.0 - 4.58).abs() < 0.01);
     }
 
     #[test]
     fn a_sample_inside_the_ceiling_crosses_the_high_way_untouched()
     {
         // The wall is a wall and not a gain: below it nothing is scaled, so the
-        // trim alone decides what the way carries.
-        for sample in [0.0_f32, 1.0, -1.0, 1.0e6, -1.0e6, HIGH_CEILING_WORDS / HIGH_TRIM]
+        // trim and the reserve alone decide what the way carries.
+        for sample in [0.0_f32, 1.0, -1.0, 1.0e6, -1.0e6, HIGH_CEILING_WORDS / HIGH_GAIN]
         {
-            let want = to_word(sample * HIGH_TRIM).cast_signed();
+            let want = to_word(sample * HIGH_GAIN).cast_signed();
             let got = words_of(sample).high().cast_signed();
 
             assert_eq!(got, want, "a sample of {sample} was moved by the wall");
@@ -500,14 +624,14 @@ mod tests
     #[test]
     fn the_three_ways_leave_at_the_three_gains_of_the_alignment()
     {
-        // The stage carries each way at its own trim, so a stage that ran one
+        // The stage carries each way at its own gain, so a stage that ran one
         // gain three times, or crossed two of the three, answers alike on two
         // channels here.
         let words = words_of(1.0e9);
 
-        assert_eq!(words.low().cast_signed(), to_word(1.0e9 * LOW_TRIM).cast_signed());
-        assert_eq!(words.mid().cast_signed(), to_word(1.0e9 * MID_TRIM).cast_signed());
-        assert_eq!(words.high().cast_signed(), to_word(1.0e9 * HIGH_TRIM).cast_signed());
+        assert_eq!(words.low().cast_signed(), to_word(1.0e9 * LOW_GAIN).cast_signed());
+        assert_eq!(words.mid().cast_signed(), to_word(1.0e9 * MID_GAIN).cast_signed());
+        assert_eq!(words.high().cast_signed(), to_word(1.0e9 * HIGH_GAIN).cast_signed());
         assert_ne!(words.low(), words.mid());
         assert_ne!(words.mid(), words.high());
         assert_ne!(words.low(), words.high());
@@ -536,6 +660,38 @@ mod tests
         assert_eq!(low.high().cast_signed(), -1_336_379_648);
         assert_eq!(high.low().cast_signed(), i32::MAX);
         assert_eq!(low.low().cast_signed(), i32::MIN);
+        assert_eq!(high.mid().cast_signed(), i32::MAX);
+        assert_eq!(low.mid().cast_signed(), i32::MIN);
+    }
+
+    #[test]
+    fn a_finite_value_past_the_format_leaves_the_low_and_mid_ways_at_the_bound_on_its_own_side()
+    {
+        // The conversion is the bound of these two ways, and a source the
+        // format carries takes the cascade of either past the format. These are
+        // values the format holds, one a step over the format after the gain of
+        // the way and two far past it, so a conversion that wraps from the
+        // format up answers the opposite sign on the first of them. A conversion
+        // that wraps over a band past the format these three miss answers the
+        // opposite sign in the exhaustive sweep, which reads the sign of every
+        // value the format holds on every way.
+        let over = FULL_SCALE_WORDS * (1.0 + f32::EPSILON);
+        let read = |name: &str, gain: f32, word: fn(WayWords) -> u32|
+        {
+            for sample in [over / gain, 4.0 * FULL_SCALE_WORDS, f32::MAX]
+            {
+                assert!(sample * gain > FULL_SCALE_WORDS, "{sample} stands inside the format");
+
+                let high = word(words_of(sample)).cast_signed();
+                let low = word(words_of(-sample)).cast_signed();
+
+                assert_eq!(high, i32::MAX, "the {name} way answered {high} for {sample}");
+                assert_eq!(low, i32::MIN, "the {name} way answered {low} for -{sample}");
+            }
+        };
+
+        read("low", LOW_GAIN, WayWords::low);
+        read("mid", MID_GAIN, WayWords::mid);
     }
 
     #[test]
@@ -545,10 +701,10 @@ mod tests
         // infinity, so a stage that answered the bound for an infinity and let
         // every finite value through would pass them both. These are values the
         // format holds, one a step over the wall and two far past it.
-        for sample in [(HIGH_CEILING_WORDS + 128.0) / HIGH_TRIM, 4.0 * FULL_SCALE_WORDS, f32::MAX]
+        for sample in [(HIGH_CEILING_WORDS + 128.0) / HIGH_GAIN, 4.0 * FULL_SCALE_WORDS, f32::MAX]
         {
             assert!(sample.is_finite(), "{sample} is not a value the reading is about");
-            assert!(sample * HIGH_TRIM > HIGH_CEILING_WORDS, "{sample} stands under the wall");
+            assert!(sample * HIGH_GAIN > HIGH_CEILING_WORDS, "{sample} stands under the wall");
 
             assert_eq!(words_of(sample).high().cast_signed(), 1_336_379_648);
             assert_eq!(words_of(-sample).high().cast_signed(), -1_336_379_648);
@@ -556,7 +712,7 @@ mod tests
     }
 
     #[test]
-    fn no_value_of_any_kind_puts_more_than_the_ceiling_on_the_high_channel()
+    fn no_value_of_any_kind_puts_the_high_channel_past_the_ceiling_or_a_way_across_zero()
     {
         // The wall bounds ONE sample, so what it claims is a property of a
         // total function of a single precision float, and the domain of that
@@ -564,6 +720,12 @@ mod tests
         // It is therefore walked whole, every pattern the format holds, values
         // that are not numbers and both infinities included. A draw of random
         // values would not be a proof of a bound.
+        //
+        // The same walk reads the sign of every word against the sign of the
+        // value it came from, on the three ways. The gain of every way is
+        // positive, so a word across zero from its value is a conversion that
+        // came back round, and the walk hands every way every value its input
+        // holds, so such a conversion shows here whatever band it wraps over.
         //
         // The stretches are run at once because the walk is four billion
         // crossings of the stage and a single file walk of it costs two
@@ -632,6 +794,9 @@ mod tests
             swept.low = swept.low.max(part.low);
             swept.mid = swept.mid.max(part.mid);
             swept.high = swept.high.max(part.high);
+            swept.low_flipped += part.low_flipped;
+            swept.mid_flipped += part.mid_flipped;
+            swept.high_flipped += part.high_flipped;
         }
 
         assert_eq!
@@ -663,6 +828,21 @@ mod tests
             "the sweep never reached the ceiling, so it read a bound nothing \
              in it came near"
         );
+
+        for (name, flips) in
+        [
+            ("low", swept.low_flipped),
+            ("mid", swept.mid_flipped),
+            ("high", swept.high_flipped),
+        ]
+        {
+            assert_eq!
+            (
+                flips, 0,
+                "the {name} way answered a word of the opposite sign to its value \
+                 on {flips} patterns"
+            );
+        }
 
         // The wall is on the high way and on no other, and the sweep drove all
         // three channels with the same value, so both other channels are
