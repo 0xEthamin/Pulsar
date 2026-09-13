@@ -207,23 +207,23 @@ static CARRY_SHIFT: AtomicU32 = AtomicU32::new(u32::MAX);
 /// It is 360 bytes, four history words then five coefficients for each section
 /// of a way, and the memory it sits in is NOT free to the carry. The
 /// disassembly is what says so: the loop reads and writes this static on every
-/// frame, 30 coefficient reads and 40 writes of the four history words each
-/// section carries, which is 70 of the 75 accesses a frame makes to this memory
-/// and the buffers together, and about 270 of the 640 cycles a frame the carry
-/// spends at the rate measured on the part. The remaining 5 are the source word
-/// and the four output words.
+/// frame, the coefficients of the sections it does not hoist and the four
+/// history words of every section, and those are most of the accesses a frame
+/// makes to this memory. The rest are the source word and the four output
+/// words. The module documentation of `pulsar_lib::passthrough` carries the
+/// count and what it costs.
 ///
 /// The 20 coefficients of the low way are the ones the compiler hoists into
 /// registers for a whole block. The 40 history words are written back every
 /// frame, each being live into the next sample of its own section, so no form of
 /// the loop keeps them out of here.
 ///
-/// It is paid rather than moved because the budget holds: the streams take
-/// 22.68 microseconds a frame, so the carry, measured at 10.0, moves 2.3 times faster
-/// than the thing it has to stay ahead of. Moving these statics to the tightly
-/// coupled memory would move the fault record and the refusal word with them,
-/// which is the machine form of the mute path, so it is a measurement of its
-/// own rather than a step of this one.
+/// It is paid rather than moved because the budget holds: by the estimate that
+/// module documentation carries, the carry moves a frame faster than the
+/// streams read one, and the streams are what it has to stay ahead of. Moving
+/// these statics to the tightly coupled memory would move the fault record and
+/// the refusal word with them, which is the machine form of the mute path, so
+/// it is a measurement of its own rather than a step of this one.
 ///
 /// # What keeps an unwritten one out of the carry
 ///
@@ -769,11 +769,12 @@ impl InputInterface for Input<'_>
     ///
     /// The carry walks a whole block through this accessor and the one below,
     /// and the loop that walks it is generic, so the two fold into it and the
-    /// whole of a frame is one straight line of 273 instructions with no call
-    /// in it, counted on the linked image. The budget it is held against is the
-    /// 5.000 milliseconds the transmitting streams take to read a block, since a
-    /// carry slower than that is one they overtake, and the folded carry spends
-    /// up to 2.21 milliseconds of it, MEASURED on the part.
+    /// whole of a frame is one straight line with no call in it, read on the
+    /// linked image. The budget it is held against is the 5.000 milliseconds
+    /// the transmitting streams take to read a block, since a carry slower than
+    /// that is one they overtake. The module documentation of
+    /// `pulsar_lib::passthrough` carries the count of that line and the cost
+    /// of the folded carry.
     #[expect
     (
         unsafe_code,
@@ -785,10 +786,9 @@ impl InputInterface for Input<'_>
     (
         clippy::inline_always,
         reason = "the carry reaches this once a frame, and the fold is what \
-                  leaves the whole frame one straight line of 273 instructions \
-                  with no call in it, counted on the linked image, which is \
-                  up to 2210 microseconds a block on a block the streams \
-                  read in 5000"
+                  leaves the whole frame one straight line with no call in \
+                  it, read on the linked image, which is what keeps a block \
+                  of the carry inside the block the streams read"
     )]
     #[inline(always)]
     fn read_word(&self, index: u32) -> u32
@@ -822,10 +822,9 @@ impl InputInterface for Input<'_>
     (
         clippy::inline_always,
         reason = "the carry reaches this four times a frame, and the fold is \
-                  what leaves the whole frame one straight line of 273 \
-                  instructions with no call in it, counted on the linked \
-                  image, which is up to 2210 microseconds a block on a block \
-                  the streams read in 5000"
+                  what leaves the whole frame one straight line with no call \
+                  in it, read on the linked image, which is what keeps a \
+                  block of the carry inside the block the streams read"
     )]
     #[inline(always)]
     fn write_word(&mut self, role: BlockRole, index: u32, word: u32)
