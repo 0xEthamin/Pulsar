@@ -214,8 +214,6 @@ pub enum Fault
     ClockUnlocked = 0x00,
     /// The transfer interrupt stopped arriving.
     TransferStalled = 0x01,
-    /// A limiter failed to initialise. No default stands for absent limiting.
-    LimiterInitFailed = 0x02,
     /// A converter transfer ran dry.
     OutputUnderrun = 0x03,
     /// The audio input overflowed its buffer.
@@ -244,7 +242,6 @@ impl Fault
         {
             0x00 => Ok(Self::ClockUnlocked),
             0x01 => Ok(Self::TransferStalled),
-            0x02 => Ok(Self::LimiterInitFailed),
             0x03 => Ok(Self::OutputUnderrun),
             0x04 => Ok(Self::InputOverrun),
             0x05 => Ok(Self::InputSilent),
@@ -729,7 +726,6 @@ mod tests
         round_trip(ToCtrl::State(DspState::Faulted));
         round_trip(ToCtrl::Fault(Fault::ClockUnlocked));
         round_trip(ToCtrl::Fault(Fault::TransferStalled));
-        round_trip(ToCtrl::Fault(Fault::LimiterInitFailed));
         round_trip(ToCtrl::Fault(Fault::OutputUnderrun));
         round_trip(ToCtrl::Fault(Fault::InputOverrun));
         round_trip(ToCtrl::Fault(Fault::InputSilent));
@@ -748,7 +744,7 @@ mod tests
     #[test]
     fn a_flipped_bit_fails_the_checksum()
     {
-        let (mut buffer, written) = encoded(&ToCtrl::Fault(Fault::LimiterInitFailed));
+        let (mut buffer, written) = encoded(&ToCtrl::Fault(Fault::TransferStalled));
         let payload_index = 2;
         assert!(payload_index < written);
         match buffer.get_mut(payload_index)
@@ -876,6 +872,7 @@ mod tests
     {
         assert_eq!(Preset::from_code(0x04), Err(ProtocolError::BadPayload));
         assert_eq!(DspState::from_code(0x04), Err(ProtocolError::BadPayload));
+        assert_eq!(Fault::from_code(0x02), Err(ProtocolError::BadPayload));
         assert_eq!(Fault::from_code(0x06), Err(ProtocolError::BadPayload));
     }
 

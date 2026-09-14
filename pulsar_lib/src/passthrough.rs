@@ -21,10 +21,11 @@
 //! three words that stage answers plus one silent word across the four
 //! converter channels: the low way and the mid way into the two slots of the
 //! master frame, the high way and the channel no way drives into the two slots
-//! of the slave frame. `FilterChain` is those three cascades and the history
-//! behind every section of them, and the output stage beside it carries the
-//! alignment of the three ways, the peak reserve, the wall on the high way and
-//! the conversion back to a buffer word.
+//! of the slave frame. `FilterChain` is those three cascades, the history
+//! behind every section of them and the thermal limiter of the high way, and
+//! the output stage beside it carries the alignment of the three ways, the peak
+//! reserve, that limiter and the wall on the high way, and the conversion back
+//! to a buffer word.
 //!
 //! The loop lives here rather than behind the interface so that a host test
 //! walks it, the fan-out onto the four channels included. A register block owns
@@ -103,21 +104,21 @@
 //! 22.68 microseconds, a block of 441 words is 5.000 milliseconds, and a new
 //! event lands every 5.000 milliseconds. The carry runs once a block and its
 //! loop once a frame. COUNTED on the text of the loop in the linked image, a
-//! frame holds 275 instructions, 75 accesses to the memory the buffers and the
-//! cascades sit in, 8 reads of the literal pool of the code, and 48 accesses to
-//! the stack. A frame whose high sample stands inside the wall runs 7 of those
-//! reads, and the eighth runs on a high sample under the negative side of it.
+//! frame holds 333 instructions, 82 accesses to the memory the buffers and the
+//! cascades sit in, 12 reads of the literal pool of the code, and 57 accesses to
+//! the stack. A frame whose high sample stands inside the wall runs 11 of those
+//! reads, and the twelfth runs on a high sample under the negative side of it.
 //!
 //! ESTIMATED from those counts, since no cycle counter has read this image. An
 //! instruction is taken at one core cycle, an access to the stack at one more,
 //! the stack sitting in the data memory coupled to the core, and an access to
 //! the memory the buffers and the cascades sit in, or a read of the literal
-//! pool, at `c` cycles. A frame is then `275 + 83 * c + 48` cycles at 64 MHz.
-//! At a `c` of 3.9 that is 647 cycles, about 143000 for an entry of 221 frames,
-//! 2.23 milliseconds and 45 per cent of the period. That is 10.1 microseconds a
-//! frame, and it leaves the carry 2.2 times faster than the streams it has to
-//! stay ahead of. It would take 13.6 cycles an access to bring the carry down
-//! to the speed of the streams, three and a half times that `c`.
+//! pool, at `c` cycles. A frame is then `333 + 94 * c + 57` cycles at 64 MHz.
+//! At a `c` of 3.9 that is 757 cycles, about 167000 for an entry of 221 frames,
+//! 2.61 milliseconds and 52 per cent of the period. That is 11.8 microseconds a
+//! frame, and it leaves the carry 1.9 times faster than the streams it has to
+//! stay ahead of. It would take 11.3 cycles an access to bring the carry down
+//! to the speed of the streams, 2.9 times that `c`.
 //!
 //! `c` is a CALIBRATION taken off the part and not a reading of this image. The
 //! cycle counter of the data watchpoint unit, read on the clock the part boots
@@ -127,24 +128,31 @@
 //! the work done once a block included. The same reading on this image is what
 //! replaces the estimate.
 //!
-//! Those 75 accesses are one number for one quantity, made in 75 transactions of
-//! one word each. 70 of them are the cascades: 30 coefficient reads and 40
-//! writes of the four history words each of the ten sections carries. The other
-//! 5 are the buffers, one source read and the four output words. The 8 reads of
-//! the literal pool reach six words, the constants the vector unit cannot
-//! encode as an immediate: the gains of the three ways, each a trim times the
-//! peak reserve, the two sides of the ceiling, and the float zero, which
-//! answers both a value that is not a number and a source index out of range.
+//! Those 82 accesses are one number for one quantity, made in 82 transactions
+//! of one word each. 75 of them are the cascades: 35
+//! coefficient reads and 40 writes of the four history words each of the ten
+//! sections carries. 2 are the thermal limiter of the high way, its average and
+//! its gain written back. The other 5 are the buffers, one source read and the
+//! four output words. The 12 reads of the literal pool reach eleven words, the
+//! constants the vector unit cannot encode as an immediate: the gains of the
+//! low and mid ways, each a trim times the peak reserve, the gain of the high
+//! way in the unit of the limiter, full scale, the coefficient, the floor and
+//! the reciprocal of the threshold of the limiter, the two sides of the
+//! ceiling, and the float zero in two places, which answers a value that is not
+//! a number, an average under the floor, a step of the gain that does not land
+//! over zero and a source index out of range.
 //!
 //! The cascade of a way is folded into the loop, and that is what holds the
-//! count there: it hoists the twenty coefficients of the low way into registers
-//! for the whole block. The forty history words are written back every frame
-//! whichever way that falls, each being live into the next sample of its own
-//! section. Left out of line, every section reads its five coefficients and its
-//! four history words back through a pointer on every sample, which is 135
-//! accesses a frame rather than 75. That form is not measured either: by the
-//! count it reaches the speed of the streams at 8.6 cycles an access, 2.2 times
-//! `c`, against three and a half times for the folded carry.
+//! count there: it hoists fifteen of the twenty coefficients of the low way out
+//! of that memory for the whole block, onto the stack, and reads the other five
+//! back every frame. The forty history words and the state of the limiter are
+//! written back every frame whichever way that falls, each being live into the
+//! next sample. Left out of line, every section reads its five coefficients and
+//! its four history words back through a pointer on every sample, which is 139
+//! accesses a frame and 2 reads of the pool rather than 82 and 12. That form is
+//! not measured either: by the count, with 325 instructions and 7 accesses to
+//! the stack, it reaches the speed of the streams at 7.9 cycles an access,
+//! twice `c`, against 2.9 times for the folded carry.
 //!
 //! A carry starts writing where the read pointer has just left, so it has 433
 //! words of clearance ahead of it, 4.91 milliseconds, at an entry taken on
@@ -212,7 +220,7 @@
 use crate::clock::wait_polls;
 use crate::constants::{MICROSECONDS_PER_SECOND, SAMPLE_RATE_HZ};
 use crate::filter::{FilterError, Way, WayCascade, way_sections};
-use crate::output::{WaySamples, WayWords};
+use crate::output::{ThermalLimiter, WaySamples, WayWords};
 use crate::readback::refuse_unless;
 use crate::release::{Laps, TonePermit};
 use crate::transport::
@@ -1864,7 +1872,8 @@ const _: () = assert!
     "a frame carries a slot the fan-out drives no way into"
 );
 
-/// The three cascades of the crossover and the history behind each section.
+/// The three cascades of the crossover, the history behind each section, and
+/// the thermal limiter of the high way.
 ///
 /// # Where it lives
 ///
@@ -1886,33 +1895,44 @@ const _: () = assert!
 ///
 /// # What an unbuilt one carries
 ///
-/// `silent` holds a silent cascade on each way, which stops the signal. A chain
-/// that never took its coefficients therefore carries silence rather than the
-/// full range of a way with no filter on it, and there is no value of this type
-/// that means no filtering.
+/// `silent` holds a silent cascade on each way, which stops the signal, and a
+/// silent limiter on the high way, which stops it again. A chain that never
+/// took its coefficients therefore carries silence rather than the full range
+/// of a way with no filter on it, and there is no value of this type that means
+/// no filtering. The limiter is a field of every value, so there is no value
+/// either that carries a high way with no limiter behind it.
+///
+/// # Why the limiter lives here
+///
+/// Its average runs on from one frame to the next and from one block to the
+/// next, exactly as the history of a section does, so it is state of the chain
+/// and the caller owns it and lends it to the carry beside the cascades.
+/// `built` holds one at rest: unity gain and no average behind it.
 ///
 /// # What bounds the samples it returns
 ///
 /// Nothing here. A cascade overshoots: a crossover half answers a full scale
 /// step above full scale, so a signal near the top of the format leaves a way
 /// past it. What each way answers is handed to the output stage, which carries
-/// the alignment of the three ways, the peak reserve, the wall on the high way
-/// and the conversion back to a buffer word. The conversion SATURATES, so a
-/// sample past the format cannot come back round to the opposite sign, which
-/// would be a step of two full scales into a way with no analog filter in front
-/// of it.
+/// the alignment of the three ways, the peak reserve, the thermal limiter and
+/// the wall on the high way, and the conversion back to a buffer word. The
+/// conversion SATURATES, so a sample past the format cannot come back round to
+/// the opposite sign, which would be a step of two full scales into a way with
+/// no analog filter in front of it.
 ///
 /// Every bound stands in that stage and none of them inside the recurrence: the
 /// history a section feeds back is the value it computed. Feeding back a
 /// bounded value instead would put a limiter inside the feedback of a filter,
 /// which is no longer the filter the coefficients describe and no longer a
 /// shape `cascade_magnitude` can be compared against.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, PartialEq)]
+#[cfg_attr(test, derive(Clone))]
 pub struct FilterChain
 {
     low: LowCascade,
     mid: MidCascade,
     high: HighCascade,
+    limiter: ThermalLimiter,
 }
 
 impl FilterChain
@@ -1926,10 +1946,12 @@ impl FilterChain
             low: LowCascade::silent(),
             mid: MidCascade::silent(),
             high: HighCascade::silent(),
+            limiter: ThermalLimiter::silent(),
         }
     }
 
-    /// Returns the chain the crossover of the loudspeaker makes, at rest.
+    /// Returns the chain the crossover of the loudspeaker makes, with the
+    /// history of every section and the limiter of the high way at rest.
     ///
     /// # Errors
     ///
@@ -1946,6 +1968,7 @@ impl FilterChain
                 low: LowCascade::of(Way::Low)?,
                 mid: MidCascade::of(Way::Mid)?,
                 high: HighCascade::of(Way::High)?,
+                limiter: ThermalLimiter::at_rest(),
             }
         )
     }
@@ -1955,8 +1978,9 @@ impl FilterChain
     /// The word crosses the sample format once and each way once, so the three
     /// answers come off one reading of the source rather than three. What each
     /// way answers then crosses the output stage, which carries the alignment
-    /// of the three ways, the peak reserve, the ceiling of the high way and the
-    /// conversion back to a word.
+    /// of the three ways, the peak reserve, the limiter and the ceiling of the
+    /// high way and the conversion back to a word. The limiter is the one this
+    /// chain holds, so its average runs on into the next frame.
     #[expect
     (
         clippy::cast_precision_loss,
@@ -1974,7 +1998,8 @@ impl FilterChain
                 low: self.low.step(sample),
                 mid: self.mid.step(sample),
                 high: self.high.step(sample),
-            }
+            },
+            &mut self.limiter
         )
     }
 
@@ -1992,6 +2017,7 @@ impl FilterChain
             low: LowCascade::of_section(section),
             mid: MidCascade::of_section(section),
             high: HighCascade::of_section(section),
+            limiter: ThermalLimiter::at_rest(),
         }
     }
 }
@@ -2956,10 +2982,10 @@ mod tests
     ///
     /// A transparent chain hands the same sample to all three ways, so what
     /// comes back is the stage alone: the alignment of the three ways, the peak
-    /// reserve, the wall on the high way and the conversion. The tests of
-    /// PLACEMENT below expect their words through this rather than through a
-    /// second copy of the alignment, and the figures the alignment stands at
-    /// are read where they are written.
+    /// reserve, the limiter at rest and the wall on the high way, and the
+    /// conversion. The tests of PLACEMENT below expect their words through this
+    /// rather than through a second copy of the alignment, and the figures the
+    /// alignment stands at are read where they are written.
     fn staged(word: u32) -> WayWords
     {
         staged_sample(source_sample(word))
@@ -2978,10 +3004,20 @@ mod tests
     }
 
     /// Returns the words the output stage leaves when all three ways answer
-    /// `sample`.
+    /// `sample`, through a limiter at rest.
+    ///
+    /// A limiter at rest answers unity on any one sample. On the drives the
+    /// tests below give a chain with the trim in place, a running limiter
+    /// stands at unity too, and every test that reads a carried word against
+    /// this reads that as well. A test that drives past the trim reads the
+    /// limiter it runs on instead.
     fn staged_sample(sample: f32) -> WayWords
     {
-        WayWords::of(WaySamples { low: sample, mid: sample, high: sample })
+        WayWords::of
+        (
+            WaySamples { low: sample, mid: sample, high: sample },
+            &mut ThermalLimiter::at_rest()
+        )
     }
 
     /// Returns the word `way` leaves out of `words`.
@@ -4593,6 +4629,350 @@ mod tests
         assert_ne!(interface.master, interface.slave);
     }
 
+    #[test]
+    fn the_limiter_runs_on_from_block_to_block_at_the_period_of_the_caller()
+    {
+        // The average of the limiter is state of the chain and runs on from one
+        // block to the next. The blocks alternate at 220 and 221 frames, as the
+        // plan cuts them, over one second of a full scale tone loud enough to
+        // take the gain down, and every word of every block is read against a
+        // straight walk of the same samples through the output stage with ONE
+        // limiter, which knows nothing of blocks. A limiter rebuilt at a
+        // boundary, or at a frame, parts from the walk there.
+        //
+        // The designed high cascade answers at or under unity, so with the trim
+        // in place no source takes the long run mean of the way near the
+        // threshold. The high cascade here is two sections of a gain that
+        // takes most of the trim back: the tone reaches the limiter at 0.954
+        // of full scale, 117 W.
+        const LAPS: u32 = 100;
+        const TONE_CYCLES: u32 = 30;
+        const HIGH_SECTION_GAIN: f32 = 2.25;
+
+        let plan = plan();
+        let loud = crate::filter::gain_section_for_test(HIGH_SECTION_GAIN);
+        let mut chain = FilterChain
+        {
+            high: HighCascade::of_section(loud),
+            ..FilterChain::transparent()
+        };
+        let mut walked_high = HighCascade::of_section(loud);
+        let mut walked = ThermalLimiter::at_rest();
+        let mut interface = MockInput::healthy();
+        let mut lengths = [false; 2];
+        let mut joined_under_unity = 0_u32;
+
+        for lap in 0..LAPS
+        {
+            for index in 0..TEST_WORDS
+            {
+                place(&mut interface.source, index, sine_word(lap, index, TONE_CYCLES, f64::from(i32::MAX)));
+            }
+
+            for half in [Half::First, Half::Second]
+            {
+                carry_block(&mut interface, &plan, half, shift(), &mut chain);
+
+                let frames = plan.carry_frames(half);
+
+                match frames
+                {
+                    220 => lengths[0] = true,
+                    221 => lengths[1] = true,
+                    _ => panic!("the plan cut a block of {frames} frames"),
+                }
+
+                if walked.current_gain_for_test() < 1.0
+                {
+                    joined_under_unity += 1;
+                }
+
+                for frame in 0..frames
+                {
+                    let index = plan.carry_start(half) + frame * WORDS_PER_FRAME;
+                    let at = (index + plan.arming_position() - PIPELINE_WORDS) % TEST_WORDS;
+                    let sample = source_sample(carried_word(&interface.source, index));
+                    let want = WayWords::of
+                    (
+                        WaySamples { low: sample, mid: sample, high: walked_high.step(sample) },
+                        &mut walked
+                    );
+
+                    for (buffer, slot, word) in
+                    [
+                        (&interface.slave, HIGH_SLOT, want.high()),
+                        (&interface.master, LOW_SLOT, want.low()),
+                        (&interface.master, MID_SLOT, want.mid()),
+                    ]
+                    {
+                        assert_eq!
+                        (
+                            carried_word(buffer, at + slot),
+                            word,
+                            "slot {slot} of frame {frame} of the {half:?} block of lap {lap} \
+                             parted from the walk"
+                        );
+                    }
+                }
+            }
+        }
+
+        assert_eq!(lengths, [true, true], "the run did not cross blocks of both lengths");
+
+        // The gain stood under unity at most of the joins, so the joins were
+        // read while the limiter moved and not only while it stood at rest.
+        let gain = walked.current_gain_for_test();
+
+        assert!(gain < 0.7, "the tone left the gain at {gain}");
+        assert!(joined_under_unity > LAPS, "the gain stood under unity at {joined_under_unity} joins");
+    }
+
+    #[test]
+    fn serving_consecutive_events_runs_the_limiter_and_every_history_on_from_one_event_to_the_next()
+    {
+        // The test above calls the carry, and the handler calls `serve`. What
+        // the machine runs is therefore a chain lent to `serve` over event
+        // after event, and a `serve` that carried a copy of it, or rebuilt its
+        // limiter at an entry, answers the one entry it is given correctly and
+        // leaves the chain of the handler where it found it.
+        //
+        // So this serves 7.7 seconds of events of both halves, 220 and 221
+        // frames, on a chain whose low and mid ways are the designed cascades
+        // and whose high way carries two sections of a gain of 4.75, which
+        // puts a full scale tone at the limiter at 4.25 of full scale, past its
+        // input bound. The tone rises from silence through the threshold to
+        // 117 W, holds there and eases to 81 W. A full scale square then holds
+        // every sample at the input bound for 3 seconds, which takes the
+        // average to the square of that bound, the largest it reaches, and the
+        // gain to the law there, the lowest it follows. The drive then steps
+        // down through a full scale tone and 117 W to a silence that takes the
+        // gain back to unity. The state of the limiter therefore crosses its
+        // whole reachable range down and back up, and a reset of the chain
+        // keyed on any level of the gain or of the average it holds lands
+        // inside this run.
+        //
+        // After every event the WHOLE chain is compared against a straight
+        // walk of the same samples, which knows nothing of events: the average
+        // and the gain of the limiter, the history of every section of the
+        // three ways, and any field a later form of the chain adds. Every word
+        // of the block is read against the words of that walk as well, the
+        // first frame of the block included, which is the join.
+        //
+        // A reset driven by state outside the chain, a static counter for one,
+        // with a period longer than the 1540 events served here passes every
+        // reading below.
+        const LAPS: u32 = 770;
+
+        let plan = plan();
+        let loud = HighCascade::of_section(crate::filter::gain_section_for_test(SERVED_SECTION_GAIN));
+        let mut served = FilterChain { high: loud, ..chain() };
+        let at_rest = FilterChain { high: loud, ..chain() };
+        let mut walked = FilterChain { high: loud, ..chain() };
+        let mut interface = MockInput::healthy();
+        let mut lengths = [false; 2];
+        let mut after_held = 0.0_f32;
+        let mut after_eased = 0.0_f32;
+        let mut lowest = 1.0_f32;
+        let mut largest = 0.0_f32;
+        let mut limiter_moved = false;
+        let mut low_moved = false;
+        let mut mid_moved = false;
+
+        assert_eq!(bring_up(&mut interface, &plan, &waits()), Ok(shift()));
+
+        for lap in 0..LAPS
+        {
+            for index in 0..TEST_WORDS
+            {
+                place(&mut interface.source, index, served_word(lap, index));
+            }
+
+            for half in [Half::First, Half::Second]
+            {
+                interface.next_event = half;
+
+                assert_eq!
+                (
+                    serve(&mut interface, &plan, shift(), &mut served),
+                    Ok(()),
+                    "the {half:?} event of lap {lap} was refused"
+                );
+
+                let frames = plan.carry_frames(half);
+
+                match frames
+                {
+                    220 => lengths[0] = true,
+                    221 => lengths[1] = true,
+                    _ => panic!("the plan cut a block of {frames} frames"),
+                }
+
+                walk_served_block(&mut walked, &interface, half, lap);
+
+                assert!
+                (
+                    served == walked,
+                    "the chain the {half:?} event of lap {lap} left parted from the walk: its \
+                     limiter holds {:?} against {:?}, and its histories agree with the walk: {}",
+                    served.limiter,
+                    walked.limiter,
+                    served.low == walked.low && served.mid == walked.mid && served.high == walked.high
+                );
+
+                let gain = served.limiter.current_gain_for_test();
+
+                lowest = lowest.min(gain);
+                largest = largest.max(served.limiter.current_average_for_test());
+                limiter_moved |= served.limiter != at_rest.limiter;
+                low_moved |= served.low != at_rest.low;
+                mid_moved |= served.mid != at_rest.mid;
+
+                match (lap, half)
+                {
+                    (99, Half::Second) => after_held = gain,
+                    (169, Half::Second) => after_eased = gain,
+                    _ => {}
+                }
+            }
+        }
+
+        assert_eq!(lengths, [true, true], "the run did not serve blocks of both lengths");
+
+        // The state the readings above compared moved over the operating
+        // points the run names: the gain held near the law of 117 W and rose
+        // towards that of 81 W. The square took the average within a thousandth
+        // of the square of the input bound, which no input passes, and the
+        // gain within a thousandth of the law there, `sqrt(threshold) / bound`.
+        // The detector stops short of that average by its stall, under a
+        // thousandth. The silence took the gain to unity or to the float one
+        // step under it: at a ratio of one the step rounds that gain to a tie
+        // and leaves it there. The history of each designed way moved too.
+        let gain = served.limiter.current_gain_for_test();
+        let (threshold, bound) = ThermalLimiter::threshold_and_input_bound_for_test();
+        let ceiling = f64::from(bound) * f64::from(bound);
+        let floor = sqrt(f64::from(threshold)) / f64::from(bound);
+
+        assert!((0.6..0.75).contains(&after_held), "the 117 W hold left the gain at {after_held}");
+        assert!((0.72..0.82).contains(&after_eased), "the 81 W hold left the gain at {after_eased}");
+        assert!(after_eased > after_held, "easing to 81 W took the gain from {after_held} to {after_eased}");
+        assert!
+        (
+            f64::from(largest) >= ceiling * (1.0 - 1.0e-3) && f64::from(largest) <= ceiling,
+            "the square took the average to {largest}, against a ceiling of {ceiling}"
+        );
+        assert!
+        (
+            (f64::from(lowest) / floor - 1.0).abs() < 1.0e-3,
+            "the square took the gain no lower than {lowest}, against a floor of {floor}"
+        );
+        assert!(gain >= 1.0 - f32::EPSILON / 2.0, "the silence left the gain at {gain}");
+        assert!(limiter_moved, "the limiter never left its rest");
+        assert!(low_moved, "the history of the low way never moved");
+        assert!(mid_moved, "the history of the mid way never moved");
+    }
+
+    /// Gain of each of the two sections the served high way carries.
+    ///
+    /// A full scale tone reaches the limiter at 4.25 of full scale through it,
+    /// which is 2332 W, and a full scale square holds every sample past the
+    /// input bound of the limiter.
+    const SERVED_SECTION_GAIN: f32 = 4.75;
+
+    /// Watts a full scale tone stands for at the limiter through
+    /// `SERVED_SECTION_GAIN`, before the input bound.
+    const SERVED_FULL_SCALE_WATTS: f64 = 2332.1;
+
+    /// Returns the word the served drive holds at `index` of lap `lap`.
+    ///
+    /// A tone of 30 periods a lap rises from silence to 117 W over 30 laps,
+    /// holds 117 W to lap 100 and 81 W to lap 170. A full scale square of as
+    /// many periods holds to lap 470, then a full scale tone to lap 520, 117 W
+    /// to lap 570 and silence after that.
+    fn served_word(lap: u32, index: u32) -> u32
+    {
+        const CYCLES: u32 = 30;
+
+        let level = match lap
+        {
+            0..30 => sqrt(117.0 / SERVED_FULL_SCALE_WATTS) * f64::from(lap) / 30.0,
+            30..100 | 520..570 => sqrt(117.0 / SERVED_FULL_SCALE_WATTS),
+            100..170 => sqrt(81.0 / SERVED_FULL_SCALE_WATTS),
+            170..470 => return square_word(lap, index, CYCLES),
+            470..520 => 1.0,
+            _ => 0.0,
+        };
+
+        sine_word(lap, index, CYCLES, f64::from(i32::MAX) * level)
+    }
+
+    /// Walks the frames the `half` event of lap `lap` carried through
+    /// `walked`, and fails unless every word of the block `interface` holds is
+    /// the word that walk answers.
+    fn walk_served_block(walked: &mut FilterChain, interface: &MockInput, half: Half, lap: u32)
+    {
+        let plan = plan();
+
+        for frame in 0..plan.carry_frames(half)
+        {
+            let index = plan.carry_start(half) + frame * WORDS_PER_FRAME;
+            let at = (index + plan.arming_position() - PIPELINE_WORDS) % TEST_WORDS;
+            let sample = source_sample(carried_word(&interface.source, index));
+            let want = WayWords::of
+            (
+                WaySamples
+                {
+                    low: walked.low.step(sample),
+                    mid: walked.mid.step(sample),
+                    high: walked.high.step(sample),
+                },
+                &mut walked.limiter
+            );
+
+            for (buffer, slot, word) in
+            [
+                (&interface.master, LOW_SLOT, want.low()),
+                (&interface.master, MID_SLOT, want.mid()),
+                (&interface.slave, HIGH_SLOT, want.high()),
+            ]
+            {
+                assert_eq!
+                (
+                    carried_word(buffer, at + slot),
+                    word,
+                    "slot {slot} of frame {frame} of the {half:?} event of lap {lap} \
+                     parted from the walk"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_chain_carries_a_limiter_and_an_unbuilt_chain_carries_a_silent_one()
+    {
+        // `silent` is a constant, since the firmware parks it before anything
+        // else runs.
+        const PARKED: FilterChain = FilterChain::silent();
+
+        assert_eq!(PARKED.limiter, ThermalLimiter::silent());
+        assert_eq!(chain().limiter, ThermalLimiter::at_rest());
+
+        // The silent limiter stops the high way on its own, with cascades that
+        // pass every sample, and leaves the other two ways alone.
+        let mut stopped = FilterChain
+        {
+            limiter: ThermalLimiter::silent(),
+            ..FilterChain::transparent()
+        };
+
+        for word in [i32::MAX, i32::MIN, 0x4000_0000, -0x4000_0000, 1]
+        {
+            let ways = stopped.carry(word.cast_unsigned());
+
+            assert_eq!(ways.high(), 0, "a silent limiter let {word} through");
+            assert_eq!(ways.low(), staged(word.cast_unsigned()).low());
+        }
+    }
+
     /// Amplitude the response sweep drives, as a sample.
     ///
     /// Under half of full scale, so the pass band of a way leaves room for the
@@ -5528,12 +5908,24 @@ mod tests
             panic!("the high way did not build");
         };
         let mut worst = 0_i32;
+        let mut running = ThermalLimiter::at_rest();
 
         for sign in positive.iter().rev()
         {
             let sample = if *sign { i32::MAX } else { i32::MIN };
-            let answered =
-                staged_sample(driven.step(source_sample(sample.cast_unsigned()))).high();
+            let answer = driven.step(source_sample(sample.cast_unsigned()));
+            let answered = staged_sample(answer).high();
+            let carried = WayWords::of
+            (
+                WaySamples { low: answer, mid: answer, high: answer },
+                &mut running
+            )
+                .high();
+
+            // The limiter the carry runs on reads the same word, since the
+            // trim holds this drive under the threshold, so the bound read at
+            // unity gain is the bound of the path the machine runs.
+            assert_eq!(carried, answered, "the limiter acted on the loudest source");
 
             worst = worst.max(answered.cast_signed().abs());
         }
@@ -5764,18 +6156,48 @@ mod tests
     #[test]
     fn a_refused_entry_carries_nothing()
     {
+        // The chain is taken off its rest first, a tone of 2332 W at the
+        // limiter over ten laps, so the limiter stands under unity and every
+        // history has moved. A refusal that rebuilt any part of the chain then
+        // shows in the comparison of the whole of it.
+        const WARM_LAPS: u32 = 10;
+
+        let plan = plan();
+        let loud = HighCascade::of_section(crate::filter::gain_section_for_test(SERVED_SECTION_GAIN));
+        let mut served = FilterChain { high: loud, ..chain() };
+        let mut warm = MockInput::healthy();
+
+        for lap in 0..WARM_LAPS
+        {
+            for index in 0..TEST_WORDS
+            {
+                place(&mut warm.source, index, sine_word(lap, index, 30, f64::from(i32::MAX)));
+            }
+
+            for half in [Half::First, Half::Second]
+            {
+                carry_block(&mut warm, &plan, half, shift(), &mut served);
+            }
+        }
+
+        let before = served.clone();
+        let gain = served.limiter.current_gain_for_test();
+
+        assert!(gain < 1.0, "the warm up left the gain at {gain}");
+
         let mut interface = MockInput::healthy();
 
-        assert_eq!(bring_up(&mut interface, &plan(), &waits()), Ok(shift()));
+        assert_eq!(bring_up(&mut interface, &plan, &waits()), Ok(shift()));
         interface.image.block.overrun = true;
 
         assert_eq!
         (
-            serve(&mut interface, &plan(), shift(), &mut chain()),
+            serve(&mut interface, &plan, shift(), &mut served),
             Err(PassthroughFault::Event(EventFault::Overrun))
         );
         assert_eq!(interface.carried, None);
         assert_eq!(interface.cleared, None);
+        assert!(served == before, "the refused entry moved the chain");
     }
 
     #[test]
