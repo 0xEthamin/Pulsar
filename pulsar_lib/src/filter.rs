@@ -463,27 +463,22 @@ impl<const N: usize> WayCascade<N>
     ///
     /// Out of line, the caller hands over a pointer to the cascade and every
     /// section reads its five coefficients and its four history words back
-    /// through it on every sample: MEASURED on the linked image at 135 accesses
-    /// a frame to the memory the cascades and the buffers sit in, against 75
-    /// folded. That memory is the slow one, and the carry has to move a frame
-    /// faster than the transmitting streams read one. Folded, the carry reaches
-    /// the speed of the streams at 3.5 times the access cost measured on the
-    /// part. Out of line the count puts that at 2.2 times, a form that is not
-    /// measured.
+    /// through it on every sample. That memory is the slow one, and the carry
+    /// has to move a frame faster than the transmitting streams read one.
     ///
-    /// What the fold buys is the READS. Folded, the twenty coefficients of the
-    /// low way are hoisted into registers for the whole block, and thirty of the
-    /// fifty are still read back each frame, one word to a transaction.
-    /// The forty history words are written back to memory on every frame either
-    /// way, since each is live into the next sample of its own section, and
-    /// only their reads come from registers.
+    /// What the fold buys is the READS. Folded, part of the coefficients are
+    /// hoisted out of that memory for the whole block, and the history is read
+    /// from registers. The history words are written back to memory on every
+    /// frame either way, since each is live into the next sample of its own
+    /// section. The module documentation of `passthrough` carries the count of
+    /// both forms on the linked image and the cost estimated from it.
     #[expect
     (
         clippy::inline_always,
         reason = "the carry reaches this once a way per frame, and the fold is \
-                  what takes the accesses to the memory the cascades and the \
-                  buffers sit in from 135 a frame to 75, MEASURED on the linked \
-                  image, which widens the lead of the carry over the streams"
+                  what takes most of the reads of the memory the cascades and \
+                  the buffers sit in out of the loop, which widens the lead of \
+                  the carry over the streams"
     )]
     #[inline(always)]
     pub(crate) fn step(&mut self, input: f32) -> f32
@@ -885,6 +880,25 @@ pub(crate) const fn unit_section_for_test() -> Biquad
     Biquad
     {
         b0: 1.0,
+        b1: 0.0,
+        b2: 0.0,
+        a1: 0.0,
+        a2: 0.0,
+    }
+}
+
+/// Builds the section that answers every sample times `gain`.
+///
+/// `b0` at `gain` and the four others at zero. No design produces it either.
+/// What it is for is a test that drives the stage behind the chain past a level
+/// the trim lets any designed way reach, which the thermal limiter of the high
+/// way needs before it acts at all.
+#[cfg(test)]
+pub(crate) const fn gain_section_for_test(gain: f32) -> Biquad
+{
+    Biquad
+    {
+        b0: gain,
         b1: 0.0,
         b2: 0.0,
         a1: 0.0,

@@ -190,7 +190,8 @@ static mut INPUT_BUFFER: MaybeUninit<[u32; BUFFER_WORDS]> = MaybeUninit::uninit(
 /// the value this opens on once the interrupt exists.
 static CARRY_SHIFT: AtomicU32 = AtomicU32::new(u32::MAX);
 
-/// The three cascades the carry runs, and the history behind each section.
+/// The three cascades the carry runs, the history behind each section, and the
+/// thermal limiter of the high way.
 ///
 /// This is the first state of this firmware that outlives one entry into a
 /// handler. `pulsar_lib` owns the type and forbids `unsafe`, so a chain is
@@ -204,19 +205,22 @@ static CARRY_SHIFT: AtomicU32 = AtomicU32::new(u32::MAX);
 /// the refusal word and the fault record, and that record is placed to sit
 /// clear of the startup zero fill, so a static added beside them moves both.
 ///
-/// It is 360 bytes, four history words then five coefficients for each section
-/// of a way, and the memory it sits in is NOT free to the carry. The
-/// disassembly is what says so: the loop reads and writes this static on every
-/// frame, the coefficients of the sections it does not hoist and the four
-/// history words of every section, and those are most of the accesses a frame
-/// makes to this memory. The rest are the source word and the four output
-/// words. The module documentation of `pulsar_lib::passthrough` carries the
-/// count and what it costs.
+/// It is 368 bytes. MEASURED on the linked image, each way lays out the four
+/// history words of every one of its sections first and the five coefficients
+/// of every one of them after, and the average and the gain of the limiter
+/// close the chain at offsets 360 and 364. The memory it sits in is NOT free to
+/// the carry. The disassembly is what says so: the loop
+/// reads and writes this static on every frame, the coefficients it does not
+/// hoist, the four history words of every section and the state of the
+/// limiter, and those are most of the accesses a frame makes to this memory.
+/// The rest are the source word and the four output words. The module
+/// documentation of `pulsar_lib::passthrough` carries the count and what it
+/// costs.
 ///
-/// The 20 coefficients of the low way are the ones the compiler hoists into
-/// registers for a whole block. The 40 history words are written back every
-/// frame, each being live into the next sample of its own section, so no form of
-/// the loop keeps them out of here.
+/// Part of the coefficients of the low way are the ones the compiler hoists
+/// out of this memory for a whole block. The history words and the state of the
+/// limiter are written back every frame, each being live into the next sample,
+/// so no form of the loop keeps them out of here.
 ///
 /// It is paid rather than moved because the budget holds: by the estimate that
 /// module documentation carries, the carry moves a frame faster than the
@@ -987,7 +991,7 @@ mod chain
         )]
         pub(super) fn publish(self) -> Result<PublishedChain, PassthroughFault>
         {
-            write_chain(&built_chain()?);
+            write_chain(built_chain()?);
 
             Ok(PublishedChain(()))
         }
@@ -1000,7 +1004,7 @@ mod chain
     /// it, so nothing a stage downstream takes comes out of this.
     pub(super) fn park_silent() -> ParkedChain
     {
-        write_chain(&FilterChain::silent());
+        write_chain(FilterChain::silent());
 
         ParkedChain(())
     }
@@ -1008,26 +1012,28 @@ mod chain
     /// Writes `chain` into the parked one.
     ///
     /// `write_volatile` is what keeps the write, since nothing in this crate
-    /// reads the memory back. It carries no store sequence of its own: a chain
-    /// is 360 bytes, so the image reaches that memory through a call to the
-    /// runtime copy routine, the same symbol an ordinary move of a chain goes
-    /// through, and what holds the write in place is a call the compiler
-    /// cannot see into. What reads the memory is one handler, and what orders
-    /// the two is the unmask that stands after every call to this.
+    /// reads the memory back. The image reaches that memory through a call to
+    /// the runtime copy routine, the same symbol an ordinary move of a chain
+    /// goes through, and what holds the write in place is a call the compiler
+    /// cannot see into. MEASURED on the linked image, the built chain crosses
+    /// that call whole, all 368 bytes of it, and the silent one crosses it for
+    /// its cascades while its limiter, two words of zero, goes in by two stores
+    /// behind it. What reads the memory is one handler, and what orders the two
+    /// is the unmask that stands after every call to this.
     #[expect
     (
         unsafe_code,
         reason = "the chain is reached by raw pointer, since the handler that \
                   reads it holds no reference this function could borrow from"
     )]
-    fn write_chain(chain: &FilterChain)
+    fn write_chain(chain: FilterChain)
     {
         // SAFETY: nothing else touches the chain while this runs. Every call to
         // this stands ahead of the unmask that puts the handler on the vector,
         // and the handler is the only other access.
         unsafe
         {
-            ptr::write_volatile((&raw mut FILTER_CHAIN).cast::<FilterChain>(), *chain);
+            ptr::write_volatile((&raw mut FILTER_CHAIN).cast::<FilterChain>(), chain);
         }
     }
 }
