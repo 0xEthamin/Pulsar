@@ -194,10 +194,10 @@ fn enable_port_clock(rcc: &RCC)
 /// Raises the converter mute line once the transport has proved it runs.
 ///
 /// `clock` is the witness that the audio kernel clock came up and read back as
-/// planned, and `filters` the witness that the crossover chain stands in the
-/// memory the carry reads. The gate reads neither. Taking them by reference is
-/// what leaves the order to the compiler: a refused clock and a refused chain
-/// each build no witness, so there is nothing to hand over, and this cannot run
+/// planned, and `filters` the witness of the write that publishes the built
+/// crossover chain. The gate reads neither. Taking them by reference is what
+/// leaves the order to the compiler: a refused clock and a refused chain each
+/// build no witness, so there is nothing to hand over, and this cannot run
 /// ahead of either stage it depends on.
 ///
 /// `core_clock_hz` sizes the window budget, and naming a clock above the one

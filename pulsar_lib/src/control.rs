@@ -397,8 +397,7 @@ mod tests
     /// Samples per buffer these tests drive the gate with.
     ///
     /// A fixture, not a decision. The audio block size is still open, since it
-    /// trades latency against interrupt load and against the look-ahead of the
-    /// high way limiter.
+    /// trades latency against interrupt load.
     const FIXTURE_BUFFER_SAMPLES: u32 = 256;
 
     /// Period of the fixture buffer, in milliseconds, rounded up.

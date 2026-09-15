@@ -38,12 +38,13 @@
 //! pipeline of the FIFOs and the shift registers that no counter reports, which
 //! the bring-up measures and leaves in `CARRY_SHIFT`.
 //!
-//! That vector no longer reaches the handler that silences the machine, so this
-//! module carries the net for it: `pulsar_lib::passthrough::next_block` refuses
-//! every entry that is not one half transfer or one transfer complete on a path
-//! still running to plan, and refuses one that would write where the
-//! transmitting streams are reading. The caller answers a refusal by silencing
-//! the machine, which is what the default handler would have done.
+//! That vector has a handler of its own and does not reach `DefaultHandler`,
+//! which silences the machine, so this module carries the net for it:
+//! `pulsar_lib::passthrough::next_block` refuses every entry that is not one
+//! half transfer or one transfer complete on a path still running to plan, and
+//! refuses one that would write where the transmitting streams are reading. The
+//! caller answers a refusal by silencing the machine, which is what
+//! `DefaultHandler` does.
 
 use core::mem::MaybeUninit;
 use core::ptr;
@@ -231,9 +232,9 @@ static CARRY_SHIFT: AtomicU32 = AtomicU32::new(u32::MAX);
 ///
 /// # What keeps an unwritten one out of the carry
 ///
-/// `start` writes a silent chain into it before it touches anything else, and
-/// the built one over that, and both writes stand ahead of the call that
-/// unmasks the line. So a handler can only be entered after the chain is
+/// `start` parks a silent chain in it before it brings the input path up, and
+/// publishes the built one over that, and both writes stand ahead of the call
+/// that unmasks the line. So a handler can only be entered after the chain is
 /// written, and a start-up that refuses leaves it silent AND enables no
 /// interrupt.
 #[expect
@@ -917,6 +918,11 @@ fn fill_silence()
 /// out of the write of the built chain rather than standing beside it, and no
 /// caller picks what that write carries.
 ///
+/// The thermal limiter of the high way is a field of the chain, so each write
+/// carries one: the silent chain carries one at zero gain and the built chain
+/// one at rest. The witness attests the second write, and that write carries
+/// the limiter with the cascades.
+///
 /// Nothing here forbids a second parking after a publication. What such a run
 /// leaves is a silent chain and a witness that attests the write it came out
 /// of, which is why the witness is read as one write at one instant and not as
@@ -934,8 +940,11 @@ mod chain
         built_chain,
     };
 
-    /// Witness that the built crossover chain stands in the memory the carry
-    /// reads.
+    /// Witness of the write that publishes the built crossover chain.
+    ///
+    /// `FilterChain` holds the thermal limiter of the high way in a private
+    /// field beside the three cascades, so that write publishes the limiter
+    /// with them.
     ///
     /// `ParkedChain::publish` is the only thing that builds one, and it returns
     /// it from the write that publishes that chain. The field is private to
@@ -954,8 +963,9 @@ mod chain
     pub(crate) struct PublishedChain(());
 
     /// The release gate takes one of these and reads nothing out of it. What it
-    /// needs is that one exists, since `start` is the only thing that builds one
-    /// and it builds one only once the chain is where the handler reads it.
+    /// needs is that one exists, since `ParkedChain::publish` is the only thing
+    /// that builds one and it builds one only out of the write that publishes
+    /// the built chain.
     impl InitialisedFilters for PublishedChain
     {
     }
@@ -1124,11 +1134,11 @@ pub(crate) fn plan(clock: &AudioClock) -> InputPlan
 /// The buffer is filled with silence before the stream that writes it is
 /// enabled, which is what keeps power-on noise out of the carry.
 ///
-/// The filter chain is published twice. A silent one goes down first, so the
-/// memory the carry would read holds cascades that stop the signal from the
-/// first instruction of this sequence, and the built one replaces it once the
-/// path is up. Both stand ahead of the call that unmasks the line, so no entry
-/// can find a chain that was never written.
+/// The filter chain is published twice. A silent one goes down before the input
+/// path comes up, so the memory the carry would read holds cascades that stop
+/// the signal, and the built one replaces it once the path is up. Both writes
+/// stand ahead of the call that unmasks the line, so no entry can find a chain
+/// that was never written.
 ///
 /// Once this returns, PD11 carries the data line of a receiver following the
 /// frame the transmitter emits, one transfer stream fills the buffer, and the
@@ -1136,9 +1146,10 @@ pub(crate) fn plan(clock: &AudioClock) -> InputPlan
 /// been read back. Nothing is enabled that could write an output buffer, and
 /// XSMT is untouched.
 ///
-/// What comes back is the witness that the built chain is in that memory. The
-/// release gate takes it and reads nothing out of it, so what it buys is the
-/// order: a run that never published a chain hands the gate nothing.
+/// What comes back is the witness of the write that publishes the built chain.
+/// The release gate takes it and reads nothing out of it, so what it buys is
+/// the order: a run that never published the built chain hands the gate
+/// nothing.
 ///
 /// # Errors
 ///

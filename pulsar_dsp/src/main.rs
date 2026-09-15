@@ -7,7 +7,7 @@
 //! The converters come out of reset muted, held there by the pull-down on their
 //! XSMT pin. One stage of this binary raises XSMT, the release gate, and it
 //! does so only after the audio clock read back as planned, the transport read
-//! back as planned, the crossover chain stood in the memory the carry reads,
+//! back as planned, the write that publishes the built crossover chain ran,
 //! both transfer counters reloaded twice with no error flag raised over that
 //! window, which is a whole lap of their buffers whatever position they were
 //! found at, and a buffer of zeros was held over the converter unmute ramp. One
@@ -312,12 +312,13 @@ fn keep_core_visible_in_sleep()
 /// one.
 ///
 /// The input path comes up between the transport and the gate, on the same
-/// witness. It configures the receiving sub-block, its stream and PD11, it
-/// parks the crossover chain in the memory the carry reads, and it starts that
+/// witness. It parks a silent crossover chain in the memory the carry reads,
+/// configures the receiving sub-block, its stream and PD11, and starts that
 /// stream where the shift the two read pointers leave lands in the band a carry
-/// can work in. It writes no output buffer and leaves PE7 alone, so the gate
-/// that follows still finds the buffers holding zeros, and what it returns is
-/// the witness that the chain is parked.
+/// can work in. It then publishes the built chain over the silent one. It
+/// writes no output buffer and leaves PE7 alone, so the gate that follows still
+/// finds the buffers holding zeros, and what it returns is the witness of that
+/// publication.
 ///
 /// The release gate takes that witness and the clock one by reference and reads
 /// neither. It watches the transfers, puts PE7 under the port and raises it,
@@ -613,8 +614,8 @@ fn silence_and_park() -> !
 /// path is armed to raise it twice a lap of the buffer.
 ///
 /// What it does with an entry it was not armed for is refuse it and take the
-/// fault path, which is what `DefaultHandler` would have done for this vector
-/// before it had a handler of its own.
+/// fault path, which is the path `DefaultHandler` takes for an interrupt that
+/// has no handler of its own.
 /// `pulsar_lib::passthrough::next_block` is where that decision lives, and it
 /// refuses an entry carrying neither transfer event flag, one carrying both, a
 /// receiving sub-block or stream reporting an alarm, a counter reading past its

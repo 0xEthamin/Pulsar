@@ -4949,8 +4949,8 @@ mod tests
     #[test]
     fn every_chain_carries_a_limiter_and_an_unbuilt_chain_carries_a_silent_one()
     {
-        // `silent` is a constant, since the firmware parks it before anything
-        // else runs.
+        // `silent` is a constant, so parking it runs no build that could
+        // refuse.
         const PARKED: FilterChain = FilterChain::silent();
 
         assert_eq!(PARKED.limiter, ThermalLimiter::silent());
