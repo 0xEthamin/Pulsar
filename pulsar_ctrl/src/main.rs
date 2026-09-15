@@ -5,11 +5,289 @@
 //! with no filtering, no gain and no limiting.
 //!
 //! The audio path outranks every other task here.
+//!
+//! The Bluedroid A2DP sink hands decoded PCM to `pulsar_lib::bridge` from the
+//! Bluetooth callback task. A dedicated thread pumps the bridge into the I2S
+//! transmit channel, which runs as target on the clocks of the processing
+//! board. The two share the bridge through a mutex that each side holds for one
+//! copy: the push of one decoded chunk, or the drain of one block. On ESP-IDF
+//! `std::sync::Mutex` is a pthread mutex, which ESP-IDF builds on a `FreeRTOS`
+//! mutex with priority inheritance.
+//!
+//! Nothing here writes non-volatile storage. Bluedroid starts without NVS and
+//! keeps no bond across a reset, so a phone pairs again after each boot.
 
-use esp_idf_svc::sys::link_patches;
+use std::convert::Infallible;
+use std::sync::Mutex;
+use std::thread;
+use std::time::Duration;
+
+use esp_idf_svc::bt::a2dp::{A2dpEvent, AudioStatus, Codec, ConnectionStatus, EspA2dp};
+use esp_idf_svc::bt::gap::{DiscoveryMode, EspGap, GapEvent};
+use esp_idf_svc::bt::{BtClassic, BtDriver};
+use esp_idf_svc::hal::delay::TickType;
+use esp_idf_svc::hal::gpio::AnyIOPin;
+use esp_idf_svc::hal::i2s::config::{
+    Config,
+    DataBitWidth,
+    Role,
+    SlotMode,
+    StdClkConfig,
+    StdConfig,
+    StdGpioConfig,
+    StdSlotConfig,
+};
+use esp_idf_svc::hal::i2s::{I2sDriver, I2sTx};
+use esp_idf_svc::hal::peripherals::Peripherals;
+use esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration;
+use esp_idf_svc::log::EspLogger;
+use esp_idf_svc::sys::{ESP_ERR_TIMEOUT, EspError, link_patches};
+use pulsar_lib::bridge::{self, Bridge, FrameSource, SlotWriter, StreamCodec, StreamVerdict};
+use pulsar_lib::constants::SAMPLE_RATE_HZ;
+
+/// Name the board advertises to phones.
+const DEVICE_NAME: &str = "Pulsar";
+
+/// Stack of the pump thread, which holds one PCM block and one slot block.
+const PUMP_STACK_BYTES: usize = 8192;
+
+/// `FreeRTOS` priority of the pump thread, above the default pthread priority of 5.
+const PUMP_PRIORITY: u8 = 15;
+
+/// Time one channel write waits for room in the DMA queue.
+const WRITE_TIMEOUT: TickType = TickType::new_millis(100);
+
+/// Pause after a failed pump, so a channel that keeps failing does not spin.
+const PUMP_RETRY: Duration = Duration::from_millis(100);
+
+/// Bridge between the A2DP callback and the pump thread.
+static BRIDGE: Mutex<Bridge<{ bridge::RING_FRAMES }>> =
+    Mutex::new(Bridge::new(bridge::PREFILL_FRAMES));
+
+/// Failure while bringing the board up.
+#[derive(Debug)]
+enum StartError
+{
+    /// An ESP-IDF call failed.
+    Esp(EspError),
+    /// The pump thread did not start.
+    Spawn(std::io::Error),
+}
+
+impl From<EspError> for StartError
+{
+    fn from(error: EspError) -> Self
+    {
+        Self::Esp(error)
+    }
+}
+
+/// The shared bridge, seen from the pump thread.
+struct SharedBridge;
+
+impl FrameSource for SharedBridge
+{
+    /// Drains one block under the lock. A poisoned lock gives out nothing,
+    /// which the pump turns into silence.
+    fn take_frames(&mut self, pcm: &mut [u8]) -> usize
+    {
+        BRIDGE.lock().map_or(0, |mut shared| shared.drain_into(pcm))
+    }
+}
+
+/// The I2S transmit channel.
+struct Link(I2sDriver<'static, I2sTx>);
+
+impl SlotWriter for Link
+{
+    type Error = EspError;
+
+    /// Writes a prefix of `bytes`. A timeout with nothing written returns 0.
+    fn write(&mut self, bytes: &[u8]) -> Result<usize, EspError>
+    {
+        match self.0.write(bytes, WRITE_TIMEOUT.ticks())
+        {
+            Err(error) if error.code() == ESP_ERR_TIMEOUT => Ok(0),
+            other => other,
+        }
+    }
+}
+
+/// Runs `action` on the shared bridge. A poisoned lock skips it.
+fn with_bridge(action: impl FnOnce(&mut Bridge<{ bridge::RING_FRAMES }>))
+{
+    if let Ok(mut shared) = BRIDGE.lock()
+    {
+        action(&mut shared);
+    }
+}
+
+/// Starts a stream on the codec the phone negotiated.
+///
+/// `pulsar_lib::bridge::stream_verdict` decides. A refused stream leaves the
+/// bridge closed, so the link carries silence, and logs one line.
+fn start_stream(codec: &Codec)
+{
+    let stream = match codec
+    {
+        Codec::Sbc([octet, ..]) => StreamCodec::Sbc(*octet),
+        _ => StreamCodec::Other,
+    };
+
+    let mut verdict = None;
+    with_bridge(|shared| verdict = Some(shared.open(stream)));
+
+    match verdict
+    {
+        Some(StreamVerdict::Forward) => {}
+        Some(refused) => println!
+        (
+            "A2DP stream refused ({refused:?}), the chain takes SBC at {SAMPLE_RATE_HZ} Hz on two channels: forwarding silence"
+        ),
+        None => println!("A2DP stream not started, the bridge lock is poisoned"),
+    }
+}
+
+/// Handles one A2DP event from the Bluetooth callback task.
+fn on_a2dp(event: A2dpEvent<'_>) -> usize
+{
+    match event
+    {
+        A2dpEvent::SinkData(pcm) =>
+        {
+            with_bridge(|shared|
+            {
+                shared.push(pcm);
+            });
+        }
+        A2dpEvent::AudioCodecConfigured { codec, .. } => start_stream(&codec),
+        A2dpEvent::AudioState { status, .. } if status != AudioStatus::Started =>
+        {
+            with_bridge(Bridge::flush);
+        }
+        A2dpEvent::ConnectionState { status: ConnectionStatus::Disconnected, .. } =>
+        {
+            with_bridge(Bridge::close);
+        }
+        _ => {}
+    }
+
+    0
+}
+
+/// Logs the outcome of a pairing.
+fn on_gap(event: &GapEvent<'_>)
+{
+    if let GapEvent::AuthenticationCompleted { bd_addr, status, .. } = event
+    {
+        println!("pairing with {bd_addr}: {status:?}");
+    }
+}
+
+/// Pumps the bridge into the link, one block at a time, for ever.
+fn run_pump(mut link: Link) -> !
+{
+    let mut pcm = [0; bridge::BLOCK_FRAMES * bridge::PCM_FRAME_BYTES];
+    let mut slots = [0; bridge::BLOCK_FRAMES * bridge::SLOT_FRAME_BYTES];
+    let mut failing = false;
+
+    loop
+    {
+        match bridge::pump(&mut SharedBridge, &mut pcm, &mut slots, &mut link)
+        {
+            Ok(_) => failing = false,
+            Err(error) =>
+            {
+                if !failing
+                {
+                    println!("I2S pump failed: {error:?}");
+                }
+
+                failing = true;
+                thread::sleep(PUMP_RETRY);
+            }
+        }
+    }
+}
+
+/// Starts the pump thread on `link` at `PUMP_PRIORITY`.
+///
+/// # Errors
+///
+/// `Esp` when the thread configuration is refused, `Spawn` when the thread
+/// does not start.
+fn spawn_pump(link: Link) -> Result<(), StartError>
+{
+    ThreadSpawnConfiguration
+    {
+        name: Some(c"pulsar_pump"),
+        stack_size: PUMP_STACK_BYTES,
+        priority: PUMP_PRIORITY,
+        ..Default::default()
+    }
+    .set()?;
+
+    let spawned = thread::Builder::new()
+        .stack_size(PUMP_STACK_BYTES)
+        .spawn(move || run_pump(link));
+
+    ThreadSpawnConfiguration::default().set()?;
+    spawned.map(drop).map_err(StartError::Spawn)
+}
 
 fn main()
 {
     // The ESP-IDF link step drops these symbols without an explicit reference.
     link_patches();
+    EspLogger::initialize_default();
+
+    match run()
+    {
+        Err(StartError::Esp(error)) => println!("start failed: {error}"),
+        Err(StartError::Spawn(error)) => println!("pump thread failed to start: {error}"),
+    }
+}
+
+/// Brings up the link, the pump and the A2DP sink, then parks for ever.
+///
+/// # Errors
+///
+/// `StartError` when a step of the bring up fails. A pump thread already
+/// started keeps running and writes silence.
+fn run() -> Result<Infallible, StartError>
+{
+    let peripherals = Peripherals::take()?;
+
+    let config = StdConfig::new
+    (
+        Config::default().role(Role::Target).auto_clear(true),
+        StdClkConfig::from_sample_rate_hz(SAMPLE_RATE_HZ),
+        StdSlotConfig::philips_slot_default(DataBitWidth::Bits32, SlotMode::Stereo),
+        StdGpioConfig::default(),
+    );
+
+    let mut channel = I2sDriver::new_std_tx
+    (
+        peripherals.i2s0,
+        &config,
+        peripherals.pins.gpio26,
+        peripherals.pins.gpio22,
+        None::<AnyIOPin>,
+        peripherals.pins.gpio25,
+    )?;
+    channel.tx_enable()?;
+    spawn_pump(Link(channel))?;
+
+    let driver = BtDriver::<BtClassic>::new(peripherals.modem, None)?;
+    let gap = EspGap::new(&driver)?;
+    gap.subscribe(|event| on_gap(&event))?;
+    let a2dp = EspA2dp::new_sink(&driver)?;
+    a2dp.subscribe(on_a2dp)?;
+    gap.set_device_name(DEVICE_NAME)?;
+    gap.set_scan_mode(true, DiscoveryMode::Discoverable)?;
+
+    loop
+    {
+        thread::park();
+    }
 }
