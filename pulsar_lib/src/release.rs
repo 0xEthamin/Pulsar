@@ -66,13 +66,17 @@
 //! is what a caller needs to write a non-zero sample, and only a completed
 //! sequence builds one.
 //!
-//! **Filters initialised** is the witness the input bring-up returns once the
-//! crossover chain stands in the memory the carry reads. The type that carries
-//! it belongs to the firmware that parks that chain, so this module names
+//! **Filters initialised** is the witness the input bring-up returns out of the
+//! write that publishes the built crossover chain. It attests that one write
+//! and says nothing about the memory afterwards. `FilterChain` holds the
+//! thermal limiter of the high way in a private field beside the three
+//! cascades, so the write that publishes the chain publishes the limiter with
+//! them and the witness of that write covers both. The type that carries it
+//! belongs to the firmware that publishes that chain, so this module names
 //! `InitialisedFilters` rather than that type, and `open` takes one by
 //! reference for the reason it takes the clock one: a refused chain builds no
-//! witness, so there is nothing to hand over and a run that never published a
-//! chain never reaches the raise.
+//! witness, so there is nothing to hand over and a run that never published the
+//! built chain never reaches the raise.
 //!
 //! # What the converter does with a long silence
 //!
@@ -129,12 +133,15 @@ pub trait VerifiedClock
 {
 }
 
-/// Attests that the crossover chain stands in the memory the carry reads.
+/// Attests the write that publishes the built crossover chain.
 ///
-/// The type carrying the attestation belongs to the firmware that parks that
-/// chain, so this trait is what the gate names. Implement it on that type and
-/// on nothing else: what it claims is a built chain published where the carry
-/// reads it, and a chain a caller merely holds is not one.
+/// `FilterChain` holds the thermal limiter of the high way in a private field
+/// beside the three cascades, so that write publishes the limiter with them.
+///
+/// The type carrying the attestation belongs to the firmware that publishes
+/// that chain, so this trait is what the gate names. Implement it on that
+/// type and on nothing else: what it claims is the write that publishes a built
+/// chain, and a chain a caller merely holds is not one.
 pub trait InitialisedFilters
 {
 }
@@ -528,9 +535,9 @@ impl Laps
 /// zeros did not run for the whole ramp, and the line goes back down before
 /// the fault is returned.
 ///
-/// `_clock` and `_filters` are not read. They are the witnesses that the audio
-/// kernel clock came up to its plan and that the crossover chain stands in the
-/// memory the carry reads, and taking them by reference is what leaves the
+/// `_clock` is the witness that the audio kernel clock came up to its plan, and
+/// `_filters` the witness of the write that publishes the built crossover
+/// chain. Neither is read, and taking them by reference is what leaves the
 /// order to the compiler rather than to a comment.
 ///
 /// # Errors
