@@ -1,54 +1,63 @@
-//! The rate limit between a decoded control message and the audio chain.
+//! The slew limit between a decoded control message and the audio chain.
 //!
-//! At 115200 baud the link carries roughly 1400 volume messages a second, and a
-//! chain applying each of them as a step would turn the control link into a
-//! full scale amplitude modulator aimed at the drivers. No transition this
-//! type hands out is abrupt.
+//! At 115200 baud the link carries up to 1645 volume messages a second, seven
+//! bytes of at least ten bits each, and a chain applying each of them as a step
+//! would turn the control link into a full scale amplitude modulator aimed at
+//! the drivers. No transition this type hands out is abrupt.
 //!
-//! `ControlState` bounds the RATE at which the applied setting moves, to one
-//! change per `GAIN_RAMP_MS`, and hands out the gain at both ends of a buffer
-//! so the caller walks the ramp sample by sample.
+//! `ControlState` bounds the SPEED of the gain. A change ramps linearly over
+//! its distance times `GAIN_FULL_SWING_MS`, and over no less than
+//! `GAIN_RAMP_MS`, so no gain moves faster than full scale in
+//! `GAIN_FULL_SWING_MS`. A request replaces the target of the ramp in flight
+//! and ramps from the gain the chain holds, so the newest request wins and a
+//! reversal starts where the gain stands. The gain is handed out at both ends
+//! of a buffer so the caller walks the ramp sample by sample.
 //!
-//! It does not bound the envelope that survives the rate limit. A sender pacing
-//! itself to the window drives the gain between its extremes at 25 Hz, whose
-//! modulation products land beside the programme rather than under any corner
-//! frequency. The volume gain sits upstream of the limiters, so holding that
-//! envelope off the drivers is what the limiters are for.
-//! `a_paced_sender_still_swings_the_gain` measures what is left.
+//! The speed bound is also what bounds the envelope a sender draws by
+//! reversing the setting, at any pace. Over any stretch of `W` ms of sound the
+//! gain swings by less than `W + 1` ms over `GAIN_FULL_SWING_MS` when the
+//! caller's count reads the sound produced in whole milliseconds. The ramp
+//! advances by the difference of two such counts, and that difference exceeds
+//! the sound between them by less than 1 ms. `poll` reads the count once per
+//! buffer, so a count read up to one buffer late widens the bound by that
+//! buffer, to `W` plus one buffer plus 1 ms. The test
+//! `a_paced_sender_swings_the_gain_no_wider_than_the_slew_allows` holds both
+//! bounds across sender periods, sender phases and buffer periods.
 //!
-//! A preset change leaves through the same gate: the gain ramps to silence, the
+//! A preset change leaves through the same ramp: the gain ramps to silence, the
 //! preset moves on a buffer silent at both ends, and the gain rides back up
 //! behind it, so the coefficients never move under signal. The filter state is
 //! the caller's to clear, see `Applied::preset`.
 //!
-//! Two clocks run here. The ramp and the commit gate run on audio produced,
-//! which is the caller's elapsed count capped at one buffer. The heartbeat
-//! silence measure runs on the raw elapsed count, because a link that stopped
-//! is measured in wall time and a capped clock reads it short.
+//! Two clocks run here. The ramp runs on audio produced, which is the caller's
+//! elapsed count capped at one buffer. The heartbeat silence measure runs on
+//! the raw elapsed count, because a link that stopped is measured in wall time
+//! and a capped clock reads it short.
 //!
 //! Time arrives as a parameter, so nothing here reads a clock.
 
-// The millisecond counts converted to a float here are bounded by GAIN_RAMP_MS,
-// and a sample index by the length of one buffer, so both conversions are
-// exact.
+// A millisecond count converted to a float here is compared against a ramp of
+// at most GAIN_FULL_SWING_MS, where it is exact, and a sample index is bounded
+// by the length of one buffer. A count past 2 to the 24th loses precision and
+// still reads as a ramp that has arrived.
 #![allow(clippy::cast_precision_loss)]
 
-use crate::constants::GAIN_RAMP_MS;
+use crate::constants::{GAIN_FULL_SWING_MS, GAIN_RAMP_MS};
 use crate::protocol::{Preset, ToDsp, Volume};
 
 /// Shortest buffer period `poll` runs on, in milliseconds.
 ///
-/// The declared period caps one step of the owned clock. A caller computing it
-/// as samples times 1000 over the sample rate reads zero for any buffer under
-/// 45 samples, and a cap of zero would freeze the clock, hold the gain where it
-/// stands and never reopen the commit window. The floor rounds such a buffer up
-/// to the resolution of the unit instead.
+/// The declared period caps one step of the ramp. A caller computing it as
+/// samples times 1000 over the sample rate reads zero for any buffer under 45
+/// samples, and a cap of zero would hold the gain where it stands and never
+/// swap a preset. The floor rounds such a buffer up to the resolution of the
+/// unit instead.
 const MIN_BUFFER_MS: u32 = 1;
 
 const _: () = assert!
 (
     MIN_BUFFER_MS > 0,
-    "a floor of zero would leave the owned clock frozen at its build value"
+    "a floor of zero would leave the gain frozen where it stands"
 );
 
 /// What the processing chain applies across one buffer.
@@ -117,61 +126,66 @@ impl Applied
     }
 }
 
-/// A linear move between two gains over `GAIN_RAMP_MS`.
+/// A linear move between two gains, at a speed bounded by
+/// `GAIN_FULL_SWING_MS`.
 #[derive(Debug, Clone, Copy)]
 struct Ramp
 {
     from: f32,
     to: f32,
-    started_ms: u32,
+    /// Milliseconds of audio produced since the ramp started, saturating.
+    elapsed_ms: u32,
+    /// Length of the ramp: the distance times `GAIN_FULL_SWING_MS`, and no
+    /// less than `GAIN_RAMP_MS`.
+    duration_ms: f32,
 }
 
 impl Ramp
 {
-    /// Returns the gain the ramp holds at `now_ms`.
-    ///
-    /// Elapsed time is a wrapping difference, which reads a count running
-    /// backwards as a large forward jump. `ControlState` owns the count this
-    /// takes and advances it by at most one buffer per poll, so the difference
-    /// is the forward distance it looks like, and the value moves monotonically
-    /// to `to`.
-    fn value_at(self, now_ms: u32) -> f32
+    /// Builds a ramp from `from` to `to`.
+    fn new(from: f32, to: f32) -> Self
     {
-        let elapsed = now_ms.wrapping_sub(self.started_ms);
-        if elapsed >= GAIN_RAMP_MS
+        let distance = (to - from).abs();
+        let duration_ms = (distance * GAIN_FULL_SWING_MS as f32).max(GAIN_RAMP_MS as f32);
+        Self
+        {
+            from,
+            to,
+            elapsed_ms: 0,
+            duration_ms,
+        }
+    }
+
+    /// Returns the gain the ramp holds.
+    ///
+    /// The value lands on `to` exactly once the elapsed time reaches the
+    /// duration, and moves monotonically from `from` before that.
+    fn value(self) -> f32
+    {
+        let elapsed = self.elapsed_ms as f32;
+        if elapsed >= self.duration_ms
         {
             return self.to;
         }
-        let fraction = elapsed as f32 / GAIN_RAMP_MS as f32;
-        self.from + (self.to - self.from) * fraction
-    }
-
-    /// Reports whether the ramp has arrived on `to` by `now_ms`.
-    ///
-    /// The caller reads this rather than comparing the gain against its target,
-    /// which no float comparison decides.
-    fn settled_at(self, now_ms: u32) -> bool
-    {
-        now_ms.wrapping_sub(self.started_ms) >= GAIN_RAMP_MS
+        self.from + (self.to - self.from) * (elapsed / self.duration_ms)
     }
 }
 
 /// The only path from a decoded `ToDsp` message to a value the chain applies.
 ///
-/// A request inside an open ramp replaces the previous one rather than queueing
-/// behind it, so a burst costs one change and lands on the newest setting.
+/// A request inside a ramp in flight replaces its target rather than queueing
+/// behind it, so a burst lands on the newest setting.
 ///
-/// The type owns the millisecond count the ramp and the gate run on. `poll`
-/// advances it by the smaller of the caller's elapsed count and the period of
-/// the buffer being filled, since one poll produces one buffer of audio and no
-/// more. A caller count that stalls, jumps forward or runs backwards therefore
-/// cannot move the gain faster than the ramp, nor open the gate early.
+/// `poll` advances the ramp by the smaller of the caller's elapsed count and
+/// the period of the buffer being filled, since one poll produces one buffer of
+/// audio and no more. A caller count that stalls, jumps forward or runs
+/// backwards therefore cannot move the gain faster than the slew limit.
 ///
 /// The heartbeat silence measure runs on the caller's raw elapsed count
 /// instead, saturating, because a capped count reads a silence short.
 ///
 /// The state is a machine, so it is neither `Copy` nor `Clone`. Two copies
-/// would each hold their own gate and disagree about what the chain applies.
+/// would each hold their own ramp and disagree about what the chain applies.
 #[derive(Debug)]
 pub struct ControlState
 {
@@ -180,17 +194,9 @@ pub struct ControlState
     requested_preset: Preset,
     active_preset: Preset,
     ramp: Ramp,
-    /// Count the ramp and the gate run on, advanced by `poll` alone.
-    clock_ms: u32,
+    muting_for_swap: bool,
     /// Caller count the last `poll` read, for the elapsed difference.
     last_seen_ms: u32,
-    /// Value of `clock_ms` when the last ramp started.
-    last_commit_ms: u32,
-    /// Gain the previous buffer ended on, which the next one starts from.
-    last_gain: f32,
-    /// Whether that gain is the target of the ramp rather than a point on it.
-    last_gain_settled: bool,
-    muting_for_swap: bool,
     /// Saturating milliseconds of wall time since the last heartbeat, or since
     /// the build of the state while none has arrived.
     silence_ms: u32,
@@ -200,8 +206,7 @@ impl ControlState
 {
     /// Builds the state silent, on the protective crossover alone.
     ///
-    /// `now_ms` is the caller's millisecond count at the build. The first
-    /// change applies without waiting out a ramp, since no ramp is in flight.
+    /// `now_ms` is the caller's millisecond count at the build.
     #[must_use]
     pub fn new(now_ms: u32) -> Self
     {
@@ -211,26 +216,17 @@ impl ControlState
             committed_volume: Volume::MUTED,
             requested_preset: Preset::Flat,
             active_preset: Preset::Flat,
-            ramp: Ramp
-            {
-                from: 0.0,
-                to: 0.0,
-                started_ms: now_ms,
-            },
-            clock_ms: now_ms,
-            last_seen_ms: now_ms,
-            last_commit_ms: now_ms.wrapping_sub(GAIN_RAMP_MS),
-            last_gain: 0.0,
-            last_gain_settled: true,
+            ramp: Ramp::new(0.0, 0.0),
             muting_for_swap: false,
+            last_seen_ms: now_ms,
             silence_ms: 0,
         }
     }
 
     /// Records what the sender asked for.
     ///
-    /// A setting does not reach the audio chain here. `poll` decides when it
-    /// may, and a later request inside the same window replaces this one.
+    /// A setting does not reach the audio chain here. The next `poll` takes
+    /// it, and a later request before that poll replaces this one.
     ///
     /// A heartbeat restarts the silence measure and touches nothing else.
     pub fn request(&mut self, message: ToDsp)
@@ -250,26 +246,21 @@ impl ControlState
     ///
     /// The returned pair is the gain at both ends of that buffer. Applying
     /// either end to the whole buffer turns the ramp back into a staircase, so
-    /// walk it with `Applied::gain_at`.
+    /// walk it with `Applied::gain_at`. A request this poll takes starts moving
+    /// the gain on the next buffer.
     ///
     /// `buffer_ms` is held at `MIN_BUFFER_MS` or above, so a declared period of
-    /// zero cannot freeze the clock. It has no ceiling, and a caller declaring
-    /// a period longer than `GAIN_RAMP_MS` walks its whole ramp inside one
-    /// buffer. Declaring the period of the buffer being filled is the caller's
-    /// half of the contract.
+    /// zero cannot freeze the ramp. It has no ceiling, and a caller declaring
+    /// a period longer than the buffer it fills moves the gain faster than the
+    /// slew limit across that buffer. Declaring the period of the buffer being
+    /// filled is the caller's half of the contract.
     pub fn poll(&mut self, now_ms: u32, buffer_ms: u32) -> Applied
     {
-        let gain_start = self.last_gain;
-        self.advance_clock(now_ms, buffer_ms);
-
-        if self.clock_ms.wrapping_sub(self.last_commit_ms) >= GAIN_RAMP_MS
-        {
-            self.commit();
-        }
-
-        let gain_end = self.ramp.value_at(self.clock_ms);
-        self.last_gain = gain_end;
-        self.last_gain_settled = self.ramp.settled_at(self.clock_ms);
+        let gain_start = self.ramp.value();
+        let step_ms = self.advance_clock(now_ms, buffer_ms);
+        self.ramp.elapsed_ms = self.ramp.elapsed_ms.saturating_add(step_ms);
+        let gain_end = self.ramp.value();
+        self.commit(gain_start, gain_end);
         Applied
         {
             gain_start,
@@ -309,77 +300,63 @@ impl ControlState
         self.silence_ms.saturating_add(since_poll)
     }
 
-    /// Advances the owned count by the audio one poll produces, and the silence
-    /// measure by the wall time that passed.
+    /// Returns the audio one poll produces, in milliseconds, and advances the
+    /// silence measure by the wall time that passed.
     ///
-    /// The step of the owned count is the caller's elapsed count capped at the
-    /// declared period, held at `MIN_BUFFER_MS` or above. A count running
-    /// backwards produces a wrapping distance far above any buffer period, so
-    /// the cap catches it.
+    /// The step is the caller's elapsed count capped at the declared period,
+    /// held at `MIN_BUFFER_MS` or above. A count running backwards produces a
+    /// wrapping distance far above any buffer period, so the cap catches it.
     ///
     /// The silence measure takes the raw elapsed count instead. Under the
     /// capped step it would count audio produced: lateness truncated, earliness
     /// never made up, and a poll that stopped freezing the measure.
-    fn advance_clock(&mut self, now_ms: u32, buffer_ms: u32)
+    fn advance_clock(&mut self, now_ms: u32, buffer_ms: u32) -> u32
     {
         let elapsed = now_ms.wrapping_sub(self.last_seen_ms);
         let period_ms = buffer_ms.max(MIN_BUFFER_MS);
-        let step = elapsed.min(period_ms);
         self.last_seen_ms = now_ms;
-        self.clock_ms = self.clock_ms.wrapping_add(step);
         self.silence_ms = self.silence_ms.saturating_add(elapsed);
+        elapsed.min(period_ms)
     }
 
-    /// Starts at most one ramp, taking the newest request of each kind.
+    /// Takes the newest request of each kind into the ramp.
     ///
-    /// A pending preset moves first, because its coefficients may only change
-    /// under silence. The volume rides back up with it in the same window.
+    /// `gain_start` and `gain_end` are the ends of the buffer this poll hands
+    /// out. A pending preset moves first, because its coefficients may only
+    /// change under silence. The volume rides back up with it.
     ///
-    /// The swap waits for the mute ramp to reach the caller, not merely to
-    /// expire. A buffer starts on the gain the previous one ended on, so a swap
-    /// taken as the ramp expires would move the coefficients across a buffer
-    /// whose first sample is still audible.
-    fn commit(&mut self)
+    /// The swap waits for a buffer that STARTS on silence. A buffer starts on
+    /// the gain the previous one ended on, so a swap taken on the buffer the
+    /// mute ramp arrives in would move the coefficients across a first sample
+    /// that is still audible. The ramp up it starts moves from the next buffer,
+    /// so the swap buffer ends on silence too.
+    fn commit(&mut self, gain_start: f32, gain_end: f32)
     {
-        let from = self.ramp.value_at(self.clock_ms);
-
         if self.muting_for_swap
         {
-            if !self.last_gain_settled
+            if gain_start > 0.0
             {
                 return;
             }
             self.active_preset = self.requested_preset;
             self.committed_volume = self.requested_volume;
             self.muting_for_swap = false;
-            self.start_ramp(from, self.committed_volume.linear_gain());
+            self.ramp = Ramp::new(gain_end, self.committed_volume.linear_gain());
             return;
         }
 
         if self.requested_preset != self.active_preset
         {
             self.muting_for_swap = true;
-            self.start_ramp(from, 0.0);
+            self.ramp = Ramp::new(gain_end, 0.0);
             return;
         }
 
         if self.requested_volume != self.committed_volume
         {
             self.committed_volume = self.requested_volume;
-            self.start_ramp(from, self.committed_volume.linear_gain());
+            self.ramp = Ramp::new(gain_end, self.committed_volume.linear_gain());
         }
-    }
-
-    /// Replaces the running ramp and closes the window behind it.
-    fn start_ramp(&mut self, from: f32, to: f32)
-    {
-        self.ramp = Ramp
-        {
-            from,
-            to,
-            started_ms: self.clock_ms,
-        };
-        self.last_commit_ms = self.clock_ms;
     }
 }
 
@@ -390,14 +367,15 @@ mod tests
     // no-panic rule does not hold.
     #![allow(clippy::panic)]
 
-    use super::*;
-    use crate::constants::SAMPLE_RATE_HZ;
-    use crate::protocol::VOLUME_MAX;
+    use std::vec::Vec;
 
-    /// Samples per buffer these tests drive the gate with.
+    use super::*;
+    use crate::constants::{GAIN_STEP_RAMP_MAX_MS, SAMPLE_RATE_HZ};
+    use crate::protocol::{COARSE_DEFAULT, COARSE_MAX, FINE_MAX};
+
+    /// Samples per buffer these tests drive the ramp with.
     ///
-    /// A fixture, not a decision. The audio block size is still open, since it
-    /// trades latency against interrupt load.
+    /// The audio chain runs 256 samples a buffer at 44.1 kHz.
     const FIXTURE_BUFFER_SAMPLES: u32 = 256;
 
     /// Period of the fixture buffer, in milliseconds, rounded up.
@@ -410,6 +388,12 @@ mod tests
     /// Tolerance covering single precision rounding on a gain comparison.
     const EPSILON: f32 = 1e-6;
 
+    /// Buffers of the fixture that carry a full swing and a margin behind it.
+    const FULL_SWING_BUFFERS: u32 = GAIN_FULL_SWING_MS.div_ceil(FIXTURE_BUFFER_MS) + 2;
+
+    /// Fastest the gain may move, in full scale per millisecond.
+    const SLEW_PER_MS: f32 = 1.0 / GAIN_FULL_SWING_MS as f32;
+
     /// Builds a volume pair, failing the test rather than returning an error.
     fn volume(coarse: u8, fine: u8) -> Volume
     {
@@ -420,10 +404,69 @@ mod tests
         }
     }
 
-    /// Returns the widest gain move `buffer_ms` of ramp allows.
+    /// Both controls at their maximum, a gain of exactly 1.
+    fn full() -> Volume
+    {
+        volume(COARSE_MAX, FINE_MAX)
+    }
+
+    /// Returns the widest gain move `buffer_ms` of audio allows.
     fn rate_bound(buffer_ms: u32) -> f32
     {
-        buffer_ms as f32 / GAIN_RAMP_MS as f32 + EPSILON
+        SLEW_PER_MS * buffer_ms as f32 + EPSILON
+    }
+
+    /// A caller filling buffers of a fixed number of samples.
+    ///
+    /// Its count is the whole milliseconds of audio produced before each poll,
+    /// as a millisecond tick read once per buffer gives, so the count steps
+    /// unevenly under the declared period whenever a buffer is not a whole
+    /// number of milliseconds.
+    struct Caller
+    {
+        samples: u32,
+        polls: u64,
+    }
+
+    impl Caller
+    {
+        fn new(samples: u32) -> Self
+        {
+            Self
+            {
+                samples,
+                polls: 0,
+            }
+        }
+
+        /// Returns the period the caller declares, rounded up.
+        fn buffer_ms(&self) -> u32
+        {
+            self.samples.saturating_mul(1_000).div_ceil(SAMPLE_RATE_HZ)
+        }
+
+        /// Returns the count the next poll reads.
+        fn now_ms(&self) -> u32
+        {
+            let produced = self
+                .polls
+                .saturating_mul(u64::from(self.samples))
+                .saturating_mul(1_000)
+                .div_euclid(u64::from(SAMPLE_RATE_HZ));
+            match u32::try_from(produced)
+            {
+                Ok(now_ms) => now_ms,
+                Err(error) => panic!("the caller count overflowed: {error:?}"),
+            }
+        }
+
+        /// Polls `state` once and returns the count it read with the result.
+        fn poll(&mut self, state: &mut ControlState) -> (u32, Applied)
+        {
+            let now_ms = self.now_ms();
+            self.polls = self.polls.saturating_add(1);
+            (now_ms, state.poll(now_ms, self.buffer_ms()))
+        }
     }
 
     /// Polls `state` for `buffers` buffers, handing each result to `observe`.
@@ -449,6 +492,28 @@ mod tests
         now_ms
     }
 
+    /// Requests `to` and polls until a buffer ends on its gain.
+    ///
+    /// Returns the caller count from the poll that takes the request to the
+    /// poll whose buffer ends on the new gain, which is the audio the ramp
+    /// took as the chain hands it out.
+    fn ramp_ms(state: &mut ControlState, caller: &mut Caller, to: Volume) -> u32
+    {
+        state.request(ToDsp::SetVolume(to));
+        let (taken_ms, _) = caller.poll(state);
+        let target = to.linear_gain().to_bits();
+        loop
+        {
+            let (now_ms, applied) = caller.poll(state);
+            let ramp_ms = now_ms.saturating_sub(taken_ms);
+            if applied.gain_end().to_bits() == target
+            {
+                return ramp_ms;
+            }
+            assert!(ramp_ms <= 2 * GAIN_FULL_SWING_MS, "the ramp to {to:?} never arrived");
+        }
+    }
+
     #[test]
     fn a_new_state_is_silent_on_the_protective_crossover()
     {
@@ -465,7 +530,7 @@ mod tests
     fn the_applied_pair_walks_the_buffer_from_end_to_end()
     {
         let mut state = ControlState::new(0);
-        state.request(ToDsp::SetVolume(volume(VOLUME_MAX, VOLUME_MAX)));
+        state.request(ToDsp::SetVolume(full()));
         let _ = state.poll(0, FIXTURE_BUFFER_MS);
         let applied = state.poll(FIXTURE_BUFFER_MS, FIXTURE_BUFFER_MS);
         assert!(applied.gain_end() > applied.gain_start());
@@ -491,32 +556,42 @@ mod tests
     }
 
     #[test]
-    fn the_gain_rate_holds_at_every_buffer_period()
+    fn the_gain_never_moves_faster_than_the_slew_at_any_buffer_period()
     {
-        // The buffer period is the caller's choice, and none of the periods it
-        // can take may turn the ramp into a step.
-        for buffer_ms in 1..=60_u32
+        // Requests land mid ramp in both directions and as a single 3 dB step,
+        // at every buffer length from one sample to 60 ms. The bound holds from
+        // each sample to the next, across the seam between buffers included.
+        let schedule =
+        [
+            (0_u32, full()),
+            (100, Volume::MUTED),
+            (160, full()),
+            (400, volume(COARSE_MAX - 1, FINE_MAX)),
+            (500, full()),
+        ];
+        for samples in (1..=64_u32).chain((65..=2_646).step_by(13))
         {
+            let mut caller = Caller::new(samples);
+            let len = samples as usize;
+            let sample_bound = SLEW_PER_MS * caller.buffer_ms() as f32 / len as f32 + EPSILON;
             let mut state = ControlState::new(0);
-            state.request(ToDsp::SetVolume(volume(VOLUME_MAX, VOLUME_MAX)));
-
-            let len = FIXTURE_BUFFER_SAMPLES as usize;
-            let bound = rate_bound(buffer_ms);
-            let sample_bound = bound / len as f32 + EPSILON;
-            let mut previous_end = 0.0_f32;
             let mut previous_sample = 0.0_f32;
+            let mut previous_end = 0.0_f32;
 
-            let observe = |index: u32, applied: Applied|
+            while caller.now_ms() <= 1_000
             {
+                for (at_ms, setting) in schedule
+                {
+                    if at_ms <= caller.now_ms()
+                    {
+                        state.request(ToDsp::SetVolume(setting));
+                    }
+                }
+                let (now_ms, applied) = caller.poll(&mut state);
                 assert!
                 (
                     (applied.gain_start() - previous_end).abs() < EPSILON,
-                    "buffers {index} and the one before it do not meet at {buffer_ms} ms"
-                );
-                assert!
-                (
-                    (applied.gain_end() - applied.gain_start()).abs() <= bound,
-                    "the gain outran the ramp over buffer {index} at {buffer_ms} ms"
+                    "buffers do not meet at {now_ms} ms with {samples} samples"
                 );
                 for sample in 0..len
                 {
@@ -524,16 +599,107 @@ mod tests
                     assert!
                     (
                         (gain - previous_sample).abs() <= sample_bound,
-                        "the gain stepped at sample {sample} of buffer {index} at {buffer_ms} ms"
+                        "the gain outran the slew at sample {sample} at {now_ms} ms with {samples} samples"
                     );
                     previous_sample = gain;
                 }
                 previous_end = applied.gain_end();
+            }
+            assert!((previous_end - 1.0).abs() < EPSILON, "the ramp never arrived with {samples} samples");
+        }
+    }
+
+    #[test]
+    fn every_single_step_ramps_between_the_shortest_and_the_longest_ramp()
+    {
+        // Every step of the coarse control at every fine value, and every fine
+        // move of one to nine values at every coarse step, both ways. Nine
+        // values is 1.7 dB, a phone with fifteen volume steps. The chain hands
+        // the ramp out a buffer at a time, so its end lands on the first
+        // buffer boundary past the ramp and the ceiling grows by one buffer
+        // less a millisecond.
+        for samples in [44_u32, 220, FIXTURE_BUFFER_SAMPLES, 441]
+        {
+            let mut caller = Caller::new(samples);
+            let ceiling_ms = GAIN_STEP_RAMP_MAX_MS + caller.buffer_ms() - 1;
+            let mut state = ControlState::new(0);
+
+            let mut check = |state: &mut ControlState, from: Volume, to: Volume|
+            {
+                let _ = ramp_ms(state, &mut caller, from);
+                for (start, end) in [(from, to), (to, from)]
+                {
+                    let took_ms = ramp_ms(state, &mut caller, end);
+                    assert!
+                    (
+                        (GAIN_RAMP_MS..=ceiling_ms).contains(&took_ms),
+                        "{start:?} to {end:?} took {took_ms} ms with {samples} samples"
+                    );
+                }
             };
 
-            let _ = drive(&mut state, 0, buffer_ms, 200, observe);
-            assert!((previous_end - 1.0).abs() < EPSILON, "the ramp never arrived");
+            for fine in 1..=FINE_MAX
+            {
+                for coarse in 1..=COARSE_MAX
+                {
+                    check(&mut state, volume(coarse, fine), volume(coarse - 1, fine));
+                }
+            }
+            for coarse in 1..=COARSE_MAX
+            {
+                for fine in 1..=FINE_MAX
+                {
+                    for moved in 1..=9_u8.min(fine)
+                    {
+                        check(&mut state, volume(coarse, fine), volume(coarse, fine - moved));
+                    }
+                }
+            }
         }
+    }
+
+    #[test]
+    fn the_widest_step_and_a_full_swing_take_their_derived_durations()
+    {
+        // At one millisecond a buffer the ramp reads to the millisecond. The 3
+        // dB step at the top spans 0.29205 of full scale, 49.94 ms at the slew
+        // limit. A full swing takes 171 ms, the longest that keeps that step
+        // under 50 ms. A 1.5 dB phone step, eight fine values, spans 0.15975
+        // and takes 27.32 ms. A single fine value ramps over the shortest
+        // ramp, 20 ms. The durations are literals, so a constant that drifts
+        // fails here.
+        let mut caller = Caller::new(44);
+        let mut state = ControlState::new(0);
+        let top_less_3_db = volume(COARSE_MAX - 1, FINE_MAX);
+        let phone_step_down = volume(COARSE_MAX, FINE_MAX - 8);
+
+        assert_eq!(ramp_ms(&mut state, &mut caller, full()), 171);
+        assert_eq!(ramp_ms(&mut state, &mut caller, top_less_3_db), 50);
+        assert_eq!(ramp_ms(&mut state, &mut caller, full()), 50);
+        assert_eq!(ramp_ms(&mut state, &mut caller, phone_step_down), 28);
+        assert_eq!(ramp_ms(&mut state, &mut caller, full()), 28);
+        assert_eq!(ramp_ms(&mut state, &mut caller, volume(COARSE_MAX, FINE_MAX - 1)), 20);
+        assert_eq!(ramp_ms(&mut state, &mut caller, full()), 20);
+        assert_eq!(ramp_ms(&mut state, &mut caller, Volume::MUTED), 171);
+    }
+
+    #[test]
+    fn a_ramp_lands_on_its_target_when_its_elapsed_time_reaches_the_duration()
+    {
+        // From coarse 1 fine 1 to coarse 1 fine 51 the gains sit more than a
+        // factor two apart, and `from + (to - from)` misses `to` in single
+        // precision. The ramp is the shortest, 20 ms, and the buffer ending on
+        // those 20 ms ends on the target to the bit.
+        let mut caller = Caller::new(44);
+        let mut state = ControlState::new(0);
+        let low = volume(1, 1);
+        let high = volume(1, 51);
+        let from = low.linear_gain();
+        let to = high.linear_gain();
+        assert_ne!((from + (to - from)).to_bits(), to.to_bits(), "the pair no longer rounds away");
+
+        let _ = ramp_ms(&mut state, &mut caller, low);
+        assert_eq!(ramp_ms(&mut state, &mut caller, high), GAIN_RAMP_MS);
     }
 
     #[test]
@@ -543,7 +709,7 @@ mod tests
         // seconds. The ramp moves by one buffer, which is all the audio the
         // chain produced.
         let mut state = ControlState::new(0);
-        state.request(ToDsp::SetVolume(volume(VOLUME_MAX, VOLUME_MAX)));
+        state.request(ToDsp::SetVolume(full()));
 
         let first = state.poll(0, FIXTURE_BUFFER_MS);
         let second = state.poll(5_000, FIXTURE_BUFFER_MS);
@@ -564,7 +730,7 @@ mod tests
         for back_ms in [1_u32, 100, 100_000, u32::MAX / 2]
         {
             let mut state = ControlState::new(1_000_000);
-            state.request(ToDsp::SetVolume(volume(VOLUME_MAX, VOLUME_MAX)));
+            state.request(ToDsp::SetVolume(full()));
 
             let bound = rate_bound(FIXTURE_BUFFER_MS);
             let mut now_ms = 1_000_000_u32;
@@ -597,183 +763,186 @@ mod tests
     }
 
     #[test]
-    fn a_wobbling_count_does_not_open_the_commit_window_early()
-    {
-        // A millisecond source that jitters by one count either way. The gate
-        // runs on audio produced, so the jitter buys no extra windows.
-        let mut state = ControlState::new(0);
-        let span_ms = 500_u32;
-        let buffers = span_ms / FIXTURE_BUFFER_MS;
-        let mut now_ms = 0_u32;
-        let mut previous = state.applied_volume();
-        let mut changes = 0_u32;
-
-        for index in 0..buffers
-        {
-            let level = if index % 2 == 0
-            {
-                VOLUME_MAX
-            }
-            else
-            {
-                0x00
-            };
-            state.request(ToDsp::SetVolume(volume(level, VOLUME_MAX)));
-            let _ = state.poll(now_ms, FIXTURE_BUFFER_MS);
-            let current = state.applied_volume();
-            if current != previous
-            {
-                changes += 1;
-                previous = current;
-            }
-            now_ms = now_ms.wrapping_add(FIXTURE_BUFFER_MS);
-            now_ms = if index % 2 == 0
-            {
-                now_ms.wrapping_sub(1)
-            }
-            else
-            {
-                now_ms.wrapping_add(1)
-            };
-        }
-
-        assert!(changes <= span_ms / GAIN_RAMP_MS + 1, "applied {changes} changes");
-    }
-
-    #[test]
-    fn a_burst_inside_one_window_applies_once_and_lands_on_the_newest_target()
+    fn a_burst_lands_on_the_newest_request_from_the_gain_in_flight()
     {
         let mut state = ControlState::new(0);
-        // A first setting closes the window behind it.
-        state.request(ToDsp::SetVolume(volume(0x10, 0x10)));
-        let _ = state.poll(0, FIXTURE_BUFFER_MS);
-        assert_eq!(state.applied_volume(), volume(0x10, 0x10));
+        state.request(ToDsp::SetVolume(full()));
+        let now_ms = drive(&mut state, 0, FIXTURE_BUFFER_MS, 8, |_, _| ());
+        let before = state.poll(now_ms, FIXTURE_BUFFER_MS);
+        assert!(before.gain_end() > 0.0 && before.gain_end() < 1.0, "the ramp is not in flight");
 
-        // A burst inside that window reaches nothing.
-        let mut now_ms = FIXTURE_BUFFER_MS;
-        while now_ms < GAIN_RAMP_MS
-        {
-            state.request(ToDsp::SetVolume(volume(0x00, 0x00)));
-            state.request(ToDsp::SetVolume(volume(VOLUME_MAX, VOLUME_MAX)));
-            let applied = state.poll(now_ms, FIXTURE_BUFFER_MS);
-            assert_eq!(state.applied_volume(), volume(0x10, 0x10));
-            assert!(applied.gain_end() >= 0.0);
-            now_ms += FIXTURE_BUFFER_MS;
-        }
+        // A burst before one poll: only the last request reaches the ramp, and
+        // the ramp turns where the gain stands.
+        let newest = volume(COARSE_DEFAULT, 0x40);
+        state.request(ToDsp::SetVolume(Volume::MUTED));
+        state.request(ToDsp::SetVolume(full()));
+        state.request(ToDsp::SetVolume(newest));
 
-        // The window opens on the newest request, not on the queue behind it.
-        let _ = state.poll(GAIN_RAMP_MS, FIXTURE_BUFFER_MS);
-        assert_eq!(state.applied_volume(), volume(VOLUME_MAX, VOLUME_MAX));
-    }
-
-    #[test]
-    fn an_alternating_flood_cannot_modulate_the_output()
-    {
-        // Valid frames at full and at zero, one per buffer, for a second. What
-        // reaches the drivers is the gain trace, so the bound is on the trace.
-        // A reversal costs a whole ramp, one per GAIN_RAMP_MS at most.
-        let mut state = ControlState::new(0);
-        let span_ms = 1_000_u32;
-        let buffers = span_ms / FIXTURE_BUFFER_MS;
         let bound = rate_bound(FIXTURE_BUFFER_MS);
-        let mut previous_end = 0.0_f32;
-        let mut reversals = 0_u32;
-        let mut rising = true;
-
-        for index in 0..buffers
+        let mut previous_end = before.gain_end();
+        let _ = drive(&mut state, now_ms + FIXTURE_BUFFER_MS, FIXTURE_BUFFER_MS, 40, |index, applied|
         {
-            let level = if index % 2 == 0
-            {
-                VOLUME_MAX
-            }
-            else
-            {
-                0x00
-            };
-            state.request(ToDsp::SetVolume(volume(level, VOLUME_MAX)));
-            let applied = state.poll(index * FIXTURE_BUFFER_MS, FIXTURE_BUFFER_MS);
-
-            assert!((applied.gain_start() - previous_end).abs() < EPSILON);
-            let moved = applied.gain_end() - applied.gain_start();
-            assert!(moved.abs() <= bound, "the gain moved {moved} over buffer {index}");
-            if moved.abs() > EPSILON
-            {
-                let now_rising = moved > 0.0;
-                if now_rising != rising
-                {
-                    reversals += 1;
-                    rising = now_rising;
-                }
-            }
+            assert!((applied.gain_start() - previous_end).abs() < EPSILON, "a step at buffer {index}");
+            assert!((applied.gain_end() - applied.gain_start()).abs() <= bound);
             previous_end = applied.gain_end();
-        }
-
-        assert!
-        (
-            reversals <= span_ms / GAIN_RAMP_MS + 1,
-            "the gain reversed {reversals} times"
-        );
+        });
+        assert_eq!(state.applied_volume(), newest);
+        assert_eq!(previous_end.to_bits(), newest.linear_gain().to_bits());
     }
 
-    #[test]
-    fn a_paced_sender_still_swings_the_gain()
+    /// Returns the widest swing of the gain over any stretch of `width` samples.
+    ///
+    /// `ends` holds the gain at every buffer end, `samples` apart, and the gain
+    /// runs linearly between two ends. On linear pieces the extremes of a
+    /// stretch sit on its two edges or on a buffer end inside it, and the swing
+    /// is convex between two positions where an edge crosses a buffer end, so
+    /// the widest stretch starts or finishes on a buffer end.
+    #[expect
+    (
+        clippy::arithmetic_side_effects,
+        reason = "the positions count samples of a trace held in memory, and a buffer holds at \
+                  least one sample"
+    )]
+    fn widest_swing(ends: &[f32], samples: usize, width: usize) -> f32
     {
-        // What the gate does NOT do. A sender pacing itself to the window
-        // drives the gain between its extremes at one half of 1000 /
-        // GAIN_RAMP_MS hertz. The rate is bounded, the envelope is not, and the
-        // limiters have to absorb it.
-        let mut state = ControlState::new(0);
-        let mut now_ms = 0_u32;
-        let mut lowest = 1.0_f32;
-        let mut highest = 0.0_f32;
-
-        for index in 0..40_u32
+        let span = (ends.len() - 1) * samples;
+        let gain_at = |at: usize| -> f32
         {
-            let level = if index % 2 == 0
+            let index = at / samples;
+            let fraction = (at % samples) as f32 / samples as f32;
+            match (ends.get(index), ends.get(index + 1))
             {
-                VOLUME_MAX
+                (Some(&low), Some(&high)) => low + (high - low) * fraction,
+                (Some(&last), None) => last,
+                _ => panic!("sample {at} lies past the trace"),
             }
-            else
+        };
+
+        let mut widest = 0.0_f32;
+        for index in 0..ends.len()
+        {
+            let edge = index * samples;
+            for start in [Some(edge), edge.checked_sub(width)].into_iter().flatten()
             {
-                0x00
-            };
-            state.request(ToDsp::SetVolume(volume(level, VOLUME_MAX)));
-            for _ in 0..GAIN_RAMP_MS
-            {
-                let applied = state.poll(now_ms, 1);
-                now_ms = now_ms.wrapping_add(1);
-                if index >= 4
+                let finish = start + width;
+                if finish > span
                 {
-                    lowest = lowest.min(applied.gain_end());
-                    highest = highest.max(applied.gain_end());
+                    continue;
                 }
+                let mut lowest = gain_at(start).min(gain_at(finish));
+                let mut highest = gain_at(start).max(gain_at(finish));
+                for &gain in ends.iter().take(finish.div_ceil(samples)).skip(start / samples + 1)
+                {
+                    lowest = lowest.min(gain);
+                    highest = highest.max(gain);
+                }
+                widest = widest.max(highest - lowest);
             }
         }
-
-        assert!
-        (
-            highest - lowest > 0.9,
-            "the residual envelope measured {}",
-            highest - lowest
-        );
+        widest
     }
 
     #[test]
-    fn changes_spaced_wider_than_the_window_each_apply()
+    fn a_paced_sender_swings_the_gain_no_wider_than_the_slew_allows()
+    {
+        // A sender reversing between silence and full scale on its own clock,
+        // off the millisecond grid, at half periods from 0.3 ms, faster than
+        // any buffer, to 120 ms, and at three phases. Fixed stretches of sound
+        // slide over the gain the chain hands out, whatever the sender period.
+        //
+        // A count reading the sound produced in whole milliseconds bounds the
+        // swing over `W` ms by `W + 1` ms at the slew limit. A count read up to
+        // one buffer late, at a lateness changing on every poll, widens it by
+        // that buffer.
+        let rate = u64::from(SAMPLE_RATE_HZ);
+        for samples in [128_u32, 240, 250, 255, FIXTURE_BUFFER_SAMPLES, 257, 265, 272, 384, 512]
+        {
+            let declared_ms = samples.saturating_mul(1_000).div_ceil(SAMPLE_RATE_HZ);
+            let buffer_ms = samples as f32 * 1_000.0 / SAMPLE_RATE_HZ as f32;
+            let mut half_us = 300_u64;
+            while half_us <= 120_000
+            {
+                for phase in 0..3_u64
+                {
+                    let phase_us = phase * half_us / 3 + 17;
+                    for late in [false, true]
+                    {
+                        let mut state = ControlState::new(0);
+                        let mut ends: Vec<f32> = Vec::new();
+                        let mut polls = 0_u64;
+                        while polls * u64::from(samples) <= rate
+                        {
+                            let position = polls * u64::from(samples);
+                            let lag = if late
+                            {
+                                (polls.wrapping_mul(2_654_435_761) >> 7) % u64::from(samples)
+                            }
+                            else
+                            {
+                                0
+                            };
+                            let sender_us = position * 1_000_000 / rate + phase_us;
+                            let level = if (sender_us / half_us).is_multiple_of(2)
+                            {
+                                full()
+                            }
+                            else
+                            {
+                                Volume::MUTED
+                            };
+                            state.request(ToDsp::SetVolume(level));
+                            let now_ms = match u32::try_from((position + lag) * 1_000 / rate)
+                            {
+                                Ok(now_ms) => now_ms,
+                                Err(error) => panic!("the caller count overflowed: {error:?}"),
+                            };
+                            let applied = state.poll(now_ms, declared_ms);
+                            if polls == 0
+                            {
+                                ends.push(applied.gain_start());
+                            }
+                            ends.push(applied.gain_end());
+                            polls += 1;
+                        }
+
+                        for window_ms in [10_u32, 20, 40, 100]
+                        {
+                            let width = (window_ms * SAMPLE_RATE_HZ / 1_000) as usize;
+                            let widened_ms = if late { buffer_ms } else { 0.0 };
+                            let bound = SLEW_PER_MS * (window_ms as f32 + widened_ms + 1.0) + EPSILON;
+                            let swing = widest_swing(&ends, samples as usize, width);
+                            assert!
+                            (
+                                swing <= bound,
+                                "a sender at {half_us} us, phase {phase_us} us, swung the gain by \
+                                 {swing} over {window_ms} ms against {bound}, with {samples} \
+                                 samples, late {late}"
+                            );
+                        }
+                    }
+                }
+                half_us = half_us * 23 / 20 + 131;
+            }
+        }
+    }
+
+    #[test]
+    fn spaced_changes_each_arrive_on_their_target()
     {
         let mut state = ControlState::new(0);
         let mut now_ms = 0_u32;
-        for level in [0x10_u8, 0x20, 0x30, 0x40]
+        for coarse in [1_u8, 4, COARSE_DEFAULT, 9, COARSE_MAX]
         {
-            let expected = volume(level, VOLUME_MAX);
+            let expected = volume(coarse, FINE_MAX);
             state.request(ToDsp::SetVolume(expected));
             let _ = state.poll(now_ms, FIXTURE_BUFFER_MS);
             assert_eq!(state.applied_volume(), expected);
 
-            now_ms = drive(&mut state, now_ms + FIXTURE_BUFFER_MS, FIXTURE_BUFFER_MS, GAIN_RAMP_MS, |_, _| ());
+            let buffers = GAIN_FULL_SWING_MS.div_ceil(FIXTURE_BUFFER_MS);
+            now_ms = drive(&mut state, now_ms + FIXTURE_BUFFER_MS, FIXTURE_BUFFER_MS, buffers, |_, _| ());
             let applied = state.poll(now_ms, FIXTURE_BUFFER_MS);
             now_ms += FIXTURE_BUFFER_MS;
-            assert!((applied.gain_end() - expected.linear_gain()).abs() < EPSILON);
+            assert_eq!(applied.gain_end().to_bits(), expected.linear_gain().to_bits());
         }
     }
 
@@ -781,10 +950,10 @@ mod tests
     fn the_ramp_is_monotonic_between_its_endpoints()
     {
         let mut state = ControlState::new(0);
-        state.request(ToDsp::SetVolume(volume(VOLUME_MAX, VOLUME_MAX)));
+        state.request(ToDsp::SetVolume(full()));
 
         let mut previous = -1.0_f32;
-        let _ = drive(&mut state, 0, FIXTURE_BUFFER_MS, 2 * GAIN_RAMP_MS, |index, applied|
+        let _ = drive(&mut state, 0, FIXTURE_BUFFER_MS, FULL_SWING_BUFFERS, |index, applied|
         {
             assert!(applied.gain_start() >= previous, "the gain fell at buffer {index}");
             assert!(applied.gain_end() >= applied.gain_start(), "the gain fell inside {index}");
@@ -797,12 +966,12 @@ mod tests
     fn a_ramp_down_is_monotonic_too()
     {
         let mut state = ControlState::new(0);
-        state.request(ToDsp::SetVolume(volume(VOLUME_MAX, VOLUME_MAX)));
-        let now_ms = drive(&mut state, 0, FIXTURE_BUFFER_MS, 2 * GAIN_RAMP_MS, |_, _| ());
+        state.request(ToDsp::SetVolume(full()));
+        let now_ms = drive(&mut state, 0, FIXTURE_BUFFER_MS, FULL_SWING_BUFFERS, |_, _| ());
 
-        state.request(ToDsp::SetVolume(volume(0x00, 0x00)));
+        state.request(ToDsp::SetVolume(Volume::MUTED));
         let mut previous = 2.0_f32;
-        let _ = drive(&mut state, now_ms, FIXTURE_BUFFER_MS, 2 * GAIN_RAMP_MS, |index, applied|
+        let _ = drive(&mut state, now_ms, FIXTURE_BUFFER_MS, FULL_SWING_BUFFERS, |index, applied|
         {
             assert!(applied.gain_start() <= previous, "the gain rose at buffer {index}");
             assert!(applied.gain_end() <= applied.gain_start(), "the gain rose inside {index}");
@@ -814,52 +983,131 @@ mod tests
     #[test]
     fn a_preset_change_is_never_applied_as_a_step()
     {
-        let mut state = ControlState::new(0);
-        state.request(ToDsp::SetVolume(volume(VOLUME_MAX, VOLUME_MAX)));
-        let now_ms = drive(&mut state, 0, FIXTURE_BUFFER_MS, 2 * GAIN_RAMP_MS, |_, _| ());
-
-        state.request(ToDsp::SelectPreset(Preset::Garden));
-        let bound = rate_bound(FIXTURE_BUFFER_MS);
-        let mut previous_preset = Preset::Flat;
-        let mut previous_end = 1.0_f32;
-        let mut swapped_at_silence = false;
-        let mut final_gain = 0.0_f32;
-
-        let _ = drive(&mut state, now_ms, FIXTURE_BUFFER_MS, 6 * GAIN_RAMP_MS, |index, applied|
+        // Each starting gain and buffer period leaves a different last value
+        // above silence on the mute ramp, some of them under a thousandth. The
+        // coefficients move only on a buffer whose two ends are zero to the
+        // bit. The preset lands on a settled gain, and on a volume ramp in
+        // flight two buffers after its request.
+        let mut starts: Vec<Volume> = (1..=COARSE_MAX).map(|coarse| volume(coarse, FINE_MAX)).collect();
+        for coarse in [1_u8, COARSE_DEFAULT, COARSE_MAX]
         {
-            assert!((applied.gain_start() - previous_end).abs() < EPSILON);
-            assert!
-            (
-                (applied.gain_end() - applied.gain_start()).abs() <= bound,
-                "the gain jumped over buffer {index}"
-            );
-            if applied.preset() != previous_preset
+            for fine in [1_u8, 2, 8, 0x20, 0x40, 0x60]
             {
-                // The coefficients may only move while nothing comes out.
-                assert!(applied.gain_start().abs() < EPSILON, "coefficients moved under signal");
-                assert!(applied.gain_end().abs() < EPSILON, "coefficients moved under signal");
-                swapped_at_silence = true;
-                previous_preset = applied.preset();
+                starts.push(volume(coarse, fine));
             }
-            previous_end = applied.gain_end();
-            final_gain = applied.gain_end();
-        });
+        }
 
-        assert!(swapped_at_silence, "the preset never reached the chain");
-        assert_eq!(previous_preset, Preset::Garden);
-        assert!((final_gain - 1.0).abs() < EPSILON);
+        let cases = [44_u32, 220, FIXTURE_BUFFER_SAMPLES, 441]
+            .into_iter()
+            .flat_map(|samples| starts.iter().map(move |&start| (samples, start)))
+            .flat_map(|(samples, start)| [false, true].map(|in_flight| (samples, start, in_flight)));
+        for (samples, start, in_flight) in cases
+        {
+            let mut caller = Caller::new(samples);
+            let mut state = ControlState::new(0);
+            let _ = ramp_ms(&mut state, &mut caller, start);
+            let mut settled = start;
+            let mut previous_end = start.linear_gain();
+            if in_flight
+            {
+                settled = if start == full()
+                {
+                    volume(COARSE_DEFAULT, FINE_MAX)
+                }
+                else
+                {
+                    full()
+                };
+                state.request(ToDsp::SetVolume(settled));
+                for _ in 0..2
+                {
+                    let (_, applied) = caller.poll(&mut state);
+                    previous_end = applied.gain_end();
+                }
+            }
+
+            state.request(ToDsp::SelectPreset(Preset::Garden));
+            let bound = rate_bound(caller.buffer_ms());
+            let target = settled.linear_gain();
+            let mut swapped = false;
+
+            for _ in 0..3 * GAIN_FULL_SWING_MS
+            {
+                let (now_ms, applied) = caller.poll(&mut state);
+                assert!((applied.gain_start() - previous_end).abs() < EPSILON);
+                assert!
+                (
+                    (applied.gain_end() - applied.gain_start()).abs() <= bound,
+                    "the gain jumped at {now_ms} ms from {start:?} with {samples} samples"
+                );
+                if applied.preset() == Preset::Garden && !swapped
+                {
+                    // The coefficients may only move while nothing comes out.
+                    assert_eq!
+                    (
+                        (applied.gain_start().to_bits(), applied.gain_end().to_bits()),
+                        (0, 0),
+                        "coefficients moved under signal from {start:?} with {samples} samples"
+                    );
+                    swapped = true;
+                }
+                previous_end = applied.gain_end();
+            }
+
+            assert!(swapped, "the preset never reached the chain from {start:?}");
+            assert_eq!
+            (
+                previous_end.to_bits(),
+                target.to_bits(),
+                "the gain never came back from {start:?} with {samples} samples"
+            );
+        }
+    }
+
+    #[test]
+    fn a_ramp_that_arrived_long_ago_stays_on_its_target()
+    {
+        // The elapsed time of a ramp saturates, so a gain held for longer than
+        // a `u32` of milliseconds, 49.7 days, never replays the ramp that
+        // brought it there.
+        let moves =
+        [
+            (full(), Volume::MUTED),
+            (Volume::MUTED, full()),
+            (full(), volume(COARSE_DEFAULT, 0x40)),
+        ];
+        for (first, then) in moves
+        {
+            let mut caller = Caller::new(FIXTURE_BUFFER_SAMPLES);
+            let mut state = ControlState::new(0);
+            let _ = ramp_ms(&mut state, &mut caller, first);
+            let _ = ramp_ms(&mut state, &mut caller, then);
+
+            state.ramp.elapsed_ms = u32::MAX - 1;
+            let target = then.linear_gain().to_bits();
+            for index in 0..8
+            {
+                let (_, applied) = caller.poll(&mut state);
+                assert_eq!
+                (
+                    (applied.gain_start().to_bits(), applied.gain_end().to_bits()),
+                    (target, target),
+                    "the gain left {then:?} at buffer {index} past the end of the count"
+                );
+            }
+        }
     }
 
     #[test]
     fn a_heartbeat_changes_no_setting()
     {
         let mut state = ControlState::new(0);
-        state.request(ToDsp::SetVolume(volume(0x40, 0x40)));
+        state.request(ToDsp::SetVolume(volume(COARSE_DEFAULT, 0x40)));
         let _ = state.poll(0, FIXTURE_BUFFER_MS);
         let before = state.applied_volume();
 
         state.request(ToDsp::Heartbeat);
-        let now_ms = drive(&mut state, FIXTURE_BUFFER_MS, FIXTURE_BUFFER_MS, 4 * GAIN_RAMP_MS, |_, _| ());
+        let now_ms = drive(&mut state, FIXTURE_BUFFER_MS, FIXTURE_BUFFER_MS, FULL_SWING_BUFFERS, |_, _| ());
         assert_eq!(state.applied_volume(), before);
         assert_eq!(state.poll(now_ms, FIXTURE_BUFFER_MS).preset(), Preset::Flat);
     }
@@ -971,30 +1219,25 @@ mod tests
     }
 
     #[test]
-    fn a_declared_period_of_zero_does_not_freeze_the_gate()
+    fn a_declared_period_of_zero_does_not_freeze_the_ramp()
     {
         // A caller computing its period as samples times 1000 over the sample
         // rate reads zero for any buffer under 45 samples.
         let mut state = ControlState::new(0);
-        state.request(ToDsp::SetVolume(volume(0x10, 0x10)));
+        state.request(ToDsp::SetVolume(volume(COARSE_DEFAULT, 0x10)));
         let _ = state.poll(0, 0);
-        assert_eq!(state.applied_volume(), volume(0x10, 0x10));
+        assert_eq!(state.applied_volume(), volume(COARSE_DEFAULT, 0x10));
 
-        state.request(ToDsp::SetVolume(volume(VOLUME_MAX, VOLUME_MAX)));
+        state.request(ToDsp::SetVolume(full()));
         let mut now_ms = 0_u32;
         let mut applied = state.poll(now_ms, 0);
-        while now_ms < 4 * GAIN_RAMP_MS
+        while now_ms < 2 * GAIN_FULL_SWING_MS
         {
             now_ms += 1;
             applied = state.poll(now_ms, 0);
         }
 
-        assert_eq!
-        (
-            state.applied_volume(),
-            volume(VOLUME_MAX, VOLUME_MAX),
-            "the commit window never reopened"
-        );
+        assert_eq!(state.applied_volume(), full(), "the request never reached the ramp");
         assert!
         (
             (applied.gain_end() - 1.0).abs() < EPSILON,
@@ -1009,11 +1252,11 @@ mod tests
     {
         let start = u32::MAX - 4;
         let mut state = ControlState::new(start);
-        state.request(ToDsp::SetVolume(volume(VOLUME_MAX, VOLUME_MAX)));
+        state.request(ToDsp::SetVolume(full()));
 
         let bound = rate_bound(FIXTURE_BUFFER_MS);
         let mut previous_end = 0.0_f32;
-        let _ = drive(&mut state, start, FIXTURE_BUFFER_MS, 2 * GAIN_RAMP_MS, |index, applied|
+        let _ = drive(&mut state, start, FIXTURE_BUFFER_MS, FULL_SWING_BUFFERS, |index, applied|
         {
             assert!
             (
