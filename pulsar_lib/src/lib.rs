@@ -9,11 +9,11 @@
 //! audio clock and the output transport, and the gate that raises the converter
 //! mute line once every stage feeding the converters has reported. It also
 //! holds the bridge the control board runs between its A2DP sink and the I2S
-//! link: the stream gate, the frame ring and the widening of each sample into
-//! its slot. A plan carries the field encodings, the bounds and the read-back
-//! comparison, so the firmware that writes the registers is the register block
-//! and nothing else, and every rule is tested on a host. Nothing here touches a
-//! peripheral.
+//! link: the stream gate, the frame ring and its drift correction, and the
+//! widening of each sample into its slot. A plan carries the field encodings,
+//! the bounds and the read-back comparison, so the firmware that writes the
+//! registers is the register block and nothing else, and every rule is tested
+//! on a host. Nothing here touches a peripheral.
 
 #![no_std]
 

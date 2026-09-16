@@ -10,9 +10,11 @@
 //! Bluetooth callback task. A dedicated thread pumps the bridge into the I2S
 //! transmit channel, which runs as target on the clocks of the processing
 //! board. The two share the bridge through a mutex that each side holds for one
-//! copy: the push of one decoded chunk, or the drain of one block. On ESP-IDF
+//! copy: the push of one decoded chunk, or the drain of one block, which also
+//! runs the drift correction. On ESP-IDF
 //! `std::sync::Mutex` is a pthread mutex, which ESP-IDF builds on a `FreeRTOS`
-//! mutex with priority inheritance.
+//! mutex with priority inheritance. The pump thread logs the statistics of the
+//! bridge every `STATS_PERIOD_BLOCKS` blocks, and the callback task logs none.
 //!
 //! Nothing here writes non-volatile storage. Bluedroid starts without NVS and
 //! keeps no bond across a reset, so a phone pairs again after each boot.
@@ -41,8 +43,16 @@ use esp_idf_svc::hal::i2s::{I2sDriver, I2sTx};
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration;
 use esp_idf_svc::log::EspLogger;
-use esp_idf_svc::sys::{ESP_ERR_TIMEOUT, EspError, link_patches};
-use pulsar_lib::bridge::{self, Bridge, FrameSource, SlotWriter, StreamCodec, StreamVerdict};
+use esp_idf_svc::sys::{ESP_ERR_TIMEOUT, EspError, link_patches, uxTaskGetStackHighWaterMark};
+use pulsar_lib::bridge::{
+    self,
+    Bridge,
+    BridgeStats,
+    FrameSource,
+    SlotWriter,
+    StreamCodec,
+    StreamVerdict,
+};
 use pulsar_lib::constants::SAMPLE_RATE_HZ;
 
 /// Name the board advertises to phones.
@@ -59,6 +69,10 @@ const WRITE_TIMEOUT: TickType = TickType::new_millis(100);
 
 /// Pause after a failed pump, so a channel that keeps failing does not spin.
 const PUMP_RETRY: Duration = Duration::from_millis(100);
+
+/// Pumped blocks between two statistics lines, 5.0 s of blocks of
+/// `bridge::BLOCK_FRAMES` frames at 44.1 kHz.
+const STATS_PERIOD_BLOCKS: u32 = 919;
 
 /// Bridge between the A2DP callback and the pump thread.
 static BRIDGE: Mutex<Bridge<{ bridge::RING_FRAMES }>> =
@@ -184,15 +198,70 @@ fn on_gap(event: &GapEvent<'_>)
     }
 }
 
+/// Returns the least free stack, in bytes, the calling task has had since it
+/// started.
+#[allow(unsafe_code)]
+fn stack_headroom() -> u32
+{
+    // SAFETY: ESP-IDF FreeRTOS `uxTaskGetStackHighWaterMark` reads the stack of
+    // the task it names and, given a null handle, of the calling task, which
+    // is alive for the whole call. It writes nothing and returns bytes.
+    unsafe { uxTaskGetStackHighWaterMark(core::ptr::null_mut()) }
+}
+
+/// Logs one line of `stats` with the stack headroom of the pump thread, unless
+/// the period saw no stream at all.
+fn log_stats(stats: &BridgeStats)
+{
+    if stats.samples == 0 && stats.dropped == 0 && stats.underruns == 0 && stats.trimmed == 0
+    {
+        return;
+    }
+
+    println!
+    (
+        "bridge: fill {}..{} mean {} over {} drains, corrections +{} -{}, dropped {}, trimmed {}, underruns {}, pump stack free {} of {} bytes",
+        stats.fill_min,
+        stats.fill_max,
+        stats.fill_mean,
+        stats.samples,
+        stats.inserted,
+        stats.removed,
+        stats.dropped,
+        stats.trimmed,
+        stats.underruns,
+        stack_headroom(),
+        PUMP_STACK_BYTES
+    );
+}
+
 /// Pumps the bridge into the link, one block at a time, for ever.
+///
+/// Every `STATS_PERIOD_BLOCKS` pumps it takes the statistics of the bridge
+/// under the lock and logs them outside it.
 fn run_pump(mut link: Link) -> !
 {
     let mut pcm = [0; bridge::BLOCK_FRAMES * bridge::PCM_FRAME_BYTES];
     let mut slots = [0; bridge::BLOCK_FRAMES * bridge::SLOT_FRAME_BYTES];
     let mut failing = false;
+    let mut pumped: u32 = 0;
 
     loop
     {
+        pumped = pumped.saturating_add(1);
+
+        if pumped >= STATS_PERIOD_BLOCKS
+        {
+            pumped = 0;
+            let mut stats = None;
+            with_bridge(|shared| stats = Some(shared.take_stats()));
+
+            if let Some(stats) = stats
+            {
+                log_stats(&stats);
+            }
+        }
+
         match bridge::pump(&mut SharedBridge, &mut pcm, &mut slots, &mut link)
         {
             Ok(_) => failing = false,
