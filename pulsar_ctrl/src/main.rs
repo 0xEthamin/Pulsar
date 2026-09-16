@@ -153,10 +153,10 @@ fn start_stream(codec: &Codec)
 
     match verdict
     {
-        Some(StreamVerdict::Forward) => {}
+        Some(StreamVerdict::Forward(_)) => {}
         Some(refused) => println!
         (
-            "A2DP stream refused ({refused:?}), the chain takes SBC at {SAMPLE_RATE_HZ} Hz on two channels: forwarding silence"
+            "A2DP stream refused ({refused:?}), the chain takes SBC at {SAMPLE_RATE_HZ} Hz: forwarding silence"
         ),
         None => println!("A2DP stream not started, the bridge lock is poisoned"),
     }

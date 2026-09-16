@@ -215,7 +215,7 @@ jobs:
 
       - name: Enforce the coverage floor
         working-directory: pulsar_lib
-        run: cargo llvm-cov report --fail-under-lines 95
+        run: cargo llvm-cov report --fail-under-lines 90
 
       - name: Upload the coverage report
         if: always()

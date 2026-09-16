@@ -214,7 +214,7 @@ static CARRY_SHIFT: AtomicU32 = AtomicU32::new(u32::MAX);
 /// reads and writes this static on every frame, the coefficients it does not
 /// hoist, the four history words of every section and the state of the
 /// limiter, and those are most of the accesses a frame makes to this memory.
-/// The rest are the source word and the four output words. The module
+/// The rest are the two source words and the four output words. The module
 /// documentation of `pulsar_lib::passthrough` carries the count and what it
 /// costs.
 ///
@@ -790,7 +790,7 @@ impl InputInterface for Input<'_>
     #[expect
     (
         clippy::inline_always,
-        reason = "the carry reaches this once a frame, and the fold is what \
+        reason = "the carry reaches this twice a frame, and the fold is what \
                   leaves the whole frame one straight line with no call in \
                   it, read on the linked image, which is what keeps a block \
                   of the carry inside the block the streams read"
