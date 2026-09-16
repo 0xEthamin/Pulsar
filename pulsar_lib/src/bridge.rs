@@ -1,20 +1,23 @@
 //! Bridge from the A2DP sink of the control board to its I2S slot stream.
 //!
-//! Bluedroid hands the sink 16-bit signed PCM, two channels interleaved, left
-//! first, little endian. The processing board clocks the I2S link as master,
-//! Philips format, two 32-bit slots per frame, and reads slot 0. Everything
+//! Bluedroid hands the sink 16-bit signed PCM, little endian, one sample per
+//! frame on a mono stream and two channels interleaved, left first, on any
+//! other. The processing board clocks the I2S link as master, Philips format,
+//! two 32-bit slots per frame, and plays the mean of the two slots. Everything
 //! between the two that touches a sample lives here: the frame ring that
 //! absorbs the drift between the clock of the phone and the clock of the link,
-//! the stream gate, the widening of each sample into its slot, and the pump that
-//! moves one block from the ring to the link through `SlotWriter`.
+//! the stream gate, the framing of a mono sample into two channels, the
+//! widening of each sample into its slot, and the pump that moves one block
+//! from the ring to the link through `SlotWriter`.
 //!
 //! # Frames, never bytes
 //!
-//! The ring stores whole frames, so no push, drop or drain can split a frame or
-//! swap its two channels. A chunk whose length is not a whole number of frames
-//! loses its trailing partial frame, and the next chunk starts on a frame
-//! boundary again. Bluedroid decodes whole SBC frames, so a trailing partial
-//! frame only comes from a malformed chunk.
+//! The ring stores whole frames of two channels, so no push, drop or drain can
+//! split a frame or swap its two channels. A chunk whose length is not a whole
+//! number of frames of its stream, two bytes on a mono stream and four on any
+//! other, loses its trailing partial frame, and the next chunk starts on a
+//! frame boundary again. Bluedroid decodes whole SBC frames, so a trailing
+//! partial frame only comes from a malformed chunk.
 //!
 //! # Drift
 //!
@@ -110,13 +113,19 @@
 //!
 //! # The stream gate
 //!
-//! The whole chain runs at 44.1 kHz on two channels. The gate opens for SBC at
-//! 44.1 kHz in joint stereo, stereo or dual channel mode, and every negotiation
-//! decides again from the codec it carries. Any other stream leaves the gate
-//! closed: every push drops its frames and the pump writes silence. Bluedroid
-//! sets the PCM stride of its SBC decoder to the channel count, so a mono stream
-//! arrives as one 16-bit sample per frame, which the ring would pair into false
-//! stereo.
+//! The whole chain runs at 44.1 kHz. The gate opens for SBC at 44.1 kHz in
+//! every channel mode, mono, dual channel, stereo and joint stereo, which is
+//! the set A2DP 1.4.1 table 4.3 makes mandatory for a sink, and every
+//! negotiation decides again from the codec it carries. Any other stream leaves
+//! the gate closed: every push drops its frames and the pump writes silence.
+//!
+//! Bluedroid sets the PCM stride of its SBC decoder to the channel count, so a
+//! mono stream arrives as one 16-bit sample per frame. A push on a mono stream
+//! writes that sample into both channels of the frame the ring stores, so the
+//! ring, the drift correction, the fades and the pump run on frames of two
+//! channels whatever the stream. That copy is framing, as the widening into
+//! slots is: no sample changes value, and the mean the processing board takes
+//! of two equal slots is the sample itself.
 
 use crate::constants::SAMPLE_RATE_HZ;
 
@@ -583,6 +592,9 @@ const SBC_48_KHZ: u8 = 0x10;
 /// Channel mode bit of mono.
 const SBC_MONO: u8 = 0x08;
 
+/// Bytes of one decoded PCM frame of a mono stream: one 16-bit sample.
+const MONO_FRAME_BYTES: usize = 2;
+
 /// Codec of a negotiated A2DP stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamCodec
@@ -594,18 +606,27 @@ pub enum StreamCodec
     Other,
 }
 
+/// Channels the decoder of a forwarded stream puts in one PCM frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Channels
+{
+    /// One sample per frame, from SBC in mono.
+    Mono,
+    /// Two samples per frame, left first, from SBC in any other channel mode.
+    Stereo,
+}
+
 /// Verdict of the stream gate on a negotiated stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamVerdict
 {
-    /// SBC at the rate of the chain on two channels. The bridge forwards it.
-    Forward,
+    /// SBC at the rate of the chain. The bridge forwards it, and the channels
+    /// name how its decoded frames are laid out.
+    Forward(Channels),
     /// A codec other than SBC.
     NotSbc,
     /// SBC at another sampling frequency, in hertz.
     WrongRate(u32),
-    /// SBC in mono.
-    Mono,
     /// SBC whose octet 0 names no single sampling frequency or no single
     /// channel mode.
     Malformed,
@@ -613,9 +634,10 @@ pub enum StreamVerdict
 
 /// Returns the verdict of the stream gate on `codec`.
 ///
-/// Forwards SBC at 44.1 kHz in joint stereo, stereo or dual channel mode. A
-/// configured stream names exactly one sampling frequency and one channel
-/// mode, so an octet with none or several of either is `Malformed`.
+/// Forwards SBC at 44.1 kHz in every channel mode, mono as `Channels::Mono`
+/// and the three others as `Channels::Stereo`. A configured stream names
+/// exactly one sampling frequency and one channel mode, so an octet with none
+/// or several of either is `Malformed`.
 #[must_use]
 pub const fn stream_verdict(codec: StreamCodec) -> StreamVerdict
 {
@@ -649,10 +671,10 @@ pub const fn stream_verdict(codec: StreamCodec) -> StreamVerdict
 
     if mode == SBC_MONO
     {
-        return StreamVerdict::Mono;
+        return StreamVerdict::Forward(Channels::Mono);
     }
 
-    StreamVerdict::Forward
+    StreamVerdict::Forward(Channels::Stereo)
 }
 
 /// What a push did with a chunk.
@@ -1128,6 +1150,8 @@ pub struct Bridge<const FRAMES: usize>
     ring: FrameRing<FRAMES>,
     prefill: usize,
     forwarding: bool,
+    /// The layout of the decoded frames a push takes, from the last `open`.
+    channels: Channels,
     largest_chunk: usize,
     burst: usize,
     waited: u32,
@@ -1310,6 +1334,7 @@ impl<const FRAMES: usize> Bridge<FRAMES>
             ring: FrameRing::new(),
             prefill,
             forwarding: false,
+            channels: Channels::Stereo,
             largest_chunk: 0,
             burst: 0,
             waited: 0,
@@ -1328,14 +1353,25 @@ impl<const FRAMES: usize> Bridge<FRAMES>
     ///
     /// Returns the verdict of `stream_verdict` on `codec`. The gate opens on
     /// `Forward` and closes on every other verdict, whatever the previous
-    /// stream was.
+    /// stream was, and the pushes that follow take the channels `Forward`
+    /// names.
     pub fn open(&mut self, codec: StreamCodec) -> StreamVerdict
     {
         self.flush();
         self.largest_chunk = 0;
         self.delivery = Delivery::new();
         let verdict = stream_verdict(codec);
-        self.forwarding = matches!(verdict, StreamVerdict::Forward);
+
+        if let StreamVerdict::Forward(channels) = verdict
+        {
+            self.forwarding = true;
+            self.channels = channels;
+        }
+        else
+        {
+            self.forwarding = false;
+        }
+
         verdict
     }
 
@@ -1393,25 +1429,49 @@ impl<const FRAMES: usize> Bridge<FRAMES>
 
     /// Pushes a chunk of decoded PCM.
     ///
-    /// The ring takes the leading whole frames of `pcm` that fit and drops the
-    /// rest of the whole frames. A ring that corrects and has not started makes
-    /// room instead by dropping its oldest frames, counted in
-    /// `BridgeStats::trimmed`. A closed gate drops every frame. A trailing
-    /// partial frame is discarded in every case. A push that drops frames from
-    /// a started ring that corrects marks the place for the output to fade
-    /// around, and every push measures the gap since the one before it.
+    /// A frame of `pcm` is the layout the last `open` named: one sample on a
+    /// mono stream, which goes into both channels of the frame the ring
+    /// stores, and two on a stereo one. The ring takes the leading whole frames
+    /// of `pcm` that fit and drops the rest of the whole frames. A ring that
+    /// corrects and has not started makes room instead by dropping its oldest
+    /// frames, counted in `BridgeStats::trimmed`. A closed gate drops every
+    /// frame. A trailing partial frame is discarded in every case. A push that
+    /// drops frames from a started ring that corrects marks the place for the
+    /// output to fade around, and every push measures the gap since the one
+    /// before it.
     pub fn push(&mut self, pcm: &[u8]) -> Pushed
     {
-        let (frames, partial) = pcm.as_chunks::<PCM_FRAME_BYTES>();
+        match self.channels
+        {
+            Channels::Mono =>
+            {
+                let (samples, partial) = pcm.as_chunks::<MONO_FRAME_BYTES>();
+                let frames = samples.iter().map(|&[low, high]| [low, high, low, high]);
+                self.push_frames(frames, samples.len(), partial.len())
+            }
+            Channels::Stereo =>
+            {
+                let (frames, partial) = pcm.as_chunks::<PCM_FRAME_BYTES>();
+                self.push_frames(frames.iter().copied(), frames.len(), partial.len())
+            }
+        }
+    }
+
+    /// Pushes `count` stored frames, a chunk trailing `trailing` bytes of a
+    /// partial frame. `push` is the whole of its contract.
+    fn push_frames<I>(&mut self, frames: I, count: usize, trailing: usize) -> Pushed
+    where
+        I: Iterator<Item = [u8; PCM_FRAME_BYTES]>,
+    {
         let mut pushed = Pushed
         {
-            trailing_bytes: partial.len(),
+            trailing_bytes: trailing,
             ..Pushed::default()
         };
-        self.largest_chunk = self.largest_chunk.max(frames.len());
+        self.largest_chunk = self.largest_chunk.max(count);
         let evicts = self.drift.is_none() && Self::corrects();
 
-        for &frame in frames
+        for frame in frames
         {
             if !self.forwarding
             {
@@ -1440,7 +1500,7 @@ impl<const FRAMES: usize> Bridge<FRAMES>
             }
         }
 
-        if self.forwarding && !frames.is_empty() && self.delivery.counting
+        if self.forwarding && count > 0 && self.delivery.counting
         {
             let delivery = &mut self.delivery;
             let holdable = u32::try_from(FRAMES.checked_div(BLOCK_FRAMES).unwrap_or(0)).unwrap_or(u32::MAX);
@@ -1450,7 +1510,7 @@ impl<const FRAMES: usize> Bridge<FRAMES>
 
         if self.forwarding
         {
-            self.burst = self.burst.saturating_add(frames.len());
+            self.burst = self.burst.saturating_add(count);
             let dropped = u32::try_from(pushed.dropped).unwrap_or(u32::MAX);
             self.stats.dropped = self.stats.dropped.saturating_add(dropped);
         }
@@ -2031,11 +2091,20 @@ mod tests
     /// SBC at 44.1 kHz in joint stereo, the stream phones negotiate most.
     const JOINT_STEREO_44_1: StreamCodec = StreamCodec::Sbc(0x21);
 
+    /// SBC at 44.1 kHz in mono.
+    const MONO_44_1: StreamCodec = StreamCodec::Sbc(0x28);
+
+    /// The verdict on a stream of two channels the bridge forwards.
+    const STEREO: StreamVerdict = StreamVerdict::Forward(Channels::Stereo);
+
+    /// The verdict on a mono stream the bridge forwards.
+    const MONO: StreamVerdict = StreamVerdict::Forward(Channels::Mono);
+
     /// Builds an open fixture bridge with `prefill` frames of prefill.
     fn open_bridge(prefill: usize) -> Bridge<FIXTURE_FRAMES>
     {
         let mut bridge = Bridge::new(prefill);
-        assert_eq!(bridge.open(JOINT_STEREO_44_1), StreamVerdict::Forward);
+        assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO);
         bridge
     }
 
@@ -2303,7 +2372,7 @@ mod tests
     fn a_prefill_above_the_capacity_stands_at_the_capacity()
     {
         let mut bridge = Bridge::<4>::new(100);
-        assert_eq!(bridge.open(JOINT_STEREO_44_1), StreamVerdict::Forward);
+        assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO);
         let mut out = [0; 4 * PCM_FRAME_BYTES];
         assert_eq!(bridge.push(&frames(0, 3)).accepted, 3);
         assert_eq!(bridge.drain_into(&mut out), 0);
@@ -2343,10 +2412,10 @@ mod tests
     {
         let cases =
         [
-            (StreamCodec::Sbc(0x21), StreamVerdict::Forward),
-            (StreamCodec::Sbc(0x22), StreamVerdict::Forward),
-            (StreamCodec::Sbc(0x24), StreamVerdict::Forward),
-            (StreamCodec::Sbc(0x28), StreamVerdict::Mono),
+            (StreamCodec::Sbc(0x21), STEREO),
+            (StreamCodec::Sbc(0x22), STEREO),
+            (StreamCodec::Sbc(0x24), STEREO),
+            (StreamCodec::Sbc(0x28), MONO),
             (StreamCodec::Sbc(0x11), StreamVerdict::WrongRate(48_000)),
             (StreamCodec::Sbc(0x18), StreamVerdict::WrongRate(48_000)),
             (StreamCodec::Sbc(0x42), StreamVerdict::WrongRate(32_000)),
@@ -2367,12 +2436,12 @@ mod tests
         }
 
         let forwarded: Vec<u8> = (0..=u8::MAX)
-            .filter(|&octet| stream_verdict(StreamCodec::Sbc(octet)) == StreamVerdict::Forward)
+            .filter(|&octet| stream_verdict(StreamCodec::Sbc(octet)) == STEREO)
             .collect();
         assert_eq!(forwarded, [0x21, 0x22, 0x24]);
 
         let mono: Vec<u8> = (0..=u8::MAX)
-            .filter(|&octet| stream_verdict(StreamCodec::Sbc(octet)) == StreamVerdict::Mono)
+            .filter(|&octet| stream_verdict(StreamCodec::Sbc(octet)) == MONO)
             .collect();
         assert_eq!(mono, [0x28]);
     }
@@ -2383,10 +2452,10 @@ mod tests
         let mut pcm = [0; 3 * PCM_FRAME_BYTES];
         let mut slots = [0x5A; 3 * SLOT_FRAME_BYTES];
 
-        for octet in [0x28, 0x11, 0x42, 0x84, 0x20, 0x23]
+        for octet in [0x18, 0x11, 0x42, 0x84, 0x20, 0x23]
         {
             let mut bridge = Bridge::<FIXTURE_FRAMES>::new(0);
-            assert_ne!(bridge.open(StreamCodec::Sbc(octet)), StreamVerdict::Forward);
+            assert!(!matches!(bridge.open(StreamCodec::Sbc(octet)), StreamVerdict::Forward(_)), "octet {octet:#04x}");
             assert_silent(&mut bridge, &std::format!("octet {octet:#04x}"));
         }
 
@@ -2395,7 +2464,7 @@ mod tests
         assert_silent(&mut other, "codec other than SBC");
 
         let mut bridge = Bridge::<FIXTURE_FRAMES>::new(0);
-        assert_eq!(bridge.open(JOINT_STEREO_44_1), StreamVerdict::Forward);
+        assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO);
         assert_eq!(bridge.push(&frames(1, 3)).accepted, 3);
         let mut link = ChokedLink::new();
         assert_eq!(pump(&mut bridge, &mut pcm, &mut slots, &mut link), Ok(3));
@@ -2419,18 +2488,18 @@ mod tests
         for refused in
         [
             StreamCodec::Sbc(0x11),
-            StreamCodec::Sbc(0x28),
+            StreamCodec::Sbc(0x18),
             StreamCodec::Sbc(0x20),
             StreamCodec::Other,
         ]
         {
             let mut bridge = open_bridge(0);
             assert_eq!(bridge.push(&frames(0, 5)).accepted, 5);
-            assert_ne!(bridge.open(refused), StreamVerdict::Forward);
+            assert!(!matches!(bridge.open(refused), StreamVerdict::Forward(_)), "{refused:?}");
             assert_eq!(bridge.drain_into(&mut out), 0, "{refused:?}");
             assert_silent(&mut bridge, &std::format!("renegotiated to {refused:?}"));
 
-            assert_eq!(bridge.open(JOINT_STEREO_44_1), StreamVerdict::Forward);
+            assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO);
             assert_eq!(bridge.drain_into(&mut out), 0);
             assert_eq!(bridge.push(&frame(9)).accepted, 1);
             assert_eq!(bridge.drain_into(&mut out), 4);
@@ -2828,7 +2897,7 @@ mod tests
     fn simulate(radio: Radio, blocks: u64) -> Outcome
     {
         let mut bridge = Bridge::<RING_FRAMES>::new(PREFILL_FRAMES);
-        assert_eq!(bridge.open(JOINT_STEREO_44_1), StreamVerdict::Forward);
+        assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO);
 
         let chunk: Vec<u8> = frames(0x1234, radio.chunk);
         let mut pcm = [0; BLOCK_FRAMES * PCM_FRAME_BYTES];
@@ -3233,7 +3302,7 @@ mod tests
     fn play(landings: &[Landing], seconds: f64) -> Trace
     {
         let mut bridge = Bridge::<RING_FRAMES>::new(PREFILL_FRAMES);
-        assert_eq!(bridge.open(JOINT_STEREO_44_1), StreamVerdict::Forward);
+        assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO);
         let bytes = frames(0, LARGEST_CHUNK_FRAMES);
         let mut pcm = [0; BLOCK_FRAMES * PCM_FRAME_BYTES];
         let blocks = (seconds * 44_100.0 / BLOCK_FRAMES as f64) as usize;
@@ -3460,6 +3529,143 @@ mod tests
         }
     }
 
+    /// Builds `count` mono frames of `sample`, one 16-bit sample each, as bytes.
+    fn mono_signal(count: usize, sample: impl Fn(usize) -> i16) -> Vec<u8>
+    {
+        (0..count).flat_map(|n| sample(n).to_le_bytes()).collect()
+    }
+
+    /// Runs `bridge` through a start, `drains` drains fed a block each with a
+    /// push past the room of the ring at drain 40, and returns the bytes the
+    /// pumps put on the link and the frames the pushes dropped.
+    ///
+    /// `bytes` holds frames of `frame_bytes` each, which is how the chunks are
+    /// cut, so a mono and a stereo bridge fed the same frames run the same
+    /// schedule.
+    fn run_link(bridge: &mut Bridge<RING_FRAMES>, bytes: &[u8], frame_bytes: usize, drains: usize) -> (Vec<u8>, usize)
+    {
+        let mut pcm = [0; BLOCK_FRAMES * PCM_FRAME_BYTES];
+        let mut slots = [0; BLOCK_FRAMES * SLOT_FRAME_BYTES];
+        let mut link = ChokedLink::new();
+        let mut fed = 0;
+        let mut dropped = 0;
+        let mut push = |bridge: &mut Bridge<RING_FRAMES>, frames: usize, fed: &mut usize|
+        {
+            for piece in bytes[*fed * frame_bytes..(*fed + frames) * frame_bytes].chunks(BLOCK_FRAMES * frame_bytes)
+            {
+                dropped += bridge.push(piece).dropped;
+            }
+
+            *fed += frames;
+        };
+
+        push(bridge, 1_148, &mut fed);
+
+        for drain in 0..drains
+        {
+            if drain == 40
+            {
+                let room = RING_FRAMES - bridge.ring.len;
+                push(bridge, room + 300, &mut fed);
+            }
+            else if drain > 0
+            {
+                push(bridge, BLOCK_FRAMES, &mut fed);
+            }
+
+            assert!(pump(bridge, &mut pcm, &mut slots, &mut link).is_ok());
+        }
+
+        (link.bytes, dropped)
+    }
+
+    #[test]
+    fn a_mono_stream_puts_its_sample_on_both_slots_through_corrections_and_fades()
+    {
+        // A mono bridge and a stereo bridge fed the same samples, the stereo
+        // one on both channels of every frame, run one schedule: a start that
+        // fades in, a prefill 900 frames under the centre that sets insertions
+        // running, and a push past the room of the ring that fades around the
+        // frames it drops. The link of the mono bridge is the link of the
+        // stereo one byte for byte, and every frame of it carries one word on
+        // both slots. A mono push that read two samples a frame, or wrote the
+        // sample into one channel only, parts on the first frame it plays.
+        const DRAINS: usize = 70;
+        const LENGTH: usize = 1_148 + DRAINS * BLOCK_FRAMES + RING_FRAMES + 300;
+
+        let tone = |n: usize| (30_000.0 * (2.0 * core::f64::consts::PI * 997.0 * n as f64 / 44_100.0).sin()).round() as i16;
+        let mono = mono_signal(LENGTH, tone);
+        let stereo = signal(LENGTH, tone, tone);
+
+        let mut one = Bridge::<RING_FRAMES>::new(1_148);
+        assert_eq!(one.open(MONO_44_1), MONO);
+        let (mono_link, mono_dropped) = run_link(&mut one, &mono, MONO_FRAME_BYTES, DRAINS);
+
+        let mut two = Bridge::<RING_FRAMES>::new(1_148);
+        assert_eq!(two.open(JOINT_STEREO_44_1), STEREO);
+        let (stereo_link, stereo_dropped) = run_link(&mut two, &stereo, PCM_FRAME_BYTES, DRAINS);
+
+        let stats = one.take_stats();
+        assert!(stats.inserted >= 2, "the run corrected {stats:?}");
+        assert!(mono_dropped > 0, "the run dropped nothing, so no fade played around a drop");
+        assert_eq!(mono_dropped, stereo_dropped);
+        assert_eq!(mono_link.len(), DRAINS * BLOCK_FRAMES * SLOT_FRAME_BYTES);
+        assert!(mono_link == stereo_link, "the mono link parted from the stereo link of the same samples");
+
+        let words: Vec<(i32, i32)> = mono_link.chunks_exact(SLOT_FRAME_BYTES).map(slots_of).collect();
+        let loud = words.iter().filter(|(left, _)| left.unsigned_abs() > 1 << 29).count();
+
+        for (n, (left, right)) in words.iter().enumerate()
+        {
+            assert_eq!(left, right, "frame {n} of the mono link");
+        }
+
+        assert!(loud > words.len() / 4, "the mono link carried {loud} loud frames of {}", words.len());
+    }
+
+    #[test]
+    fn a_renegotiation_between_mono_and_stereo_keeps_every_frame_aligned()
+    {
+        // A mono chunk trailing one byte, then stereo, then mono again, each
+        // stream opened on the one before without a close. The trailing byte is
+        // discarded as a stereo trailing partial frame is, and every frame
+        // after a renegotiation is read at the stride of the stream it belongs
+        // to: an open that kept the stride of the previous stream shifts every
+        // frame after it.
+        let mut out = [0; 8 * PCM_FRAME_BYTES];
+        let mut bridge = Bridge::<FIXTURE_FRAMES>::new(0);
+
+        assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO);
+        assert_eq!(bridge.push(&frames(0, 2)).accepted, 2);
+
+        assert_eq!(bridge.open(MONO_44_1), MONO);
+        assert_eq!(bridge.drain_into(&mut out), 0, "the stereo frames outlived the mono open");
+
+        let mut chunk = mono_signal(3, |n| [0x1234, -0x0765, i16::MIN][n]);
+        chunk.push(JUNK);
+        assert_eq!(bridge.push(&chunk), Pushed { accepted: 3, dropped: 0, trailing_bytes: 1 });
+        assert_eq!(bridge.push(&mono_signal(1, |_| i16::MAX)).accepted, 1);
+        assert_eq!(bridge.drain_into(&mut out), 4 * PCM_FRAME_BYTES);
+        assert_eq!
+        (
+            samples_of(&out[..4 * PCM_FRAME_BYTES]),
+            [[0x1234, 0x1234], [-0x0765, -0x0765], [i16::MIN, i16::MIN], [i16::MAX, i16::MAX]]
+        );
+
+        assert_eq!(bridge.push(&mono_signal(2, |_| 0x0101)).accepted, 2);
+        assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO);
+        assert_eq!(bridge.drain_into(&mut out), 0, "the mono frames outlived the stereo open");
+        assert_eq!(bridge.push(&frames(9, 2)).accepted, 2);
+        assert_eq!(bridge.drain_into(&mut out), 2 * PCM_FRAME_BYTES);
+        assert_eq!(index_of(&out[..4]), 9);
+        assert_eq!(index_of(&out[4..8]), 10);
+
+        assert_eq!(bridge.open(MONO_44_1), MONO);
+        assert_eq!(bridge.push(&mono_signal(2, |n| [7, -7][n])).accepted, 2);
+        assert_eq!(bridge.drain_into(&mut out), 2 * PCM_FRAME_BYTES);
+        assert_eq!(samples_of(&out[..2 * PCM_FRAME_BYTES]), [[7, 7], [-7, -7]]);
+    }
+
     /// Fills a fresh bridge to `level` frames of `bytes` and starts it: all but
     /// the last block before a drain that stays under the level, then the last
     /// block alone, then the drain that starts the ring. Returns the output of
@@ -3531,7 +3737,7 @@ mod tests
         ]
         {
             let mut bridge = Bridge::<RING_FRAMES>::new(PREFILL_FRAMES);
-            assert_eq!(bridge.open(JOINT_STEREO_44_1), StreamVerdict::Forward);
+            assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO);
             assert_eq!(bridge.push(&frames(0, chunk)).accepted, chunk);
             assert_eq!(bridge.start_level(), start, "chunk {chunk}");
 
@@ -3551,7 +3757,7 @@ mod tests
         // Chunks under two blocks land two to a drain, which still makes a
         // lone burst.
         let mut small_chunks = Bridge::<RING_FRAMES>::new(PREFILL_FRAMES);
-        assert_eq!(small_chunks.open(JOINT_STEREO_44_1), StreamVerdict::Forward);
+        assert_eq!(small_chunks.open(JOINT_STEREO_44_1), STEREO);
         push_chunks(&mut small_chunks, 1_920, 128);
         assert_eq!(small_chunks.drain_into(&mut pcm), 0);
         push_chunks(&mut small_chunks, 256, 128);
@@ -3559,7 +3765,7 @@ mod tests
 
         // A flush forgets the burst of the stream it ends.
         let mut flushed = Bridge::<RING_FRAMES>::new(300);
-        assert_eq!(flushed.open(JOINT_STEREO_44_1), StreamVerdict::Forward);
+        assert_eq!(flushed.open(JOINT_STEREO_44_1), STEREO);
         assert_eq!(flushed.push(&frames(0, 500)).accepted, 500);
         flushed.flush();
         assert_eq!(flushed.push(&frames(0, 500)).accepted, 500);
@@ -3567,7 +3773,7 @@ mod tests
 
         // A push larger than any Bluedroid chunk counts as the largest one.
         let mut large = Bridge::<RING_FRAMES>::new(PREFILL_FRAMES);
-        assert_eq!(large.open(JOINT_STEREO_44_1), StreamVerdict::Forward);
+        assert_eq!(large.open(JOINT_STEREO_44_1), STEREO);
         assert_eq!(large.push(&frames(0, 4_000)).accepted, 4_000);
         assert_eq!(large.start_level(), PREFILL_FRAMES + 840);
         assert_eq!(large.lone_burst(), LARGEST_CHUNK_FRAMES);
@@ -3575,7 +3781,7 @@ mod tests
         // A ring too small to correct starts at its prefill, trims nothing and
         // needs no lone chunk.
         let mut small = Bridge::<FIXTURE_FRAMES>::new(FIXTURE_PREFILL);
-        assert_eq!(small.open(JOINT_STEREO_44_1), StreamVerdict::Forward);
+        assert_eq!(small.open(JOINT_STEREO_44_1), STEREO);
         assert_eq!(small.push(&frames(0, 30)).accepted, 30);
         let mut out = [0; 30 * PCM_FRAME_BYTES];
         assert_eq!(small.drain_into(&mut out), out.len());
@@ -3592,7 +3798,7 @@ mod tests
         // to its level and waits, a drain with no push waits too, and the
         // drain after one lone chunk starts it.
         let mut bridge = Bridge::<RING_FRAMES>::new(PREFILL_FRAMES);
-        assert_eq!(bridge.open(JOINT_STEREO_44_1), StreamVerdict::Forward);
+        assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO);
         assert_eq!(bridge.push(&frames(0, 1_920)).accepted, 1_920);
         assert_eq!(bridge.push(&frames(1_920, 1_920)).accepted, 1_920);
         assert_eq!(bridge.push(&frames(3_840, 1_920)).accepted, 1_920);
@@ -3608,7 +3814,7 @@ mod tests
         // Two chunks between every pair of drains never make a lone chunk, so
         // the ring starts after START_WAIT_DRAINS drains of waiting.
         let mut pairs = Bridge::<RING_FRAMES>::new(PREFILL_FRAMES);
-        assert_eq!(pairs.open(JOINT_STEREO_44_1), StreamVerdict::Forward);
+        assert_eq!(pairs.open(JOINT_STEREO_44_1), STEREO);
         assert_eq!(waiting_drains(&mut pairs), START_WAIT_DRAINS);
     }
 
@@ -3616,7 +3822,7 @@ mod tests
     fn a_ring_that_has_not_started_drops_its_oldest_frames_when_full()
     {
         let mut bridge = Bridge::<RING_FRAMES>::new(PREFILL_FRAMES);
-        assert_eq!(bridge.open(JOINT_STEREO_44_1), StreamVerdict::Forward);
+        assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO);
         assert_eq!(bridge.push(&frames(0, RING_FRAMES)).accepted, RING_FRAMES);
         assert_eq!(bridge.push(&frames(10_000, 100)), Pushed { accepted: 100, dropped: 0, trailing_bytes: 0 });
         let stats = bridge.take_stats();
@@ -3626,7 +3832,7 @@ mod tests
 
         // Once started, a full ring drops the incoming frames and counts them.
         let mut started = Bridge::<RING_FRAMES>::new(PREFILL_FRAMES);
-        assert_eq!(started.open(JOINT_STEREO_44_1), StreamVerdict::Forward);
+        assert_eq!(started.open(JOINT_STEREO_44_1), STEREO);
         let bytes = frames(0, RING_FRAMES);
         let _ = start_on(&mut started, &bytes, PREFILL_FRAMES);
         let room = RING_FRAMES - started.ring.len;
@@ -3639,7 +3845,7 @@ mod tests
     {
         let mut pcm = [0; BLOCK_FRAMES * PCM_FRAME_BYTES];
         let mut bridge = Bridge::<RING_FRAMES>::new(0);
-        assert_eq!(bridge.open(JOINT_STEREO_44_1), StreamVerdict::Forward);
+        assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO);
 
         // Past the wait for a lone chunk too, an empty ring never starts.
         for _ in 0..2 * START_WAIT_DRAINS
@@ -3666,7 +3872,7 @@ mod tests
         for restart in ["flush", "underrun", "open", "close"]
         {
             let mut bridge = Bridge::<RING_FRAMES>::new(PREFILL_FRAMES);
-            assert_eq!(bridge.open(JOINT_STEREO_44_1), StreamVerdict::Forward);
+            assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO);
             assert_eq!(bridge.push(&frames(0, 1_920)).accepted, 1_920);
             assert_eq!(bridge.push(&frames(0, 1_920)).accepted, 1_920);
             assert_eq!(bridge.drain_into(&mut pcm), 0);
@@ -3700,13 +3906,13 @@ mod tests
                 }
                 "open" =>
                 {
-                    assert_eq!(bridge.open(JOINT_STEREO_44_1), StreamVerdict::Forward);
+                    assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO);
                     PREFILL_FRAMES
                 }
                 _ =>
                 {
                     bridge.close();
-                    assert_eq!(bridge.open(JOINT_STEREO_44_1), StreamVerdict::Forward);
+                    assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO);
                     PREFILL_FRAMES
                 }
             };
@@ -3725,7 +3931,7 @@ mod tests
         for restart in ["flush", "open", "close", "underrun"]
         {
             let mut bridge = Bridge::<RING_FRAMES>::new(PREFILL_FRAMES);
-            assert_eq!(bridge.open(JOINT_STEREO_44_1), StreamVerdict::Forward);
+            assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO);
             let _ = start_on(&mut bridge, &bytes, PREFILL_FRAMES);
 
             // Blocks the ring sits far over the dead band drive the estimate
@@ -3744,11 +3950,11 @@ mod tests
             match restart
             {
                 "flush" => bridge.flush(),
-                "open" => assert_eq!(bridge.open(JOINT_STEREO_44_1), StreamVerdict::Forward),
+                "open" => assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO),
                 "close" =>
                 {
                     bridge.close();
-                    assert_eq!(bridge.open(JOINT_STEREO_44_1), StreamVerdict::Forward);
+                    assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO);
                 }
                 _ =>
                 {
@@ -3851,7 +4057,7 @@ mod tests
         // A start that waited its whole wait, then a gap, then the same
         // backlog: the second start waits the whole wait again.
         let mut bridge = Bridge::<RING_FRAMES>::new(PREFILL_FRAMES);
-        assert_eq!(bridge.open(JOINT_STEREO_44_1), StreamVerdict::Forward);
+        assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO);
         assert_eq!(waiting_drains(&mut bridge), START_WAIT_DRAINS);
         run_dry(&mut bridge);
         assert_eq!(bridge.take_stats().underruns, 1);
@@ -3860,7 +4066,7 @@ mod tests
         // A suspend in the middle of a wait: the stream that resumes waits
         // the whole wait.
         let mut flushed = Bridge::<RING_FRAMES>::new(PREFILL_FRAMES);
-        assert_eq!(flushed.open(JOINT_STEREO_44_1), StreamVerdict::Forward);
+        assert_eq!(flushed.open(JOINT_STEREO_44_1), STEREO);
         let mut waited = 0;
 
         for _ in 0..256
@@ -4107,7 +4313,7 @@ mod tests
             {
                 let context = std::format!("{name}, {correction:?}");
                 let mut bridge = Bridge::<RING_FRAMES>::new(prefill);
-                assert_eq!(bridge.open(JOINT_STEREO_44_1), StreamVerdict::Forward);
+                assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO);
 
                 let mut output = start_on(&mut bridge, input, prefill);
                 let mut fed = prefill;
@@ -4180,7 +4386,7 @@ mod tests
         // its first frame and nothing of the stream before.
         const PREFILL: usize = 3_600;
         let mut bridge = Bridge::<RING_FRAMES>::new(PREFILL);
-        assert_eq!(bridge.open(JOINT_STEREO_44_1), StreamVerdict::Forward);
+        assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO);
         let square = |n: usize| if n % 6 < 3 { i16::MAX } else { i16::MIN };
         let loud = signal(PREFILL + 4 * BLOCK_FRAMES, square, square);
         let _ = start_on(&mut bridge, &loud, PREFILL);
@@ -4251,7 +4457,7 @@ mod tests
                 scope.spawn(move ||
                 {
                     let mut bridge = Bridge::<RING_FRAMES>::new(3_600);
-                    assert_eq!(bridge.open(JOINT_STEREO_44_1), StreamVerdict::Forward);
+                    assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO);
                     let sine = |n: usize| (30_000.0 * (2.0 * core::f64::consts::PI * hz * n as f64 / 44_100.0).sin()).round() as i16;
                     let mut pcm = [0; BLOCK_FRAMES * PCM_FRAME_BYTES];
                     let mut left = Vec::new();
@@ -4460,7 +4666,7 @@ mod tests
         // the spacing, and the next one waits for it to end.
         let bytes = frames(0, 4 * RING_FRAMES);
         let mut bridge = Bridge::<RING_FRAMES>::new(3_000);
-        assert_eq!(bridge.open(JOINT_STEREO_44_1), StreamVerdict::Forward);
+        assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO);
         let _ = start_on(&mut bridge, &bytes, 3_000);
         let mut pcm = [0; 32 * PCM_FRAME_BYTES];
         let mut indices = Vec::new();
@@ -4494,7 +4700,7 @@ mod tests
         {
             let bytes = frames(0, RING_FRAMES);
             let mut bridge = Bridge::<RING_FRAMES>::new(prefill);
-            assert_eq!(bridge.open(JOINT_STEREO_44_1), StreamVerdict::Forward);
+            assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO);
             let mut given = start_on(&mut bridge, &bytes, prefill).len() / PCM_FRAME_BYTES;
 
             for _ in 0..64
@@ -4555,7 +4761,7 @@ mod tests
         let second = first + CORRECTION_SPACING as usize;
         let lands = (CROSSFADE_FRAMES - 2) / BLOCK_FRAMES;
         let drains = second + lands + 2;
-        assert_eq!(bridge.open(JOINT_STEREO_44_1), StreamVerdict::Forward);
+        assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO);
         let bytes = frames(0, 3 * RING_FRAMES);
         push_span(&mut bridge, &bytes, 0, 3_000 - BLOCK_FRAMES, BLOCK_FRAMES);
         assert_eq!(bridge.drain_into(&mut pcm), 0);
@@ -4684,7 +4890,7 @@ mod tests
         for (name, input) in [("sine", signal(LENGTH, sine, |n| sine(n).saturating_neg())), ("square", signal(LENGTH, square, square))]
         {
             let mut bridge = Bridge::<RING_FRAMES>::new(PREFILL_FRAMES);
-            assert_eq!(bridge.open(JOINT_STEREO_44_1), StreamVerdict::Forward);
+            assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO);
             let mut output: Vec<u8> = Vec::new();
             let mut fed = 0;
             let mut pcm = [0; BLOCK_FRAMES * PCM_FRAME_BYTES];
@@ -4800,7 +5006,7 @@ mod tests
     {
         arrivals.sort_by_key(|&(drain, _)| drain);
         let mut bridge = Bridge::<RING_FRAMES>::new(PREFILL_FRAMES);
-        assert_eq!(bridge.open(JOINT_STEREO_44_1), StreamVerdict::Forward);
+        assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO);
         let bytes = frames(0, LARGEST_CHUNK_FRAMES);
         let mut pcm = [0; BLOCK_FRAMES * PCM_FRAME_BYTES];
         let mut out = Replay { underruns: Vec::new(), dropped: Vec::new(), playing: Vec::new() };
@@ -4958,7 +5164,7 @@ mod tests
         let block = frames(0, BLOCK_FRAMES);
         let bytes = frames(0, RING_FRAMES);
         let mut bridge = Bridge::<RING_FRAMES>::new(PREFILL_FRAMES);
-        assert_eq!(bridge.open(JOINT_STEREO_44_1), StreamVerdict::Forward);
+        assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO);
         let _ = start_on(&mut bridge, &bytes, PREFILL_FRAMES);
 
         // The gap that runs the ring dry right after its start counts, up to
@@ -5032,7 +5238,7 @@ mod tests
         const LEVEL: i16 = 16_384;
         let mut pcm = [0; BLOCK_FRAMES * PCM_FRAME_BYTES];
         let mut bridge = Bridge::<RING_FRAMES>::new(PREFILL_FRAMES);
-        assert_eq!(bridge.open(JOINT_STEREO_44_1), StreamVerdict::Forward);
+        assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO);
         let steady = signal(PREFILL_FRAMES + 2 * BLOCK_FRAMES, |_| LEVEL, |_| -LEVEL);
         let mut output = start_on(&mut bridge, &steady, PREFILL_FRAMES);
         push_span(&mut bridge, &steady, PREFILL_FRAMES, BLOCK_FRAMES, BLOCK_FRAMES);
@@ -5077,7 +5283,7 @@ mod tests
         {
             let mut pcm = [0; BLOCK_FRAMES * PCM_FRAME_BYTES];
             let mut bridge = Bridge::<RING_FRAMES>::new(PREFILL_FRAMES);
-            assert_eq!(bridge.open(JOINT_STEREO_44_1), StreamVerdict::Forward);
+            assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO);
 
             if flushed
             {
@@ -5167,7 +5373,7 @@ mod tests
         // Two drops 480 frames apart play as one silence from the frame before
         // the first to the frame after the second.
         let mut bridge = Bridge::<RING_FRAMES>::new(PREFILL_FRAMES);
-        assert_eq!(bridge.open(JOINT_STEREO_44_1), StreamVerdict::Forward);
+        assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO);
         let (mut output, first, last) = two_drops(&mut bridge);
         play(&mut bridge, &mut output, RING_FRAMES / BLOCK_FRAMES + 6);
         let got = samples_of(&output);
@@ -5185,7 +5391,7 @@ mod tests
         for (case, drains, tail) in [("after the drop", 0, BLOCK_FRAMES), ("inside the silence", 16, 0), ("before a drop", 14, FADE_FRAMES)]
         {
             let mut bridge = Bridge::<RING_FRAMES>::new(PREFILL_FRAMES);
-            assert_eq!(bridge.open(JOINT_STEREO_44_1), StreamVerdict::Forward);
+            assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO);
 
             if case == "before a drop"
             {
@@ -5241,7 +5447,7 @@ mod tests
         for (index, restart) in ["flush", "close", "open"].into_iter().enumerate()
         {
             let mut bridge = Bridge::<RING_FRAMES>::new(PREFILL_FRAMES);
-            assert_eq!(bridge.open(JOINT_STEREO_44_1), StreamVerdict::Forward);
+            assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO);
             let mut output: Vec<u8> = Vec::new();
             let mut pcm = [0; BLOCK_FRAMES * PCM_FRAME_BYTES];
             let mut fed = 0;
@@ -5256,7 +5462,7 @@ mod tests
                     {
                         "flush" => bridge.flush(),
                         "close" => bridge.close(),
-                        _ => assert_eq!(bridge.open(JOINT_STEREO_44_1), StreamVerdict::Forward),
+                        _ => assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO),
                     }
                     assert_eq!(bridge.tail, FADE_FRAMES, "{restart}");
                 }

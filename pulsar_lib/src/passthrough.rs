@@ -1,9 +1,9 @@
 //! Input path of the processing board, and the block structure it feeds.
 //!
-//! One converter channel arrives on sub-block A of the second audio interface,
+//! Frames of two slots arrive on sub-block A of the second audio interface,
 //! run as a slave receiver synchronised on the first interface, and one
-//! circular transfer stream drops it into a buffer the length of the two output
-//! buffers. What runs on top of that is a block structure: each time the
+//! circular transfer stream drops them into a buffer the length of the two
+//! output buffers. What runs on top of that is a block structure: each time the
 //! receiving stream finishes a half of its buffer, the frames of that half are
 //! carried to the two output buffers, at the positions those frames were sent
 //! from.
@@ -16,8 +16,10 @@
 //!
 //! # What the carry does to a frame
 //!
-//! It reads the sample the first slot of the frame carries, runs it through the
-//! three cascades of the crossover and through the output stage, and writes the
+//! It reads the two slots of the frame, the left and the right channel of the
+//! sender, and takes their mean, since one loudspeaker plays both. It runs that
+//! sample through the three cascades of the crossover and through the output
+//! stage, and writes the
 //! three words that stage answers plus one silent word across the four
 //! converter channels: the low way and the mid way into the two slots of the
 //! master frame, the high way and the channel no way drives into the two slots
@@ -81,7 +83,8 @@
 //! the source: `CarryShift` is that distance measured once, less the pipeline
 //! the section below names, and the carry adds it to every index. The block it
 //! writes is then the block the read pointer has just left, which is also the
-//! placement that leaves 433 words of margin ahead of the carry.
+//! placement that leaves 433 words of margin ahead of the first carry of a lap
+//! and 432 ahead of the second.
 //!
 //! The distance itself is not left to chance either. `bring_up` holds the
 //! receiver stopped until the transmitting side has walked its read pointer to
@@ -104,21 +107,22 @@
 //! 22.68 microseconds, a block of 441 words is 5.000 milliseconds, and a new
 //! event lands every 5.000 milliseconds. The carry runs once a block and its
 //! loop once a frame. COUNTED on the text of the loop in the linked image, a
-//! frame holds 333 instructions, 82 accesses to the memory the buffers and the
-//! cascades sit in, 12 reads of the literal pool of the code, and 57 accesses to
-//! the stack. A frame whose high sample stands inside the wall runs 11 of those
-//! reads, and the twelfth runs on a high sample under the negative side of it.
+//! frame holds 331 instructions, 83 accesses to the memory the buffers and the
+//! cascades sit in, 13 reads of the literal pool of the code, and 59 accesses to
+//! the stack. A frame whose high sample stands inside the wall runs 12 of those
+//! reads, and the thirteenth runs on a high sample under the negative side of
+//! it.
 //!
 //! ESTIMATED from those counts, since no cycle counter has read this image. An
 //! instruction is taken at one core cycle, an access to the stack at one more,
 //! the stack sitting in the data memory coupled to the core, and an access to
 //! the memory the buffers and the cascades sit in, or a read of the literal
-//! pool, at `c` cycles. A frame is then `333 + 94 * c + 57` cycles at 64 MHz.
-//! At a `c` of 3.9 that is 757 cycles, about 167000 for an entry of 221 frames,
-//! 2.61 milliseconds and 52 per cent of the period. That is 11.8 microseconds a
+//! pool, at `c` cycles. A frame is then `331 + 96 * c + 59` cycles at 64 MHz.
+//! At a `c` of 3.9 that is 764 cycles, about 169000 for an entry of 221 frames,
+//! 2.64 milliseconds and 53 per cent of the period. That is 11.9 microseconds a
 //! frame, and it leaves the carry 1.9 times faster than the streams it has to
-//! stay ahead of. It would take 11.3 cycles an access to bring the carry down
-//! to the speed of the streams, 2.9 times that `c`.
+//! stay ahead of. It would take 11.1 cycles an access to bring the carry down
+//! to the speed of the streams, 2.8 times that `c`.
 //!
 //! `c` is a CALIBRATION taken off the part and not a reading of this image. The
 //! cycle counter of the data watchpoint unit, read on the clock the part boots
@@ -128,19 +132,20 @@
 //! the work done once a block included. The same reading on this image is what
 //! replaces the estimate.
 //!
-//! Those 82 accesses are one number for one quantity, made in 82 transactions
+//! Those 83 accesses are one number for one quantity, made in 83 transactions
 //! of one word each. 75 of them are the cascades: 35
 //! coefficient reads and 40 writes of the four history words each of the ten
 //! sections carries. 2 are the thermal limiter of the high way, its average and
-//! its gain written back. The other 5 are the buffers, one source read and the
-//! four output words. The 12 reads of the literal pool reach eleven words, the
+//! its gain written back. The other 6 are the buffers, the two slots of the
+//! source frame and the four output words. The 13 reads of the literal pool
+//! reach eleven words, the
 //! constants the vector unit cannot encode as an immediate: the gains of the
 //! low and mid ways, each a trim times the peak reserve, the gain of the high
 //! way in the unit of the limiter, full scale, the coefficient, the floor and
 //! the reciprocal of the threshold of the limiter, the two sides of the
 //! ceiling, and the float zero in two places, which answers a value that is not
 //! a number, an average under the floor, a step of the gain that does not land
-//! over zero and a source index out of range.
+//! over zero and a source index out of range on either slot.
 //!
 //! The cascade of a way is folded into the loop, and that is what holds the
 //! count there: it hoists fifteen of the twenty coefficients of the low way out
@@ -148,15 +153,15 @@
 //! back every frame. The forty history words and the state of the limiter are
 //! written back every frame whichever way that falls, each being live into the
 //! next sample. Left out of line, every section reads its five coefficients and
-//! its four history words back through a pointer on every sample, which is 139
-//! accesses a frame and 2 reads of the pool rather than 82 and 12. That form is
-//! not measured either: by the count, with 325 instructions and 7 accesses to
-//! the stack, it reaches the speed of the streams at 7.9 cycles an access,
-//! twice `c`, against 2.9 times for the folded carry.
+//! its four history words back through a pointer on every sample, which is 57
+//! accesses a frame more than the folded carry and 10 reads of the pool fewer.
+//! That form is not measured either: by the count it reaches the speed of the
+//! streams near twice `c`, against 2.8 times for the folded carry.
 //!
-//! A carry starts writing where the read pointer has just left, so it has 433
-//! words of clearance ahead of it, 4.91 milliseconds, at an entry taken on
-//! time. One that fits inside a block therefore never crosses the pointer.
+//! A carry starts writing where the read pointer has just left, so at an entry
+//! taken on time it has 433 words of clearance ahead of it on the first block
+//! and 432 on the second, 4.90 milliseconds at the least. One that fits inside
+//! a block therefore never crosses the pointer.
 //!
 //! One that does not fit never catches up either: `travelled` grows by the
 //! overrun at every entry, the clearance shrinks by as much, and the streams
@@ -285,8 +290,8 @@ const HALVES: u32 = 2;
 /// microseconds, short of the first word the carry writes. That is the FLOOR
 /// over the entries the check accepts, not the distance an armed path leaves:
 /// the carry writes the block the read pointer has just finished, so an entry
-/// taken on time starts 433 words and 4.91 milliseconds ahead of it, and the
-/// floor is what a handler entered late enough runs into.
+/// taken on time starts at least 432 words and 4.90 milliseconds ahead of it,
+/// and the floor is what a handler entered late enough runs into.
 ///
 /// A carry of one block takes LONGER than the 624 microseconds an entry at the
 /// floor leaves, by the estimate the module documentation carries. What
@@ -751,12 +756,14 @@ impl PassthroughFault
 /// second block starts on the second slot of a frame rather than on the first,
 /// and one frame straddles the boundary between the two blocks.
 ///
-/// The carry runs on frames, so it cares. It walks the frames whose first slot
-/// falls inside the block and writes both words of each, which carries the
-/// straddling frame whole from the block its first slot belongs to.
-/// `InputPlan::carry_start` and `InputPlan::carry_frames` are that reading, so
-/// it follows from the length of the buffer rather than being written down as a
-/// property of the halves.
+/// The carry runs on frames, so it cares. It walks the frames whose LAST slot
+/// falls inside the block and reads and writes both words of each, which
+/// carries the straddling frame whole from the block its last slot belongs to.
+/// Every word a carry reads then stands in the half whose event started it or
+/// in the half before, so it is in by that event whatever order the carry reads
+/// it in. `InputPlan::carry_start` and `InputPlan::carry_frames` are that
+/// reading, so it follows from the length of the buffer rather than being
+/// written down as a property of the halves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Half
 {
@@ -1111,11 +1118,11 @@ impl InputPlan
 
     /// Returns the first source index the carry of one block reads.
     ///
-    /// The carry walks the frames whose slot 0 falls inside the block, so a
-    /// block beginning part way into a frame begins at the frame above it. On a
-    /// buffer of an odd number of frames the second block begins one slot
-    /// inside a frame, and that slot belongs to the frame the first block
-    /// carried.
+    /// The carry walks the frames whose last slot falls inside the block, so
+    /// the carry of a block beginning part way into a frame begins at the start
+    /// of that frame. On a buffer of an odd number of frames the second block
+    /// begins one slot inside a frame, and this places its carry one slot
+    /// before the block, on a word the first half holds.
     ///
     /// A frame of no slots names no boundary and gives the block start.
     #[must_use]
@@ -1126,37 +1133,36 @@ impl InputPlan
         match start.checked_rem(self.frame_slots())
         {
             Some(0) | None => start,
-            Some(over) =>
-                start.saturating_add(self.frame_slots()).saturating_sub(over),
+            Some(over) => start.saturating_sub(over),
         }
     }
 
     /// Returns the frames the carry of one block reads.
     ///
-    /// The frame holding the last slot of the block counts, whole, since the
-    /// carry writes both of its words. That is what makes the two blocks of a
-    /// lap cover the buffer exactly once between them on a buffer whose blocks
-    /// are an odd number of words.
+    /// A frame counts when its last slot stands inside the block, so the frame
+    /// holding the last slot of a block of an odd number of words counts in the
+    /// block after it, whole. That is what makes the two blocks of a lap cover
+    /// the buffer exactly once between them on a buffer whose blocks are an odd
+    /// number of words.
     ///
     /// A frame of no slots names no count and gives none.
     #[must_use]
     pub(crate) const fn carry_frames(self, half: Half) -> u32
     {
-        let slots = self.frame_slots();
+        let words = self.block_end(half).saturating_sub(self.carry_start(half));
 
-        if slots == 0
+        match words.checked_div(self.frame_slots())
         {
-            return 0;
+            Some(frames) => frames,
+            None => 0,
         }
-
-        self.block_end(half).saturating_sub(self.carry_start(half)).div_ceil(slots)
     }
 
     /// Returns the words the carry of one block writes into each output buffer.
     ///
     /// It is the SPAN the guard protects, and it is not the length of the
-    /// block: a block whose last slot opens a frame is carried one frame past
-    /// its own end, and the block after it starts that much further in.
+    /// block: a block whose last slot opens a frame leaves that frame to the
+    /// block after it, which starts that much earlier.
     #[must_use]
     pub(crate) const fn carry_words(self, half: Half) -> u32
     {
@@ -1272,12 +1278,11 @@ impl InputPlan
     ///
     /// The span it measures is `carry_words`, taken from `carry_start`, which
     /// is the span the carry itself loops over. The length of the BLOCK is not
-    /// that span: a block whose last slot opens a frame is carried one frame
-    /// past its own end, and its last written word is then the first word of
-    /// the other half of the buffer. A guard reading the block end instead
-    /// leaves a read pointer sitting on that word at a distance of zero, which
-    /// reads as the whole margin, and the carry writes the word the stream is
-    /// reading.
+    /// that span: on a buffer of an odd number of frames the first carry stops
+    /// one slot short of the end of its block, and the second starts one slot
+    /// before its own. A guard reading the block instead admits a read pointer
+    /// one word closer to the start of the second carry than the margin, and
+    /// refuses one standing on the word the first carry leaves to the second.
     ///
     /// It answers for that instant alone. Whether the carry then STAYS clear of
     /// the pointer is the speed of the carry against the speed of the streams,
@@ -1703,7 +1708,7 @@ const fn overlaps(one: u32, other: u32, bytes: u32) -> bool
 ///
 /// Every method is `Sized`, and none of the generic functions over this trait
 /// admits `?Sized`. A call through `dyn InputInterface` is a call the compiler
-/// cannot fold, and the carry reaches the accessors five times a frame, so the
+/// cannot fold, and the carry reaches the accessors six times a frame, so the
 /// door is shut rather than left open for a caller that does not exist.
 pub trait InputInterface
 {
@@ -1861,16 +1866,27 @@ const _: () = assert!
      does not carry"
 );
 
-/// The fan-out drives two slots of each module and the source is read at one,
-/// so a frame of another width would leave slots of every frame replaying the
-/// lap before. The transport pins the frame at 64 bit clock periods rather than
-/// at two slots, and a frame of four 16 bit slots satisfies that, so this
-/// stands on its own rather than repeating it.
+/// The fan-out drives two slots of each module and the source is read at the
+/// two slots of a frame, so a frame of another width would leave slots of every
+/// frame replaying the lap before, or leave a channel of the sender out of the
+/// mean. The transport pins the frame at 64 bit clock periods rather than at
+/// two slots, and a frame of four 16 bit slots satisfies that, so this stands
+/// on its own rather than repeating it.
 const _: () = assert!
 (
-    SLOTS_PER_FRAME == 2,
-    "a frame carries a slot the fan-out drives no way into"
+    SLOTS_PER_FRAME == 2
+        && LEFT_SLOT != RIGHT_SLOT
+        && LEFT_SLOT < SLOTS_PER_FRAME as u32
+        && RIGHT_SLOT < SLOTS_PER_FRAME as u32,
+    "a frame carries a slot the fan-out drives no way into, or the source is \
+     read at a slot the frame does not carry"
 );
+
+/// Slot of a source frame the left channel of the sender arrives in.
+const LEFT_SLOT: u32 = 0;
+
+/// Slot of a source frame the right channel of the sender arrives in.
+const RIGHT_SLOT: u32 = 1;
 
 /// The three cascades of the crossover, the history behind each section, and
 /// the thermal limiter of the high way.
@@ -1886,8 +1902,9 @@ const _: () = assert!
 ///
 /// # Why there is one history per way and not one per slot
 ///
-/// The chain runs ONCE per frame, over the sample the source carries in slot 0,
-/// and the three words it answers with are fanned out across the slots of the
+/// The chain runs ONCE per frame, over the mean of the two channels the source
+/// carries in the two slots, and the three words it answers with are fanned out
+/// across the slots of the
 /// two output frames. So the sequence each way filters is one sample per frame
 /// at the frame rate, and one history per way is the whole of what a way
 /// remembers. A history per slot would be a second, interleaved run of the same
@@ -1973,23 +1990,45 @@ impl FilterChain
         )
     }
 
-    /// Runs one source word through the three ways and the output stage.
+    /// Runs the two words of one source frame through the three ways and the
+    /// output stage.
     ///
-    /// The word crosses the sample format once and each way once, so the three
-    /// answers come off one reading of the source rather than three. What each
-    /// way answers then crosses the output stage, which carries the alignment
-    /// of the three ways, the peak reserve, the limiter and the ceiling of the
-    /// high way and the conversion back to a word. The limiter is the one this
-    /// chain holds, so its average runs on into the next frame.
+    /// The mean of the two channels crosses each way once, so the three answers
+    /// come off one sample rather than three. What each way answers then
+    /// crosses the output stage, which carries the alignment of the three ways,
+    /// the peak reserve, the limiter and the ceiling of the high way and the
+    /// conversion back to a word. The limiter is the one this chain holds, so
+    /// its average runs on into the next frame.
+    ///
+    /// # Where the mean forms, and what bounds it
+    ///
+    /// In single precision, after each word has crossed into the format on
+    /// its own. The sum of two slot words taken as integers needs a 33rd bit,
+    /// and a 32-bit sum would come back round to the opposite sign on two loud
+    /// samples of one sign. Two converted words stand at full scale or under,
+    /// their sum at twice that, which the format holds without rounding past
+    /// it, and the halving is exact. So the mean stands at full scale or under
+    /// whatever the two words hold, and the chain and every protection behind
+    /// it see no sample louder than one slot on its own carries. Two equal
+    /// words give that word, and two opposite words give zero exactly, since
+    /// the conversion rounds a word and its negation alike.
     #[expect
     (
         clippy::cast_precision_loss,
         reason = "the audio path is single precision, and this is the step that \
                   gets a sample there"
     )]
-    fn carry(&mut self, word: u32) -> WayWords
+    #[expect
+    (
+        clippy::manual_midpoint,
+        reason = "the two operands stand at full scale or under, where the sum \
+                  cannot overflow, and `f32::midpoint` compiles on this target to \
+                  a guard on both magnitudes and a read of the literal pool that \
+                  those operands never need, once a frame"
+    )]
+    fn carry(&mut self, left: u32, right: u32) -> WayWords
     {
-        let sample = word.cast_signed() as f32;
+        let sample = (left.cast_signed() as f32 + right.cast_signed() as f32) * 0.5;
 
         WayWords::of
         (
@@ -2027,13 +2066,19 @@ impl FilterChain
 ///
 /// # Which frames, and which words it writes
 ///
-/// It walks the frames whose SLOT 0 falls inside the block, and it writes both
-/// words of each of them. A buffer holding an odd number of frames splits into
-/// two blocks of an odd number of words, so one frame straddles the boundary
-/// between them, and this rule is what carries that frame whole from the block
-/// its first slot belongs to. The two blocks of a lap then write the buffer
-/// entire, exactly once, and nothing of a half frame is held between two
-/// entries.
+/// It walks the frames whose LAST slot falls inside the block, and it reads
+/// both words of each of them and writes both. A buffer holding an odd number
+/// of frames splits into two blocks of an odd number of words, so one frame
+/// straddles the boundary between them, and this rule is what carries that
+/// frame whole from the block its last slot belongs to. The two blocks of a
+/// lap then write the buffer entire, exactly once, and nothing of a half frame
+/// is held between two entries.
+///
+/// The receiving stream raises the event of a half once the last word of that
+/// half is in. Every word this reads stands in that half or, for the first
+/// slot of the straddling frame, in the half before it, so every one of them
+/// is in when the event is raised, and the order this reads them in changes
+/// nothing of what it reads.
 ///
 /// `InputPlan::carry_start` and `InputPlan::carry_words` are that rule, and the
 /// guard every entry passes reads the same two, so the stretch it protects is
@@ -2049,17 +2094,18 @@ impl FilterChain
 ///
 /// # What each way reaches
 ///
-/// The chain runs once on the sample slot 0 carries and answers three words,
+/// The chain runs once on the mean of the two slots and answers three words,
 /// one per way. The master converter takes the low way and the mid way, the
 /// slave takes the high way and the channel no way drives, which is written
 /// with silence. Four converter channels for three ways leave one over, and it
 /// is driven rather than skipped because a channel nothing writes replays
 /// whatever its buffer last held.
 ///
-/// Reading slot 0 alone is the source contract: the two slots of a source frame
-/// are two channels of one sender, and mixing them is a gain law and a ceiling
-/// rather than an average, so the chain takes one channel until that law
-/// exists.
+/// The mean is the source contract: the two slots of a source frame are the
+/// left and the right channel of one sender, and one loudspeaker plays both. A
+/// channel the sender holds silent arrives at half its level, two channels in
+/// opposition cancel, and the mean never stands past full scale, so the chain
+/// sees nothing louder than one channel carries on its own.
 ///
 /// # Where the loop lives
 ///
@@ -2110,7 +2156,11 @@ where
     for step in 0..frames
     {
         let index = first.saturating_add(step.saturating_mul(slots));
-        let ways = chain.carry(interface.read_word(index));
+        let ways = chain.carry
+        (
+            interface.read_word(index.saturating_add(LEFT_SLOT)),
+            interface.read_word(index.saturating_add(RIGHT_SLOT))
+        );
 
         interface.write_word(BlockRole::Master, at.saturating_add(LOW_SLOT), ways.low());
         interface.write_word(BlockRole::Master, at.saturating_add(MID_SLOT), ways.mid());
@@ -2977,8 +3027,8 @@ mod tests
         out
     }
 
-    /// Returns the words the output stage leaves for a source carrying `word`,
-    /// read through cascades that change nothing.
+    /// Returns the words the output stage leaves for a source frame carrying
+    /// `left` and `right`, read through cascades that change nothing.
     ///
     /// A transparent chain hands the same sample to all three ways, so what
     /// comes back is the stage alone: the alignment of the three ways, the peak
@@ -2986,21 +3036,41 @@ mod tests
     /// conversion. The tests of PLACEMENT below expect their words through this
     /// rather than through a second copy of the alignment, and the figures the
     /// alignment stands at are read where they are written.
-    fn staged(word: u32) -> WayWords
+    fn staged(left: u32, right: u32) -> WayWords
     {
-        staged_sample(source_sample(word))
+        staged_sample(source_sample(left, right))
     }
 
-    /// Returns the sample the carry reads `word` as.
+    /// Returns the sample the carry reads a source frame holding `left` and
+    /// `right` as.
+    ///
+    /// Each word crosses single precision as the carry converts it, and the
+    /// mean then forms in DOUBLE precision, where the sum of the two is exact,
+    /// before it narrows once. Halving commutes with that rounding, so this is
+    /// the value the single precision sum and halving of the carry leave,
+    /// derived by another route rather than transcribed.
     #[expect
     (
         clippy::cast_precision_loss,
         reason = "the carry crosses single precision at the same step, and this \
                   is what makes the two answer alike"
     )]
-    fn source_sample(word: u32) -> f32
+    fn source_sample(left: u32, right: u32) -> f32
     {
-        word.cast_signed() as f32
+        let sum = f64::from(left.cast_signed() as f32) + f64::from(right.cast_signed() as f32);
+
+        (sum / 2.0) as f32
+    }
+
+    /// Returns the sample the carry reads the frame of `buffer` opening at
+    /// `index` as.
+    fn frame_sample(buffer: &[u32; TEST_WORDS as usize], index: u32) -> f32
+    {
+        source_sample
+        (
+            carried_word(buffer, index + LEFT_SLOT),
+            carried_word(buffer, index + RIGHT_SLOT)
+        )
     }
 
     /// Returns the words the output stage leaves when all three ways answer
@@ -3034,9 +3104,9 @@ mod tests
     /// Returns the image `role` holds once the source `buffer` has crossed a
     /// transparent chain and the output stage, frame for frame.
     ///
-    /// The sample of a frame is the word its first slot carries, which is the
-    /// source contract, so a buffer seeded with two different slots comes back
-    /// carrying the first of them on every channel.
+    /// The sample of a frame is the mean of its two slots, which is the source
+    /// contract, so a buffer seeded with two different slots comes back
+    /// carrying their mean on every channel.
     fn staged_buffer(buffer: &[u32; TEST_WORDS as usize], role: BlockRole)
         -> [u32; TEST_WORDS as usize]
     {
@@ -3045,7 +3115,7 @@ mod tests
         for index in 0..TEST_WORDS
         {
             let first = index - index % WORDS_PER_FRAME;
-            let words = staged(carried_word(buffer, first + LOW_SLOT));
+            let words = staged_sample(frame_sample(buffer, first));
             let slot = index % WORDS_PER_FRAME;
 
             let word = match (role, slot)
@@ -3065,9 +3135,9 @@ mod tests
     /// Returns what a closed link seeded with `seed` hands a transparent chain
     /// at lap `laps`, counting from one.
     ///
-    /// The link closes on the master buffer, whose first slot carries the low
-    /// way, so each lap reads the words the low way left at the lap before, and
-    /// the first lap reads the seed.
+    /// The link closes on the master buffer, whose two slots carry the low way
+    /// and the mid way, so each lap reads the mean of the words those two ways
+    /// left at the lap before, and the first lap reads the seed.
     fn looped_buffer
     (
         seed: &[u32; TEST_WORDS as usize],
@@ -3621,33 +3691,34 @@ mod tests
         // 441 frames is odd, so the second block starts on the second slot of a
         // frame and one frame straddles the boundary. The carry runs on frames,
         // so the block that carries the straddling frame is the one holding its
-        // first slot, and the other block starts a frame further in.
+        // last slot, and that block starts its carry one slot early, on the
+        // first slot of the frame.
         let plan = plan();
 
         assert_eq!(plan.block_start(Half::First) % WORDS_PER_FRAME, 0);
         assert_eq!(plan.block_start(Half::Second) % WORDS_PER_FRAME, 1);
 
         assert_eq!(plan.carry_start(Half::First), 0);
-        assert_eq!(plan.carry_start(Half::Second), plan.block_start(Half::Second) + 1);
+        assert_eq!(plan.carry_start(Half::Second), plan.block_start(Half::Second) - 1);
     }
 
     #[test]
     fn the_two_carries_of_a_lap_write_the_buffer_once_between_them()
     {
         // The whole of what the frame rule buys. A block of an odd number of
-        // words carries one frame more than it holds slots for, the block after
-        // it carries one fewer, and the two come to the lap exactly. A rule that
-        // took the frame the other way round would write the straddling frame
-        // twice or never, and no state of half a frame is held between the two
-        // entries either way.
+        // words leaves its last slot, the first slot of the straddling frame,
+        // to the block after it, which carries that frame whole, and the two
+        // come to the lap exactly. A rule that took the frame in both blocks or
+        // in neither would write the straddling frame twice or never, and no
+        // state of half a frame is held between the two entries either way.
         let plan = plan();
         let first = plan.carry_words(Half::First);
         let second = plan.carry_words(Half::Second);
 
-        assert_eq!(plan.carry_frames(Half::First), 221);
-        assert_eq!(plan.carry_frames(Half::Second), 220);
-        assert_eq!(first, 442);
-        assert_eq!(second, 440);
+        assert_eq!(plan.carry_frames(Half::First), 220);
+        assert_eq!(plan.carry_frames(Half::Second), 221);
+        assert_eq!(first, 440);
+        assert_eq!(second, 442);
         assert_eq!(first + second, plan.transfer_items());
 
         // The second carry starts where the first one stopped, so the two spans
@@ -3655,11 +3726,12 @@ mod tests
         assert_eq!(plan.carry_start(Half::First) + first, plan.carry_start(Half::Second));
         assert_eq!(plan.carry_start(Half::Second) + second, plan.transfer_items());
 
-        // The span of the first block reaches past its own end, into the first
-        // word of the other half. That is the word a guard reading the block end
-        // would leave a read pointer sitting on.
-        assert_eq!(first, plan.block_words() + 1);
-        assert!(first > plan.block_end(Half::First));
+        // No span reaches past the end of its own block, so no carry reads a
+        // word of a half the receiving stream has not finished when its event
+        // is raised. The span of the first block stops one slot short of it.
+        assert_eq!(first, plan.block_words() - 1);
+        assert_eq!(plan.carry_start(Half::First) + first + 1, plan.block_end(Half::First));
+        assert_eq!(plan.carry_start(Half::Second) + second, plan.block_end(Half::Second));
     }
 
     #[test]
@@ -3736,9 +3808,9 @@ mod tests
         // against a second derivation of its span. The carry runs on a fresh
         // mock, the mock records which indices it reached, and every one of
         // those indices is then offered to the guard as a read pointer
-        // position. A guard reading the end of the BLOCK admits the last word of
-        // the first carry at a distance of zero, which is the whole margin, and
-        // the carry then writes the word the transmitting stream is reading.
+        // position. A guard reading the BLOCK rather than the span refuses one
+        // position of the lap too few on the second carry and one too many on
+        // the first, which the count below reads.
         //
         // The count closes the other direction. A guard that refused more than
         // the span and the margin would be one that refuses entries a healthy
@@ -3814,6 +3886,44 @@ mod tests
                 (
                     !plan.block_is_clear(half, position, shift()),
                     "half {half:?} at position {position}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_entry_on_time_leaves_each_carry_the_clearance_the_margin_is_measured_against()
+    {
+        // At an entry taken on time the read pointer stands one block past the
+        // receiving counter plus the counter distance, and the first word the
+        // carry writes stands the shift past the start of the carry. What lies
+        // between the two is the clearance the module documentation and the
+        // margin name: 433 words on the first block, 432 on the second, whose
+        // carry starts one slot before its block. It does not move with the
+        // distance a start-up leaves, which is swept, and each of those entries
+        // clears the guard.
+        let plan = plan();
+        let words = plan.transfer_items();
+
+        for offset in LOOP_OFFSETS
+        {
+            let shift = shift_at(offset);
+
+            for (half, clearance) in [(Half::First, 433), (Half::Second, 432)]
+            {
+                let position = (plan.block_end(half) + offset) % words;
+                let first = shift.destination(plan, plan.carry_start(half));
+
+                assert_eq!
+                (
+                    (first + words - position) % words,
+                    clearance,
+                    "the {half:?} carry at a distance of {offset} words"
+                );
+                assert!
+                (
+                    plan.block_is_clear(half, position, shift),
+                    "the {half:?} entry on time at a distance of {offset} words was refused"
                 );
             }
         }
@@ -4465,7 +4575,7 @@ mod tests
         {
             let index = plan.carry_start(half) + frame * WORDS_PER_FRAME;
             let at = (index + plan.arming_position() - PIPELINE_WORDS) % TEST_WORDS;
-            let ways = staged(0xC0DE_0000 | index);
+            let ways = staged(0xC0DE_0000 | index, 0xC0DE_0000 | (index + RIGHT_SLOT));
 
             place(master, at + LOW_SLOT, ways.low());
             place(master, at + MID_SLOT, ways.mid());
@@ -4691,7 +4801,7 @@ mod tests
                 {
                     let index = plan.carry_start(half) + frame * WORDS_PER_FRAME;
                     let at = (index + plan.arming_position() - PIPELINE_WORDS) % TEST_WORDS;
-                    let sample = source_sample(carried_word(&interface.source, index));
+                    let sample = frame_sample(&interface.source, index);
                     let want = WayWords::of
                     (
                         WaySamples { low: sample, mid: sample, high: walked_high.step(sample) },
@@ -4916,7 +5026,7 @@ mod tests
         {
             let index = plan.carry_start(half) + frame * WORDS_PER_FRAME;
             let at = (index + plan.arming_position() - PIPELINE_WORDS) % TEST_WORDS;
-            let sample = source_sample(carried_word(&interface.source, index));
+            let sample = frame_sample(&interface.source, index);
             let want = WayWords::of
             (
                 WaySamples
@@ -4966,10 +5076,10 @@ mod tests
 
         for word in [i32::MAX, i32::MIN, 0x4000_0000, -0x4000_0000, 1]
         {
-            let ways = stopped.carry(word.cast_unsigned());
+            let ways = stopped.carry(word.cast_unsigned(), word.cast_unsigned());
 
             assert_eq!(ways.high(), 0, "a silent limiter let {word} through");
-            assert_eq!(ways.low(), staged(word.cast_unsigned()).low());
+            assert_eq!(ways.low(), staged(word.cast_unsigned(), word.cast_unsigned()).low());
         }
     }
 
@@ -5070,8 +5180,9 @@ mod tests
     /// of the signal in one bin of the measurement below.
     ///
     /// Every slot of the frame carries the same sample, which is what a sender
-    /// of one channel puts on the link. The chain reads the first slot, and the
-    /// test that measures WHICH slot drives the two apart on purpose.
+    /// of one channel puts on the link, and the mean the chain reads is then
+    /// that sample. The tests that measure the mean drive the two slots apart
+    /// on purpose.
     fn sine_word(lap: u32, index: u32, cycles: u32, amplitude: f64) -> u32
     {
         let angle = TAU * f64::from(cycles) * f64::from(sample_of(lap, index))
@@ -5112,6 +5223,11 @@ mod tests
     /// before it is carried, and leaves in `master` and `slave` what each
     /// output buffer holds at the destination of every source index of the LAST
     /// lap.
+    ///
+    /// A half is filled whole before its carry and the half after it is not,
+    /// which is where the receiving stream stands at the event of that half. So
+    /// a carry reading a word past its half reads what the lap before left
+    /// there. Each destination is read right after the carry that writes it.
     ///
     /// It drives the source rather than closing the link on the output, which is
     /// the path the product runs: a source this board does not write, one chain,
@@ -5154,9 +5270,9 @@ mod tests
 
                 carry_block(&mut interface, &plan, half, shift(), chain);
 
-                for step in 0..plan.block_words()
+                for step in 0..plan.carry_words(half)
                 {
-                    let index = first + step;
+                    let index = plan.carry_start(half) + step;
                     let at = (index + plan.arming_position() - PIPELINE_WORDS) % TEST_WORDS;
 
                     place(master, index, carried_word(&interface.master, at));
@@ -5360,31 +5476,104 @@ mod tests
         }
     }
 
-    #[test]
-    fn the_chain_reads_the_first_slot_of_a_frame_and_nothing_else()
+    /// Returns a word no lap repeats at `index`, eleven and a half periods a
+    /// lap at 0.6 of `SWEEP_AMPLITUDE`.
+    ///
+    /// Half a period over, so the word a position holds turns over from one lap
+    /// to the next, and a reading of a position the source has not yet written
+    /// this lap answers the lap before rather than the same value.
+    fn turning_word(lap: u32, index: u32) -> u32
     {
-        // The source contract. The two slots of a source frame are two channels
-        // of one sender and the chain takes the first, since mixing them is a
-        // gain law and a ceiling rather than an average. So a source driven on
-        // the second slot alone answers silence on every channel, and the same
-        // source driven on the first alone answers the sweep. A chain that read
-        // the wrong slot, or averaged the two, fails one of the two readings.
-        const CYCLES: u32 = 5;
+        let angle = TAU * 11.5 * f64::from(sample_of(lap, index)) / f64::from(LAP_FRAMES);
 
-        let mut master = [0_u32; TEST_WORDS as usize];
-        let mut slave = [0_u32; TEST_WORDS as usize];
+        (round(0.6 * SWEEP_AMPLITUDE * sin(angle)) as i32).cast_unsigned()
+    }
+
+    #[test]
+    #[expect
+    (
+        clippy::cast_precision_loss,
+        reason = "the walk converts a word the way a single slot converts it, \
+                  which is what the chain is compared against"
+    )]
+    fn a_frame_holding_one_word_twice_answers_what_that_word_answers_alone()
+    {
+        // A sender of one channel puts one word on both slots. The chain then
+        // answers exactly what it answers that word converted on its own, so
+        // the mean costs such a sender nothing, not even a rounding. The walk
+        // beside the chain converts the word as one slot converts it and knows
+        // nothing of a mean. The words run a full scale tone, then both ends of
+        // the format and the odd words next to them, so a mean that doubled the
+        // sample, or rounded the sum past what the format holds, parts from the
+        // walk.
+        const EDGES: [i32; 8] = [i32::MAX, i32::MIN, i32::MAX - 1, i32::MIN + 1, 1, -1, 0, 3];
+
+        let mut carried = chain();
+        let mut walked = chain();
+        let mut compared = 0_u32;
+
+        for lap in 0..2
+        {
+            for frame in 0..LAP_FRAMES
+            {
+                let tone = sine_word(lap, frame * WORDS_PER_FRAME, 7, f64::from(i32::MAX));
+                let edge = EDGES.get((frame as usize) % EDGES.len()).copied().unwrap_or(0);
+
+                for word in [tone, edge.cast_unsigned()]
+                {
+                    let sample = word.cast_signed() as f32;
+                    let want = WayWords::of
+                    (
+                        WaySamples
+                        {
+                            low: walked.low.step(sample),
+                            mid: walked.mid.step(sample),
+                            high: walked.high.step(sample),
+                        },
+                        &mut walked.limiter
+                    );
+
+                    assert_eq!
+                    (
+                        carried.carry(word, word),
+                        want,
+                        "a frame holding {word:#010x} twice parted from the word alone \
+                         at frame {frame} of lap {lap}"
+                    );
+
+                    compared += 1;
+                }
+            }
+        }
+
+        assert_eq!(compared, 4 * LAP_FRAMES, "a frame went uncompared");
+        assert!(carried == walked, "the chain and the walk left different states");
+    }
+
+    #[test]
+    fn two_channels_in_opposition_answer_silence_and_one_channel_arrives_at_half()
+    {
+        // The mean, read through the carry of whole blocks rather than one
+        // call. Two channels in opposition cancel to zero exactly, so every
+        // word of both buffers is silent. One channel driven with the other
+        // silent reaches the chain at half its level, on either slot, and every
+        // word is read against a walk of the chain on that half sample, which
+        // knows nothing of slots, blocks or positions.
+        const LAPS: u32 = 3;
+
+        let mut master = [0xDEAD_BEEF_u32; TEST_WORDS as usize];
+        let mut slave = [0xDEAD_BEEF_u32; TEST_WORDS as usize];
 
         run_laps
         (
             &mut chain(),
-            SWEEP_WARM_LAPS + 1,
-            |lap, index| if index % WORDS_PER_FRAME == LOW_SLOT
+            LAPS,
+            |lap, index|
             {
-                0
-            }
-            else
-            {
-                sine_word(lap, index, CYCLES, SWEEP_AMPLITUDE)
+                let frame = index - index % WORDS_PER_FRAME;
+                let word = sine_word(lap, frame, 7, SWEEP_AMPLITUDE).cast_signed();
+
+                if index % WORDS_PER_FRAME == LEFT_SLOT { word } else { -word }.cast_unsigned()
             },
             &mut master,
             &mut slave
@@ -5392,45 +5581,233 @@ mod tests
 
         for index in 0..TEST_WORDS as usize
         {
-            assert_eq!
-            (
-                master.get(index).copied(),
-                Some(0),
-                "master word {index} answered a source the chain does not read"
-            );
-            assert_eq!
-            (
-                slave.get(index).copied(),
-                Some(0),
-                "slave word {index} answered a source the chain does not read"
-            );
+            assert_eq!(master.get(index).copied(), Some(0), "master word {index} of two channels in opposition");
+            assert_eq!(slave.get(index).copied(), Some(0), "slave word {index} of two channels in opposition");
         }
 
-        let mut driven_master = [0_u32; TEST_WORDS as usize];
-        let mut driven_slave = [0_u32; TEST_WORDS as usize];
+        for driven in [LEFT_SLOT, RIGHT_SLOT]
+        {
+            let mut master = [0_u32; TEST_WORDS as usize];
+            let mut slave = [0_u32; TEST_WORDS as usize];
+
+            run_laps
+            (
+                &mut chain(),
+                LAPS,
+                |lap, index| if index % WORDS_PER_FRAME == driven
+                {
+                    sine_word(lap, index, 7, SWEEP_AMPLITUDE)
+                }
+                else
+                {
+                    0
+                },
+                &mut master,
+                &mut slave
+            );
+
+            let mut walked = chain();
+
+            for lap in 0..LAPS
+            {
+                for frame in 0..LAP_FRAMES
+                {
+                    let index = frame * WORDS_PER_FRAME;
+                    let whole = frame_of(sine_word(lap, index, 7, SWEEP_AMPLITUDE).cast_signed());
+                    let half = (f64::from(whole) * 0.5) as f32;
+                    let want = WayWords::of
+                    (
+                        WaySamples
+                        {
+                            low: walked.low.step(half),
+                            mid: walked.mid.step(half),
+                            high: walked.high.step(half),
+                        },
+                        &mut walked.limiter
+                    );
+
+                    if lap + 1 < LAPS
+                    {
+                        continue;
+                    }
+
+                    for (buffer, slot, word) in
+                    [
+                        (&master, LOW_SLOT, want.low()),
+                        (&master, MID_SLOT, want.mid()),
+                        (&slave, HIGH_SLOT, want.high()),
+                    ]
+                    {
+                        assert_eq!
+                        (
+                            carried_word(buffer, index + slot),
+                            word,
+                            "slot {slot} of frame {frame} with slot {driven} alone driven"
+                        );
+                    }
+                }
+            }
+
+            assert!
+            (
+                amplitude_at(&master, MID_SLOT, 7) > 0.25 * SWEEP_AMPLITUDE,
+                "slot {driven} alone reached the mid way at nothing, so the reading \
+                 above compared silence"
+            );
+        }
+    }
+
+    #[test]
+    fn the_loudest_frames_of_the_format_do_not_come_back_round()
+    {
+        // The mean forms from two words of 32 bits, whose sum takes a 33rd.
+        // Every pairing of the two ends of the format and of the words beside
+        // them is carried through a block, and each answers the frame it holds
+        // read as the mean in double precision, through a transparent chain so
+        // the sample the chain was handed shows in every channel. A sum that
+        // wrapped answers two loud words of one sign as a quiet word of the
+        // other, and fails on the sign as well as on the value.
+        const WORDS: [i32; 4] = [i32::MAX, i32::MAX - 1, i32::MIN, i32::MIN + 1];
+
+        let plan = plan();
+        let mut interface = MockInput::healthy();
+        let mut pairs = 0_u32;
+
+        for frame in 0..plan.carry_frames(Half::First)
+        {
+            let left = WORDS.get((frame as usize) % 4).copied().unwrap_or(0);
+            let right = WORDS.get((frame as usize / 4) % 4).copied().unwrap_or(0);
+            let index = frame * WORDS_PER_FRAME;
+
+            place(&mut interface.source, index + LEFT_SLOT, left.cast_unsigned());
+            place(&mut interface.source, index + RIGHT_SLOT, right.cast_unsigned());
+        }
+
+        carry_block(&mut interface, &plan, Half::First, shift(), &mut transparent_chain());
+
+        for frame in 0..plan.carry_frames(Half::First)
+        {
+            let index = frame * WORDS_PER_FRAME;
+            let left = carried_word(&interface.source, index + LEFT_SLOT).cast_signed();
+            let right = carried_word(&interface.source, index + RIGHT_SLOT).cast_signed();
+            let at = (index + plan.arming_position() - PIPELINE_WORDS) % TEST_WORDS;
+            let want = staged(left.cast_unsigned(), right.cast_unsigned());
+            let low = carried_word(&interface.master, at + LOW_SLOT);
+
+            assert_eq!(low, want.low(), "the low way of the frame {left} and {right}");
+            assert_eq!(carried_word(&interface.master, at + MID_SLOT), want.mid(), "the mid way of the frame {left} and {right}");
+            assert_eq!(carried_word(&interface.slave, at + HIGH_SLOT), want.high(), "the high way of the frame {left} and {right}");
+
+            // Two words of one sign leave on that sign, at the level one of
+            // them leaves at on its own.
+            if (left > 0) == (right > 0)
+            {
+                let alone = staged(left.cast_unsigned(), left.cast_unsigned()).low().cast_signed();
+
+                assert_eq!(low.cast_signed().signum(), left.signum(), "the frame {left} and {right} came back round");
+                assert!
+                (
+                    low.cast_signed().unsigned_abs() <= alone.unsigned_abs().max(1_u32 << 31),
+                    "the frame {left} and {right} left louder than one word"
+                );
+                pairs += 1;
+            }
+        }
+
+        assert!(pairs >= 8, "the block carried {pairs} frames of one sign");
+    }
+
+    #[test]
+    fn the_two_channels_of_every_frame_join_across_the_blocks_of_a_run()
+    {
+        // The mean across several blocks, the straddling frame included. The
+        // two slots carry different signals, a tone on the left and on the
+        // right a word no lap repeats, so a carry that read the left slot twice,
+        // or the right slot of the frame before, or the straddling frame before
+        // the receiving stream finished it, parts from a straight walk of the
+        // same frames. The walk forms each mean from the two
+        // signals rather than from a buffer, and knows nothing of halves,
+        // positions or shifts. The two blocks of a lap start on different slots
+        // of a frame, which is what makes the seam a real one to cross.
+        const LAPS: u32 = 4;
+
+        let left = |lap: u32, index: u32| sine_word(lap, index, 7, SWEEP_AMPLITUDE);
+        let mut master = [0_u32; TEST_WORDS as usize];
+        let mut slave = [0_u32; TEST_WORDS as usize];
 
         run_laps
         (
             &mut chain(),
-            SWEEP_WARM_LAPS + 1,
-            |lap, index| if index % WORDS_PER_FRAME == LOW_SLOT
+            LAPS,
+            |lap, index| if index % WORDS_PER_FRAME == LEFT_SLOT
             {
-                sine_word(lap, index, CYCLES, SWEEP_AMPLITUDE)
+                left(lap, index)
             }
             else
             {
-                0
+                turning_word(lap, index)
             },
-            &mut driven_master,
-            &mut driven_slave
+            &mut master,
+            &mut slave
         );
+
+        let mut straight = chain();
+        let plan = plan();
+        let straddling = plan.carry_start(Half::Second);
 
         assert!
         (
-            amplitude_at(&driven_master, LOW_SLOT, CYCLES) > 0.0,
-            "the slot the chain reads carried nothing, so the reading above \
-             proves nothing"
+            straddling < plan.block_end(Half::First)
+                && straddling + RIGHT_SLOT == plan.block_start(Half::Second),
+            "frame {straddling} does not straddle the two blocks"
         );
+        assert_ne!
+        (
+            turning_word(LAPS - 1, straddling + RIGHT_SLOT),
+            turning_word(LAPS - 2, straddling + RIGHT_SLOT),
+            "the right slot of the straddling frame repeats the lap before, so a \
+             stale reading of it would pass"
+        );
+
+        for lap in 0..LAPS
+        {
+            for frame in 0..LAP_FRAMES
+            {
+                let index = frame * WORDS_PER_FRAME;
+                let sample = source_sample(left(lap, index), turning_word(lap, index + RIGHT_SLOT));
+                let want = WayWords::of
+                (
+                    WaySamples
+                    {
+                        low: straight.low.step(sample),
+                        mid: straight.mid.step(sample),
+                        high: straight.high.step(sample),
+                    },
+                    &mut straight.limiter
+                );
+
+                if lap + 1 < LAPS
+                {
+                    continue;
+                }
+
+                for (buffer, slot, word) in
+                [
+                    (&master, LOW_SLOT, want.low()),
+                    (&master, MID_SLOT, want.mid()),
+                    (&slave, HIGH_SLOT, want.high()),
+                ]
+                {
+                    assert_eq!
+                    (
+                        carried_word(buffer, index + slot),
+                        word,
+                        "slot {slot} of frame {frame} of the last lap does not continue \
+                         the run of the two channels"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -5558,7 +5935,11 @@ mod tests
             for frame in 0..LAP_FRAMES
             {
                 let index = frame * WORDS_PER_FRAME;
-                let ways = straight.carry(sine_word(lap, index, 7, SWEEP_AMPLITUDE));
+                let ways = straight.carry
+                (
+                    sine_word(lap, index + LEFT_SLOT, 7, SWEEP_AMPLITUDE),
+                    sine_word(lap, index + RIGHT_SLOT, 7, SWEEP_AMPLITUDE)
+                );
 
                 place(&mut want_master, index + LOW_SLOT, ways.low());
                 place(&mut want_master, index + MID_SLOT, ways.mid());
@@ -5838,6 +6219,19 @@ mod tests
         }
     }
 
+    /// Returns the sample the carry reads a source frame holding `word` in both
+    /// slots as.
+    ///
+    /// The loudest sources below are frames of that shape. The mean of two
+    /// words stands at full scale or under, and a frame holding one word twice
+    /// answers that word, so a frame of this shape reaches every sample any
+    /// frame reaches, full scale on either side included, and a bound it
+    /// attains is the bound over every frame the format carries.
+    fn frame_of(word: i32) -> f32
+    {
+        source_sample(word.cast_unsigned(), word.cast_unsigned())
+    }
+
     /// Returns the loudest word the high way leaves for a full scale square of
     /// `half` samples to the half period, read through the output stage.
     ///
@@ -5856,7 +6250,7 @@ mod tests
         {
             let sample = if (step / half).is_multiple_of(2) { i32::MIN } else { i32::MAX };
             let answered =
-                staged_sample(cascade.step(source_sample(sample.cast_unsigned()))).high();
+                staged_sample(cascade.step(frame_of(sample))).high();
 
             if step >= 8 * half
             {
@@ -5913,7 +6307,7 @@ mod tests
         for sign in positive.iter().rev()
         {
             let sample = if *sign { i32::MAX } else { i32::MIN };
-            let answer = driven.step(source_sample(sample.cast_unsigned()));
+            let answer = driven.step(frame_of(sample));
             let answered = staged_sample(answer).high();
             let carried = WayWords::of
             (
@@ -6029,7 +6423,7 @@ mod tests
             for sign in positive.iter().rev()
             {
                 let sample = if *sign == turned { i32::MIN } else { i32::MAX };
-                let answer = driven.step(source_sample(sample.cast_unsigned()));
+                let answer = driven.step(frame_of(sample));
                 let reference = f64::from(answer * gain);
                 let side = reference > 0.0;
 
@@ -6390,6 +6784,42 @@ mod tests
         chain: &mut FilterChain
     ) -> Result<(), PassthroughFault>
     {
+        let words = plan().transfer_items();
+
+        run_wire
+        (
+            interface,
+            laps,
+            shift,
+            chain,
+            |interface, _, at|
+            {
+                carried_word(&interface.master, (at + interface.offset + words - PIPELINE_WORDS) % words)
+            }
+        )
+    }
+
+    /// Runs the block structure for `laps` laps over a link that puts the word
+    /// `link` names into the receiving buffer, one word a slot.
+    ///
+    /// `link` is handed the interface as it stands at that slot, the lap and
+    /// the position. A transfer event is raised at the slot that fills a half,
+    /// which is where the part raises one, and it is served before the next
+    /// word arrives. So a carry runs with the half its event names written and
+    /// every word after that half still holding what the lap before left there,
+    /// or zero on the first lap, which is where the receiving stream stands
+    /// when the part raises the event.
+    fn run_wire<F>
+    (
+        interface: &mut MockInput,
+        laps: u32,
+        shift: CarryShift,
+        chain: &mut FilterChain,
+        link: F
+    ) -> Result<(), PassthroughFault>
+    where
+        F: Fn(&MockInput, u32, u32) -> u32,
+    {
         let plan = plan();
         let words = plan.transfer_items();
         let block = plan.block_words();
@@ -6397,13 +6827,9 @@ mod tests
         for slot in 0..laps * words
         {
             let at = slot % words;
-            let read = ((at + interface.offset + words - PIPELINE_WORDS) % words) as usize;
-            let word = interface.master.get(read).copied().unwrap_or(0);
+            let word = link(interface, slot / words, at);
 
-            if let Some(place) = interface.source.get_mut(at as usize)
-            {
-                *place = word;
-            }
+            place(&mut interface.source, at, word);
 
             let filled = match at + 1
             {
@@ -6418,6 +6844,95 @@ mod tests
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn a_carry_reads_no_word_the_link_has_not_delivered_when_its_event_is_raised()
+    {
+        // The rhythm of the wire against the event. The link delivers one word
+        // a slot and each event is served at the slot that raises it, so the
+        // half a carry answers is in and the word after it is not. The part
+        // raises the event at that same slot, so a carry reading a word past
+        // its half depends on outrunning the wire to find it, and here it reads
+        // the lap before whatever order its loop reads in. Every word of the
+        // source turns over from one lap to the next, so such a reading parts
+        // from a straight walk of the frames, which knows nothing of events,
+        // halves or positions. The run is taken at every counter distance of
+        // the loop tests, since the distance moves the destinations against
+        // the event.
+        const LAPS: u32 = 3;
+
+        let plan = plan();
+
+        for offset in LOOP_OFFSETS
+        {
+            let mut interface = MockInput::healthy();
+
+            interface.offset = offset;
+
+            let shift = shift_at(offset);
+
+            assert_eq!
+            (
+                bring_up(&mut interface, &plan, &waits()),
+                Ok(shift),
+                "the bring-up refused a distance of {offset} words"
+            );
+            assert_eq!
+            (
+                run_wire(&mut interface, LAPS, shift, &mut chain(), |_, lap, at| turning_word(lap, at)),
+                Ok(()),
+                "an event was refused at a distance of {offset} words"
+            );
+
+            let mut straight = chain();
+
+            for lap in 0..LAPS
+            {
+                for frame in 0..LAP_FRAMES
+                {
+                    let index = frame * WORDS_PER_FRAME;
+                    let sample = source_sample
+                    (
+                        turning_word(lap, index + LEFT_SLOT),
+                        turning_word(lap, index + RIGHT_SLOT)
+                    );
+                    let want = WayWords::of
+                    (
+                        WaySamples
+                        {
+                            low: straight.low.step(sample),
+                            mid: straight.mid.step(sample),
+                            high: straight.high.step(sample),
+                        },
+                        &mut straight.limiter
+                    );
+
+                    if lap + 1 < LAPS
+                    {
+                        continue;
+                    }
+
+                    let at = (index + offset - PIPELINE_WORDS) % TEST_WORDS;
+
+                    for (buffer, slot, word) in
+                    [
+                        (&interface.master, LOW_SLOT, want.low()),
+                        (&interface.master, MID_SLOT, want.mid()),
+                        (&interface.slave, HIGH_SLOT, want.high()),
+                    ]
+                    {
+                        assert_eq!
+                        (
+                            carried_word(buffer, at + slot),
+                            word,
+                            "slot {slot} of frame {frame} of the last lap at a distance of \
+                             {offset} words does not continue the walk"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Returns the largest step between two neighbouring samples of one channel
@@ -6484,10 +6999,11 @@ mod tests
             // word rather than the seeded one.
             //
             // What each channel comes back holding is the word that entered the
-            // last lap at the gain of its own way. The link closes on the slot
-            // the low way leaves in, and that way carries the peak reserve, so
-            // the content falls two decibels a lap and stays in place. The
-            // expectation walks the stage the same number of laps.
+            // last lap at the gain of its own way. The link closes on the two
+            // slots the low way and the mid way leave in, and the chain reads
+            // their mean, so the content falls at every lap by the gain those
+            // two ways carry and stays in place. The expectation walks the
+            // stage the same number of laps.
             let entered = looped_buffer(&narrowed_buffer(&interface.master), 12);
             let want_master = staged_buffer(&entered, BlockRole::Master);
             let want_slave = staged_buffer(&entered, BlockRole::Slave);
@@ -6514,9 +7030,9 @@ mod tests
 
     /// Fall a closed link of twelve laps must leave, as a divisor of the seed.
     ///
-    /// The measurement beside the test that reads it stands at a 218th, so this
-    /// is half of what was measured.
-    const DECAY_FLOOR: u32 = 109;
+    /// The measurement beside the test that reads it stands at a 2476th, so
+    /// this is half of what was measured.
+    const DECAY_FLOOR: u32 = 1_237;
 
     /// Returns the largest magnitude any word of `buffer` carries.
     fn largest_magnitude(buffer: &[u32; TEST_WORDS as usize]) -> u32
@@ -6536,17 +7052,18 @@ mod tests
         // carries what this board sent, so its content crosses a way once a lap
         // and what survives is the part of it that way passes.
         //
-        // The link closes on the master buffer, whose first slot carries the LOW
-        // way, so the seeded 1000 Hz tone re-enters the low way at every lap and
-        // that way is 42 dB down there.
+        // The link closes on the master buffer, whose two slots carry the LOW
+        // way and the MID way, so the seeded 1000 Hz tone re-enters the chain
+        // at every lap as the mean of what those two ways left. The mid way
+        // passes that tone and the mean halves it, the low way is 42 dB down
+        // there.
         //
         // MEASURED here, from a seed of 268433753, on the largest word of the
-        // master buffer. For the first two laps it stands on the mid slot, which
-        // carries the tone in the pass band of the mid way, at 175635152 and
-        // then 157879712. From the third lap on it stands on the low slot, and
-        // it does not fall by a fixed step a lap: eleven laps leave 1151070 and
-        // twelve leave 1229797, a 218th of the seed. The bound below is half
-        // that measured fall.
+        // master buffer. For the first six laps it stands on the mid slot, at
+        // 175635152 after one lap and 1292714 after six. From the seventh lap
+        // on it stands on the low slot, and it does not fall by a fixed step a
+        // lap: eleven laps leave 172062 and twelve leave 108416, a 2476th of
+        // the seed. The bound below is half that measured fall.
         //
         // It is also the reason a closed link can measure WHERE a word lands and
         // never what the chain does to it: a bench reading this loop reads a
@@ -6604,7 +7121,8 @@ mod tests
             // The tone each channel is read against is the tone that entered
             // the last lap at the gain of that channel, since the stage under
             // the carry brings each of the three down and the link feeds the
-            // low way back at every lap. A channel is compared against its own,
+            // mean of the low way and the mid way back at every lap. A channel
+            // is compared against its own,
             // which leaves the reading here about the JOIN and about nothing
             // else.
             let entered = looped_buffer(&narrowed_buffer(&interface.master), 12);

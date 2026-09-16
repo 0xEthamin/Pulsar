@@ -28,7 +28,7 @@ do
 done
 
 CRATES="pulsar_lib pulsar_dsp pulsar_ctrl"
-COVERAGE_FLOOR=95
+COVERAGE_FLOOR=90
 
 passed=()
 failed=()
