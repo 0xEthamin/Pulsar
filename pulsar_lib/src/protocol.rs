@@ -66,12 +66,99 @@ pub const MAX_PAYLOAD_LEN: usize = payload_len(VOLUME_FIELDS);
 /// A caller sizes its transmit buffer from this.
 pub const MAX_FRAME_LEN: usize = MAX_PAYLOAD_LEN + FRAME_OVERHEAD;
 
-/// Highest value either volume control takes.
+/// Highest step of the coarse control on the cabinet, which sits at 0 dB.
+///
+/// Step `n` stands for `(n - 13) x 3` dB and step 0 mutes, so the control
+/// covers the 36 dB below full scale in 3 dB steps.
+pub const COARSE_MAX: u8 = 13;
+
+/// Coarse step the cabinet starts on at power up: -24 dB.
+///
+/// The encoder is incremental and no step survives a power cycle.
+pub const COARSE_DEFAULT: u8 = 5;
+
+/// Highest value of the fine control, which sits at 0 dB.
 ///
 /// AVRCP 1.6.3 section 6.13.1 carries absolute volume as one octet from 0x00 to
-/// 0x7F. The coarse control on the cabinet uses the same scale, so neither
-/// field needs converting before the two are multiplied.
-pub const VOLUME_MAX: u8 = 0x7F;
+/// 0x7F. Value `v` stands for `(v - 127) x 24 / 127` dB and 0 mutes.
+pub const FINE_MAX: u8 = 0x7F;
+
+/// Bit 7 of an AVRCP absolute volume octet.
+///
+/// AVRCP 1.6.3 section 6.13.1 reserves it for future additions, and section
+/// 1.3.2.1 tells a receiver to ignore such bits.
+const ABSOLUTE_VOLUME_RFA: u8 = 0x80;
+
+/// Ratio of the linear gains of two neighbouring coarse steps, `10^(-3/20)`.
+///
+/// The exhaustive test of the volume law holds the literal to the formula.
+const COARSE_STEP_RATIO: f64 = 0.707_945_784_384_137_9;
+
+/// Ratio of the linear gains of two neighbouring fine values,
+/// `10^(-24/(127 x 20))`.
+///
+/// The exhaustive test of the volume law holds the literal to the formula.
+const FINE_STEP_RATIO: f64 = 0.978_478_260_521_376_1;
+
+/// Linear gain of each coarse step, 0 at step 0 and 1 at `COARSE_MAX`.
+const COARSE_GAIN: [f32; COARSE_MAX as usize + 1] = gain_table(COARSE_STEP_RATIO);
+
+/// Linear gain of each fine value, 0 at value 0 and 1 at `FINE_MAX`.
+const FINE_GAIN: [f32; FINE_MAX as usize + 1] = gain_table(FINE_STEP_RATIO);
+
+/// Builds a table whose last entry is 1, each entry below it `ratio` times the
+/// one above, and whose first entry is 0.
+///
+/// The powers accumulate in double precision and each entry narrows once, so
+/// an entry carries the rounding of one narrowing over a double precision
+/// error below 1e-13. No exponentiation runs on the target.
+#[expect
+(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::cast_possible_truncation,
+    reason = "the table is built in a constant, where an index out of bounds \
+              fails the build, and narrowing to single precision is what the \
+              audio path carries"
+)]
+const fn gain_table<const N: usize>(ratio: f64) -> [f32; N]
+{
+    let mut table = [0.0_f32; N];
+    let mut power = 1.0_f64;
+    let mut index = N;
+    while index > 1
+    {
+        index -= 1;
+        table[index] = power as f32;
+        power *= ratio;
+    }
+    table
+}
+
+/// Moves a coarse step by `steps` encoder detents, held to 0 and `COARSE_MAX`.
+///
+/// A negative count turns the level down. A `coarse` above `COARSE_MAX` counts
+/// from `COARSE_MAX`.
+#[must_use]
+pub fn step_coarse(coarse: u8, steps: i32) -> u8
+{
+    let ceiling = i32::from(COARSE_MAX);
+    let moved = i32::from(coarse.min(COARSE_MAX))
+        .saturating_add(steps)
+        .clamp(0, ceiling);
+    u8::try_from(moved).unwrap_or(COARSE_MAX)
+}
+
+/// Returns the fine value an AVRCP absolute volume octet carries.
+///
+/// AVRCP 1.6.3 section 6.13.1: "The top bit (bit 7) is reserved for future
+/// addition (RFA)." Section 1.3.2.1: "Receivers shall ignore these bits." The
+/// remaining seven bits are the value, 0x00 for 0 percent and 0x7F for 100.
+#[must_use]
+pub const fn fine_from_absolute_volume(octet: u8) -> u8
+{
+    octet & !ABSOLUTE_VOLUME_RFA
+}
 
 // Tags of the two directions occupy disjoint ranges, so a frame that arrives on
 // the wrong link fails as an unknown tag rather than decoding into a plausible
@@ -250,11 +337,12 @@ impl Fault
     }
 }
 
-/// The two volume controls, carried on the AVRCP scale.
+/// The two volume controls: a coarse step from the cabinet and a fine value
+/// from AVRCP absolute volume.
 ///
-/// The pair travels in one frame because the processing board multiplies both
-/// into a single digital gain. Split across two messages, one could arrive
-/// without the other and move the level twice.
+/// The pair travels in one frame because the processing board sums both in
+/// decibels into a single digital gain. Split across two messages, one could
+/// arrive without the other and move the level twice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Volume
 {
@@ -275,10 +363,11 @@ impl Volume
     ///
     /// # Errors
     ///
-    /// Returns `BadPayload` when either value exceeds `VOLUME_MAX`.
+    /// Returns `BadPayload` when `coarse` exceeds `COARSE_MAX` or `fine`
+    /// exceeds `FINE_MAX`.
     pub fn new(coarse: u8, fine: u8) -> Result<Self, ProtocolError>
     {
-        if coarse > VOLUME_MAX || fine > VOLUME_MAX
+        if coarse > COARSE_MAX || fine > FINE_MAX
         {
             return Err(ProtocolError::BadPayload);
         }
@@ -302,15 +391,18 @@ impl Volume
         self.fine
     }
 
-    /// Returns the product of both controls as a linear gain in 0 to 1, held at
-    /// `FULL_SCALE`.
+    /// Returns the linear gain of both controls, held at `FULL_SCALE`.
+    ///
+    /// The gain is `10^((coarse dB + fine dB) / 20)`: exactly 1 with both
+    /// controls at their maximum, and exactly 0 with either at zero.
     ///
     /// This is the raw setting. `crate::control::ControlState` turns it into a
     /// value the chain applies, because a setting applied as a step pops.
     pub(crate) fn linear_gain(self) -> f32
     {
-        let scale = f32::from(VOLUME_MAX);
-        let gain = (f32::from(self.coarse) / scale) * (f32::from(self.fine) / scale);
+        let coarse = COARSE_GAIN.get(usize::from(self.coarse)).copied().unwrap_or(0.0);
+        let fine = FINE_GAIN.get(usize::from(self.fine)).copied().unwrap_or(0.0);
+        let gain = coarse * fine;
         if gain > FULL_SCALE
         {
             return FULL_SCALE;
@@ -709,10 +801,13 @@ mod tests
         round_trip(ToDsp::SelectPreset(Preset::Home));
         round_trip(ToDsp::SelectPreset(Preset::Garden));
         round_trip(ToDsp::SelectPreset(Preset::BassBoosted));
-        match Volume::new(0x40, VOLUME_MAX)
+        for (coarse, fine) in [(0, 0), (COARSE_DEFAULT, 0x40), (COARSE_MAX, FINE_MAX)]
         {
-            Ok(volume) => round_trip(ToDsp::SetVolume(volume)),
-            Err(error) => panic!("volume rejected: {error:?}"),
+            match Volume::new(coarse, fine)
+            {
+                Ok(volume) => round_trip(ToDsp::SetVolume(volume)),
+                Err(error) => panic!("volume rejected: {error:?}"),
+            }
         }
     }
 
@@ -829,42 +924,173 @@ mod tests
         }
     }
 
-    #[test]
-    fn a_volume_above_the_avrcp_range_is_refused()
+    /// Builds a volume pair, failing the test rather than returning an error.
+    fn volume(coarse: u8, fine: u8) -> Volume
     {
-        assert_eq!(Volume::new(VOLUME_MAX + 1, 0), Err(ProtocolError::BadPayload));
-        assert_eq!(Volume::new(0, VOLUME_MAX + 1), Err(ProtocolError::BadPayload));
-        assert!(Volume::new(VOLUME_MAX, VOLUME_MAX).is_ok());
+        match Volume::new(coarse, fine)
+        {
+            Ok(volume) => volume,
+            Err(error) => panic!("volume rejected: {error:?}"),
+        }
+    }
+
+    /// Returns the gain the volume law defines, in double precision.
+    ///
+    /// The formula is written out here from the decibel figures, so the tables
+    /// and the ratios they are built from are what the tests hold against it.
+    fn reference_gain(coarse: u8, fine: u8) -> f64
+    {
+        if coarse == 0 || fine == 0
+        {
+            return 0.0;
+        }
+        let coarse_db = (f64::from(coarse) - 13.0) * 3.0;
+        let fine_db = (f64::from(fine) - 127.0) * 24.0 / 127.0;
+        10.0_f64.powf((coarse_db + fine_db) / 20.0)
     }
 
     #[test]
-    fn the_volume_gain_never_exceeds_one()
+    fn a_volume_outside_either_range_is_refused()
     {
-        // The bound is the literal, so moving FULL_SCALE moves the code under
-        // the test rather than the test with it.
-        for coarse in 0..=VOLUME_MAX
+        assert_eq!(Volume::new(COARSE_MAX + 1, 0), Err(ProtocolError::BadPayload));
+        assert_eq!(Volume::new(u8::MAX, 0), Err(ProtocolError::BadPayload));
+        assert_eq!(Volume::new(0, FINE_MAX + 1), Err(ProtocolError::BadPayload));
+        assert_eq!(Volume::new(0, u8::MAX), Err(ProtocolError::BadPayload));
+        assert!(Volume::new(COARSE_MAX, FINE_MAX).is_ok());
+    }
+
+    #[test]
+    fn a_volume_frame_with_a_coarse_step_above_the_range_is_refused()
+    {
+        // The checksum is recomputed, so the frame fails on the field rather
+        // than on its checksum. The step just below the bound decodes.
+        for (coarse, expected) in
+        [
+            (COARSE_MAX, None),
+            (COARSE_MAX + 1, Some(ProtocolError::BadPayload)),
+            (0x7F, Some(ProtocolError::BadPayload)),
+        ]
         {
-            for fine in 0..=VOLUME_MAX
+            let mut frame = [0_u8; MAX_FRAME_LEN];
+            match frame_into(&[TAG_TO_DSP_VOLUME, coarse, FINE_MAX], &mut frame)
             {
-                match Volume::new(coarse, fine)
+                Ok(_) => (),
+                Err(error) => panic!("framing failed: {error:?}"),
+            }
+            match (ToDsp::decode(&frame), expected)
+            {
+                (Err(error), Some(refusal)) => assert_eq!(error, refusal),
+                (Ok((ToDsp::SetVolume(decoded), _)), None) =>
                 {
-                    Ok(volume) =>
-                    {
-                        let gain = volume.linear_gain();
-                        assert!(gain >= 0.0);
-                        assert!(gain <= 1.0);
-                    }
-                    Err(error) => panic!("volume rejected: {error:?}"),
+                    assert_eq!(decoded, volume(coarse, FINE_MAX));
                 }
+                (outcome, _) => panic!("coarse step {coarse} decoded as {outcome:?}"),
             }
         }
+    }
 
-        match Volume::new(VOLUME_MAX, VOLUME_MAX)
+    #[test]
+    fn the_volume_law_matches_the_decibel_formula_at_every_setting()
+    {
+        // Each table entry is the nearest single precision value to a double
+        // precision power, which is off by at most half of one unit in the last
+        // place, a relative error of `f32::EPSILON / 2`. The product rounds
+        // once more. Three such roundings stay under `1.5 * f32::EPSILON`
+        // relative, and the powers built in double precision add a relative
+        // error below 1e-13. Two `f32::EPSILON` covers all of it, which is
+        // 2.1e-6 dB.
+        let tolerance = 2.0 * f64::from(f32::EPSILON);
+        for coarse in 0..=COARSE_MAX
         {
-            Ok(volume) => assert!((volume.linear_gain() - 1.0).abs() < f32::EPSILON),
-            Err(error) => panic!("volume rejected: {error:?}"),
+            for fine in 0..=FINE_MAX
+            {
+                let gain = volume(coarse, fine).linear_gain();
+                let reference = reference_gain(coarse, fine);
+                assert!
+                (
+                    (f64::from(gain) - reference).abs() <= tolerance * reference,
+                    "coarse {coarse} fine {fine} gives {gain} against {reference}"
+                );
+                assert!((0.0..=1.0).contains(&gain), "coarse {coarse} fine {fine} gives {gain}");
+            }
         }
-        assert!((Volume::MUTED.linear_gain() - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn the_volume_law_is_exact_at_its_ends()
+    {
+        // Bit patterns, so a gain a rounding away from 1 or a negative zero
+        // fails where an epsilon would let it through.
+        assert_eq!(volume(COARSE_MAX, FINE_MAX).linear_gain().to_bits(), 1.0_f32.to_bits());
+        for other in 0..=u8::MAX
+        {
+            if let Ok(fine_only) = Volume::new(0, other)
+            {
+                assert_eq!(fine_only.linear_gain().to_bits(), 0.0_f32.to_bits());
+            }
+            if let Ok(coarse_only) = Volume::new(other, 0)
+            {
+                assert_eq!(coarse_only.linear_gain().to_bits(), 0.0_f32.to_bits());
+            }
+        }
+        assert_eq!(Volume::MUTED.linear_gain().to_bits(), 0.0_f32.to_bits());
+    }
+
+    #[test]
+    fn the_volume_law_rises_with_each_control()
+    {
+        for coarse in 1..=COARSE_MAX
+        {
+            for fine in 1..=FINE_MAX
+            {
+                let here = volume(coarse, fine).linear_gain();
+                let below_fine = volume(coarse, fine - 1).linear_gain();
+                let below_coarse = volume(coarse - 1, fine).linear_gain();
+                assert!(here > below_fine, "fine {fine} at coarse {coarse} does not rise");
+                assert!(here > below_coarse, "coarse {coarse} at fine {fine} does not rise");
+            }
+        }
+    }
+
+    #[test]
+    fn the_default_coarse_step_sits_at_minus_24_db()
+    {
+        let gain = f64::from(volume(COARSE_DEFAULT, FINE_MAX).linear_gain());
+        let expected = 10.0_f64.powf(-24.0 / 20.0);
+        assert!((gain - expected).abs() <= 2.0 * f64::from(f32::EPSILON) * expected);
+    }
+
+    #[test]
+    fn a_coarse_step_moves_by_its_detents_and_holds_at_both_ends()
+    {
+        let ceiling = i64::from(COARSE_MAX);
+        for coarse in (0..=COARSE_MAX + 2).chain([u8::MAX])
+        {
+            for steps in (-30..=30).chain([i32::MIN, i32::MIN + 1, i32::MAX - 1, i32::MAX])
+            {
+                let start = i64::from(coarse).min(ceiling);
+                let expected = (start + i64::from(steps)).clamp(0, ceiling);
+                assert_eq!
+                (
+                    i64::from(step_coarse(coarse, steps)),
+                    expected,
+                    "step {coarse} moved by {steps}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_absolute_volume_octet_drops_its_reserved_bit()
+    {
+        for octet in 0..=u8::MAX
+        {
+            let fine = fine_from_absolute_volume(octet);
+            assert_eq!(fine, octet % 0x80, "octet {octet:#04x}");
+            assert!(Volume::new(COARSE_MAX, fine).is_ok());
+        }
+        assert_eq!(fine_from_absolute_volume(0x80), 0);
+        assert_eq!(fine_from_absolute_volume(0xFF), FINE_MAX);
     }
 
     #[test]
@@ -971,11 +1197,7 @@ mod tests
     #[test]
     fn a_reader_recovers_after_a_truncated_frame()
     {
-        let (first, first_len) = encoded(&ToDsp::SetVolume(match Volume::new(0x10, 0x20)
-        {
-            Ok(volume) => volume,
-            Err(error) => panic!("volume rejected: {error:?}"),
-        }));
+        let (first, first_len) = encoded(&ToDsp::SetVolume(volume(0x0A, 0x20)));
         let (second, second_len) = encoded(&ToDsp::SelectPreset(Preset::Home));
 
         // The head of a frame, cut before its checksum, then a whole frame.
@@ -1041,12 +1263,7 @@ mod tests
     #[test]
     fn the_payload_bound_is_the_width_of_the_widest_message()
     {
-        let volume = match Volume::new(VOLUME_MAX, VOLUME_MAX)
-        {
-            Ok(volume) => volume,
-            Err(error) => panic!("volume rejected: {error:?}"),
-        };
-        let (_, widest) = encoded(&ToDsp::SetVolume(volume));
+        let (_, widest) = encoded(&ToDsp::SetVolume(volume(COARSE_MAX, FINE_MAX)));
         assert_eq!(widest, MAX_FRAME_LEN);
 
         for message in

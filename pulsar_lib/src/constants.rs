@@ -129,12 +129,25 @@ pub const MUTE_SEQUENCE_US: f32 = MUTE_SEQUENCE_US_TIMES_RATE as f32 / SAMPLE_RA
 /// the assertion below is what holds those two figures against each other.
 const ZERO_DATA_MUTE_FRAMES: u32 = 1_024;
 
-/// Duration of a gain ramp, in milliseconds.
+/// Shortest gain ramp, in milliseconds.
 ///
-/// Every gain change is ramped, because a step pops. The ramp is long enough
-/// to bury the step and short enough that a volume change still answers at
-/// once, which places it between 10 and 50 ms.
+/// Every gain change ramps for at least this long, because a step pops.
 pub const GAIN_RAMP_MS: u32 = 20;
+
+/// Longest ramp one step of either volume control takes, in milliseconds.
+///
+/// A ramp is long enough to bury the step and short enough that a volume change
+/// still answers at once, which places it between 10 and 50 ms.
+pub const GAIN_STEP_RAMP_MAX_MS: u32 = 50;
+
+/// Time the gain takes to cross from 0 to 1 at its fastest, in milliseconds.
+///
+/// This bounds the speed of every gain change. The widest single step of the
+/// volume law, 3 dB at the top of the coarse control, spans `1 - 10^(-3/20)`,
+/// 0.29205 of full scale. Crossing it in `GAIN_STEP_RAMP_MAX_MS` puts a full
+/// swing at 171.20 ms, and the count rounds down so that step lands inside the
+/// bound, at 49.94 ms.
+pub const GAIN_FULL_SWING_MS: u32 = 171;
 
 /// Returns the delay loop iterations covering the converter mute sequence.
 ///
@@ -205,6 +218,12 @@ const _: () = assert!
 (
     GAIN_RAMP_MS > 0,
     "a ramp of zero length is a step, and a step pops"
+);
+
+const _: () = assert!
+(
+    GAIN_RAMP_MS <= GAIN_STEP_RAMP_MAX_MS && GAIN_STEP_RAMP_MAX_MS <= GAIN_FULL_SWING_MS,
+    "the shortest ramp fits inside the longest step, which fits inside a full swing"
 );
 
 /// Whether the count fits `u32` at every core clock.
