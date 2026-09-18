@@ -2874,6 +2874,34 @@ mod tests
             self.trimmed = u64::from(stats.trimmed);
             self.underruns = u64::from(stats.underruns);
         }
+
+        /// Folds in a drain of `bridge` that wrote `written` frames. The fill
+        /// and estimate figures cover a started bridge, and the highest fill
+        /// a bridge that was started before the drain.
+        fn record_drain
+        (
+            &mut self,
+            bridge: &Bridge<RING_FRAMES>,
+            written: u64,
+            was_started: bool
+        )
+        {
+            self.given += written;
+            self.short_drains += u64::from(written < BLOCK_FRAMES as u64);
+
+            if bridge.drift.is_some()
+            {
+                let estimate = estimate_of(bridge);
+                self.estimate_min = self.estimate_min.min(estimate);
+                self.estimate_max = self.estimate_max.max(estimate);
+                self.fill_min = self.fill_min.min(bridge.ring.len);
+
+                if was_started
+                {
+                    self.fill_max = self.fill_max.max(bridge.ring.len + written as usize);
+                }
+            }
+        }
     }
 
     /// What a drift simulation saw, before and after `SETTLE_BLOCKS`.
@@ -2884,6 +2912,36 @@ mod tests
         settled: Stretch,
         started_at: u64,
         conserved: bool,
+    }
+
+    impl Outcome
+    {
+        /// Returns the stretch `block` falls in.
+        fn stretch_at(&mut self, block: u64) -> &mut Stretch
+        {
+            if block < SETTLE_BLOCKS
+            {
+                &mut self.start
+            }
+            else
+            {
+                &mut self.settled
+            }
+        }
+    }
+
+    /// Returns `at`, moved to the end of the stall that runs `length` from
+    /// `stall_at` when it falls inside it.
+    fn past_stall(at: u128, stall_at: u128, length: u128) -> u128
+    {
+        if (stall_at..stall_at + length).contains(&at)
+        {
+            stall_at + length
+        }
+        else
+        {
+            at
+        }
     }
 
     /// Runs `radio` into a production bridge, one pump drain per block of the
@@ -2911,14 +2969,8 @@ mod tests
             let bunched = u64::from(radio.bunch_every > 0 && index.is_multiple_of(radio.bunch_every.max(1)));
             let clocked = (u128::from(index + bunched) + 1) * radio.chunk as u128 * 1_000_000_000 / rate;
             let delay = rng.below(radio.jitter as usize + 1) as u128 * 1_000;
-            let mut at = (clocked + delay + u128::from(radio.phase) * 1_000).max(previous);
-
-            if (stall_at..stall_at + stall_length).contains(&at)
-            {
-                at = stall_at + stall_length;
-            }
-
-            at
+            let at = (clocked + delay + u128::from(radio.phase) * 1_000).max(previous);
+            past_stall(at, stall_at, stall_length)
         };
 
         let mut outcome = Outcome
@@ -2960,22 +3012,7 @@ mod tests
             }
 
             outcome.started_at = outcome.started_at.min(block);
-            let stretch = if block < SETTLE_BLOCKS { &mut outcome.start } else { &mut outcome.settled };
-            stretch.given += written;
-            stretch.short_drains += u64::from(written < BLOCK_FRAMES as u64);
-
-            if bridge.drift.is_some()
-            {
-                let estimate = estimate_of(&bridge);
-                stretch.estimate_min = stretch.estimate_min.min(estimate);
-                stretch.estimate_max = stretch.estimate_max.max(estimate);
-                stretch.fill_min = stretch.fill_min.min(bridge.ring.len);
-
-                if was_started
-                {
-                    stretch.fill_max = stretch.fill_max.max(bridge.ring.len + written as usize);
-                }
-            }
+            outcome.stretch_at(block).record_drain(&bridge, written, was_started);
         }
 
         outcome.settled.close(bridge.take_stats());
@@ -3058,6 +3095,26 @@ mod tests
     /// and less. 200 ppm rides on the cap and holds in simulation.
     const DRIFTS: [i64; 9] = [-200, -100, -40, -10, 0, 10, 40, 100, 200];
 
+    /// Simulates a steady radio of the sweep for four minutes past the
+    /// settling and asserts what it must hold.
+    fn assert_steady_radio_holds(ppm: i64, chunk: usize, jitter: u64, phase: u64)
+    {
+        let radio = Radio::steady(ppm, chunk, phase, jitter, 0xD1F7 ^ phase);
+        let outcome = simulate(radio, SETTLE_BLOCKS + 4 * BLOCKS_PER_MINUTE);
+        std::println!("{radio:?} {outcome:?}");
+        assert_holds(radio, &outcome);
+
+        // With neither drift nor jitter the only offset is the phase of the
+        // start, within half a block of the seed, and the term inside the band
+        // takes it to the centre one frame per correction.
+        if jitter == 0 && ppm == 0
+        {
+            let spent = outcome.start.inserted + outcome.start.removed
+                + outcome.settled.inserted + outcome.settled.removed;
+            assert!(spent <= (SLIP / 2 + TRACK) as u64, "{radio:?} {outcome:?}");
+        }
+    }
+
     #[test]
     #[cfg_attr(coverage, ignore = "the unit tests of the controller, the start and the crossfade reach the same lines in a fraction of the time")]
     fn the_drift_correction_holds_the_ring_over_drift_chunk_size_phase_and_jitter()
@@ -3072,29 +3129,14 @@ mod tests
             {
                 scope.spawn(move ||
                 {
-                    for chunk in [128, 240, 1024, 1920]
-                    {
-                        for jitter in [0, 441]
-                        {
-                            for phase in [0, 131]
-                            {
-                                let radio = Radio::steady(ppm, chunk, phase, jitter, 0xD1F7 ^ phase);
-                                let outcome = simulate(radio, SETTLE_BLOCKS + 4 * BLOCKS_PER_MINUTE);
-                                std::println!("{radio:?} {outcome:?}");
-                                assert_holds(radio, &outcome);
+                    let cases = [128, 240, 1024, 1920]
+                        .into_iter()
+                        .flat_map(|chunk| [0, 441].map(|jitter| (chunk, jitter)))
+                        .flat_map(|(chunk, jitter)| [0, 131].map(|phase| (chunk, jitter, phase)));
 
-                                // With neither drift nor jitter the only offset is
-                                // the phase of the start, within half a block of
-                                // the seed, and the term inside the band takes it
-                                // to the centre one frame per correction.
-                                if jitter == 0 && ppm == 0
-                                {
-                                    let spent = outcome.start.inserted + outcome.start.removed
-                                        + outcome.settled.inserted + outcome.settled.removed;
-                                    assert!(spent <= (SLIP / 2 + TRACK) as u64, "{radio:?} {outcome:?}");
-                                }
-                            }
-                        }
+                    for (chunk, jitter, phase) in cases
+                    {
+                        assert_steady_radio_holds(ppm, chunk, jitter, phase);
                     }
                 });
             }
@@ -3215,12 +3257,11 @@ mod tests
         flush: bool,
     }
 
-    /// Lays out what a phone at `ppm` delivers over `seconds`: chunks of `chunk`
-    /// frames late by a draw in `0..=jitter` frames, never before the chunk
-    /// ahead of them, and moved by `episodes`.
-    fn landings(ppm: i64, seconds: f64, chunk: usize, jitter: usize, episodes: &[Episode]) -> Vec<Landing>
+    /// Returns the stretches of play between the suspends of `episodes` over
+    /// `seconds`, each as its start and end in seconds and the backlog, small
+    /// chunks and small chunk frames it resumes with.
+    fn play_spans(seconds: f64, episodes: &[Episode]) -> Vec<(f64, f64, usize, usize, usize)>
     {
-        let mut rng = Lcg(0xE915 ^ ppm.unsigned_abs());
         let mut spans: Vec<(f64, f64, usize, usize, usize)> = Vec::new();
         let mut from = 0.0;
         let mut resume = (0, 0, 0);
@@ -3236,6 +3277,55 @@ mod tests
         }
 
         spans.push((from, seconds, resume.0, resume.1, resume.2));
+        spans
+    }
+
+    /// Returns the link time in frames a chunk due at `at` lands at, after
+    /// the late and stall episodes of `episodes` in their order.
+    fn moved_by_episodes(at: f64, episodes: &[Episode]) -> f64
+    {
+        let mut at = at;
+
+        for &episode in episodes
+        {
+            match episode
+            {
+                Episode::Late { at: late, delay, length } if at >= late * 44_100.0 && at < (late + length) * 44_100.0 =>
+                {
+                    at += delay;
+                }
+                Episode::Stall { at: stall, length } if at >= stall * 44_100.0 && at < (stall + length) * 44_100.0 =>
+                {
+                    at = (stall + length) * 44_100.0;
+                }
+                _ => {}
+            }
+        }
+
+        at
+    }
+
+    /// Returns the frames of chunk `k` of a span that resumes with `small`
+    /// chunks of `small_frames` frames before chunks of `chunk` frames.
+    fn chunk_frames(k: usize, small: usize, small_frames: usize, chunk: usize) -> usize
+    {
+        if k < small
+        {
+            small_frames
+        }
+        else
+        {
+            chunk
+        }
+    }
+
+    /// Lays out what a phone at `ppm` delivers over `seconds`: chunks of `chunk`
+    /// frames late by a draw in `0..=jitter` frames, never before the chunk
+    /// ahead of them, and moved by `episodes`.
+    fn landings(ppm: i64, seconds: f64, chunk: usize, jitter: usize, episodes: &[Episode]) -> Vec<Landing>
+    {
+        let mut rng = Lcg(0xE915 ^ ppm.unsigned_abs());
+        let spans = play_spans(seconds, episodes);
         let mut out: Vec<Landing> = Vec::new();
         let mut previous = 0.0_f64;
 
@@ -3246,7 +3336,7 @@ mod tests
                 out.push(Landing { at: spans[index - 1].1 * 44_100.0, frames: 0, flush: true });
             }
 
-            let size = |k: usize| if k < small { small_frames } else { chunk };
+            let size = |k: usize| chunk_frames(k, small, small_frames, chunk);
             let held: usize = (0..backlog).map(size).sum();
             let mut produced = 0;
 
@@ -3262,24 +3352,7 @@ mod tests
                 }
 
                 at += rng.below(jitter + 1) as f64;
-
-                for &episode in episodes
-                {
-                    match episode
-                    {
-                        Episode::Late { at: late, delay, length } if at >= late * 44_100.0 && at < (late + length) * 44_100.0 =>
-                        {
-                            at += delay;
-                        }
-                        Episode::Stall { at: stall, length } if at >= stall * 44_100.0 && at < (stall + length) * 44_100.0 =>
-                        {
-                            at = (stall + length) * 44_100.0;
-                        }
-                        _ => {}
-                    }
-                }
-
-                at = at.max(previous);
+                at = moved_by_episodes(at, episodes).max(previous);
                 previous = at;
                 out.push(Landing { at, frames: size(k), flush: false });
             }
@@ -4123,38 +4196,64 @@ mod tests
         weights
     }
 
-    #[test]
-    fn the_resampler_table_is_the_kaiser_windowed_sinc_it_claims_and_keeps_the_treble_level()
+    /// Returns tap `t` of the Kaiser windowed sinc of the resampler, at a
+    /// fraction `mu` of a frame.
+    fn kaiser_sinc(t: i32, mu: f64) -> f64
     {
         const BETA: f64 = 4.0;
 
+        let d = f64::from(t) - mu;
+        let sinc = if d.abs() < 1e-15 { 1.0 } else { (core::f64::consts::PI * d).sin() / (core::f64::consts::PI * d) };
+        let r = d / 4.0;
+        let window = if r.abs() <= 1.0 { bessel_i0(BETA * (1.0 - r * r).max(0.0).sqrt()) / bessel_i0(BETA) } else { 0.0 };
+        sinc * window
+    }
+
+    /// Returns the row of the resampler table at `phase`, from its
+    /// definition: the windowed sinc normalized to 16384 and rounded, the
+    /// rounding error folded into its largest tap.
+    fn expected_sinc_row(phase: usize) -> Vec<i32>
+    {
+        let mu = phase as f64 / 256.0;
+        let ideal: Vec<f64> = (-3..=4).map(|t| kaiser_sinc(t, mu)).collect();
+        let total: f64 = ideal.iter().sum();
+        let mut expected: Vec<i32> = ideal.iter().map(|v| (v / total * 16_384.0).round_ties_even() as i32).collect();
+        let mut largest = 0;
+
+        for t in 1..SINC_TAPS
+        {
+            if ideal[t].abs() > ideal[largest].abs()
+            {
+                largest = t;
+            }
+        }
+
+        expected[largest] += 16_384 - expected.iter().sum::<i32>();
+        expected
+    }
+
+    /// Returns the gain in dB of `weights`, read at a fraction `mu` of a
+    /// frame, on a tone of `w` radians per frame.
+    fn resampler_gain_db(weights: &[i32; SINC_TAPS], mu: f64, w: f64) -> f64
+    {
+        let (mut re, mut im) = (0.0, 0.0);
+
+        for (t, &weight) in weights.iter().enumerate()
+        {
+            let delay = t as f64 - 3.0 - mu;
+            re += f64::from(weight) * (w * delay).cos();
+            im += f64::from(weight) * (w * delay).sin();
+        }
+
+        20.0 * (re.hypot(im) / 16_384.0).log10()
+    }
+
+    #[test]
+    fn the_resampler_table_is_the_kaiser_windowed_sinc_it_claims_and_keeps_the_treble_level()
+    {
         for (phase, row) in SINC_ROWS.iter().enumerate()
         {
-            let mu = phase as f64 / 256.0;
-            let ideal: Vec<f64> = (-3..=4)
-                .map(|t|
-                {
-                    let d = f64::from(t) - mu;
-                    let sinc = if d.abs() < 1e-15 { 1.0 } else { (core::f64::consts::PI * d).sin() / (core::f64::consts::PI * d) };
-                    let r = d / 4.0;
-                    let window = if r.abs() <= 1.0 { bessel_i0(BETA * (1.0 - r * r).max(0.0).sqrt()) / bessel_i0(BETA) } else { 0.0 };
-                    sinc * window
-                })
-                .collect();
-            let total: f64 = ideal.iter().sum();
-            let mut expected: Vec<i32> = ideal.iter().map(|v| (v / total * 16_384.0).round_ties_even() as i32).collect();
-            let mut largest = 0;
-
-            for t in 1..SINC_TAPS
-            {
-                if ideal[t].abs() > ideal[largest].abs()
-                {
-                    largest = t;
-                }
-            }
-
-            expected[largest] += 16_384 - expected.iter().sum::<i32>();
-            assert_eq!(row.map(i32::from).to_vec(), expected, "phase {phase}");
+            assert_eq!(row.map(i32::from).to_vec(), expected_sinc_row(phase), "phase {phase}");
         }
 
         // Gain of the resampler at every position a correction reads, and the
@@ -4170,16 +4269,7 @@ mod tests
                 let weights = weights_at(position);
                 largest_magnitude = largest_magnitude.max(weights.iter().map(|w| w.abs()).sum::<i32>());
                 let mu = position as f64 / CROSSFADE_FRAMES as f64;
-                let (mut re, mut im) = (0.0, 0.0);
-
-                for (t, &weight) in weights.iter().enumerate()
-                {
-                    let delay = t as f64 - 3.0 - mu;
-                    re += f64::from(weight) * (w * delay).cos();
-                    im += f64::from(weight) * (w * delay).sin();
-                }
-
-                let gain = 20.0 * (re.hypot(im) / 16_384.0).log10();
+                let gain = resampler_gain_db(&weights, mu, w);
                 assert!((low..=high).contains(&gain), "{hz} Hz at position {position}: {gain:+.3} dB");
             }
         }
@@ -4201,27 +4291,6 @@ mod tests
         total: usize
     ) -> Vec<([f64; 2], f64)>
     {
-        let length = CROSSFADE_FRAMES;
-        let sample = |n: usize, channel: usize| f64::from(input[n][channel]);
-        let unit = f64::from(1_u32 << SINC_FRACTION_BITS);
-        let resampled = |i: usize, position: usize| -> ([f64; 2], f64)
-        {
-            let weights = weights_at(position);
-            let mut values = [0.0; 2];
-
-            for (channel, value) in values.iter_mut().enumerate()
-            {
-                let sum: f64 = weights
-                    .iter()
-                    .enumerate()
-                    .map(|(t, &weight)| if i + t >= 3 { f64::from(weight) * sample(i + t - 3, channel) } else { 0.0 })
-                    .sum();
-                *value = (sum / unit).clamp(f64::from(i16::MIN), f64::from(i16::MAX));
-            }
-
-            (values, 0.5)
-        };
-
         let mut out: Vec<([f64; 2], f64)> = Vec::new();
         let mut at = 0;
 
@@ -4229,38 +4298,81 @@ mod tests
         {
             if !openings.contains(&out.len())
             {
-                out.push(([sample(at, 0), sample(at, 1)], 0.0));
+                out.push((reference_frame(input, at), 0.0));
                 at += 1;
                 continue;
             }
 
-            match correction
-            {
-                Correction::Remove =>
-                {
-                    for k in 0..length - 1
-                    {
-                        out.push(resampled(at + k, k + 1));
-                    }
-                }
-                Correction::Insert =>
-                {
-                    out.push(([sample(at, 0), sample(at, 1)], 0.0));
-
-                    for k in 1..length
-                    {
-                        out.push(resampled(at + k - 1, length - k));
-                    }
-
-                    out.push(([sample(at + length - 1, 0), sample(at + length - 1, 1)], 0.0));
-                }
-            }
-
-            at += length;
+            push_reference_correction(&mut out, input, correction, at);
+            at += CROSSFADE_FRAMES;
         }
 
         out.truncate(total);
         out
+    }
+
+    /// Returns frame `n` of `input` in floating point.
+    fn reference_frame(input: &[[i16; 2]], n: usize) -> [f64; 2]
+    {
+        [f64::from(input[n][0]), f64::from(input[n][1])]
+    }
+
+    /// Returns the frame the resampler gives at `position` over input frames
+    /// `i - 3` to `i + 4`, frames before the input silent, in floating point
+    /// with half a sample of slack.
+    fn resampled_reference(input: &[[i16; 2]], i: usize, position: usize) -> ([f64; 2], f64)
+    {
+        let weights = weights_at(position);
+        let unit = f64::from(1_u32 << SINC_FRACTION_BITS);
+        let mut values = [0.0; 2];
+
+        for (channel, value) in values.iter_mut().enumerate()
+        {
+            let sum: f64 = weights
+                .iter()
+                .enumerate()
+                .map(|(t, &weight)| if i + t >= 3 { f64::from(weight) * f64::from(input[i + t - 3][channel]) } else { 0.0 })
+                .sum();
+            *value = (sum / unit).clamp(f64::from(i16::MIN), f64::from(i16::MAX));
+        }
+
+        (values, 0.5)
+    }
+
+    /// Appends to `out` the frames a correction of kind `correction` gives
+    /// from input frame `at`, over the `CROSSFADE_FRAMES` input frames it
+    /// reads.
+    fn push_reference_correction
+    (
+        out: &mut Vec<([f64; 2], f64)>,
+        input: &[[i16; 2]],
+        correction: Correction,
+        at: usize
+    )
+    {
+        let length = CROSSFADE_FRAMES;
+
+        match correction
+        {
+            Correction::Remove =>
+            {
+                for k in 0..length - 1
+                {
+                    out.push(resampled_reference(input, at + k, k + 1));
+                }
+            }
+            Correction::Insert =>
+            {
+                out.push((reference_frame(input, at), 0.0));
+
+                for k in 1..length
+                {
+                    out.push(resampled_reference(input, at + k - 1, length - k));
+                }
+
+                out.push((reference_frame(input, at + length - 1), 0.0));
+            }
+        }
     }
 
     /// Returns `reference` as it plays from a start: frame `n` at a gain of
@@ -4283,6 +4395,87 @@ mod tests
             .collect()
     }
 
+    /// Returns sample `n` of a full-scale square of `period` frames.
+    fn square_of_period(n: usize, period: usize) -> i16
+    {
+        if n % period < period / 2 { i16::MAX } else { i16::MIN }
+    }
+
+    /// Starts a bridge prefilled with `prefill` frames of `input`, then pushes
+    /// and drains one block at a time up to `blocks` drains.
+    ///
+    /// Returns the output, the output frames each correction opened on, and
+    /// the statistics of the run.
+    fn run_corrections
+    (
+        input: &[u8],
+        prefill: usize,
+        blocks: usize,
+        context: &str
+    ) -> (Vec<u8>, Vec<usize>, BridgeStats)
+    {
+        let mut bridge = Bridge::<RING_FRAMES>::new(prefill);
+        assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO);
+
+        let mut output = start_on(&mut bridge, input, prefill);
+        let mut fed = prefill;
+        let mut openings: Vec<usize> = Vec::new();
+        let mut pcm = [0; BLOCK_FRAMES * PCM_FRAME_BYTES];
+
+        if bridge.segment.is_some()
+        {
+            openings.push(0);
+        }
+
+        for _ in 1..blocks
+        {
+            push_span(&mut bridge, input, fed, BLOCK_FRAMES, BLOCK_FRAMES);
+            fed += BLOCK_FRAMES;
+            let running = bridge.segment.is_some();
+            let at = output.len() / PCM_FRAME_BYTES;
+            assert_eq!(bridge.drain_into(&mut pcm), pcm.len(), "{context}");
+            output.extend_from_slice(&pcm);
+
+            if !running && bridge.segment.is_some()
+            {
+                openings.push(at);
+            }
+        }
+
+        (output, openings, bridge.take_stats())
+    }
+
+    /// Asserts that every frame of `got` sits within its slack of the frame
+    /// of `reference`, and, on a sine held in opposition, that its two
+    /// channels still cancel.
+    fn assert_follows_reference
+    (
+        got: &[[i16; 2]],
+        reference: &[([f64; 2], f64)],
+        sine: bool,
+        context: &str
+    )
+    {
+        for (n, (got, (want, slack))) in got.iter().zip(reference).enumerate()
+        {
+            for channel in 0..2
+            {
+                assert!
+                (
+                    (f64::from(got[channel]) - want[channel]).abs() <= slack + 1e-9,
+                    "{context}: frame {n} channel {channel} gives {} for {} within {slack}",
+                    got[channel],
+                    want[channel]
+                );
+            }
+
+            if sine
+            {
+                assert!((i32::from(got[0]) + i32::from(got[1])).abs() <= 1, "{context}: frame {n} lost its pairing");
+            }
+        }
+    }
+
     #[test]
     fn a_correction_resamples_one_frame_out_or_in_across_drains_and_keeps_the_frames_aligned()
     {
@@ -4293,16 +4486,12 @@ mod tests
         {
             (30_000.0 * (2.0 * core::f64::consts::PI * hz * n as f64 / 44_100.0 + phase).sin()).round() as i16
         };
-        let square = |n: usize, period: usize| -> i16
-        {
-            if n % period < period / 2 { i16::MAX } else { i16::MIN }
-        };
 
         let cases: [(&str, Vec<u8>); 3] =
         [
             ("sine 1 kHz", signal(LENGTH, |n| tone(n, 1_000.0, 0.0), |n| tone(n, 1_000.0, 0.0).saturating_neg())),
             ("sine 15 kHz", signal(LENGTH, |n| tone(n, 15_000.0, 0.3), |n| tone(n, 15_000.0, 0.3).saturating_neg())),
-            ("full scale square", signal(LENGTH, |n| square(n, 50), |n| square(n, 34))),
+            ("full scale square", signal(LENGTH, |n| square_of_period(n, 50), |n| square_of_period(n, 34))),
         ];
 
         // A prefill 900 frames off the centre puts the estimate past the band,
@@ -4312,59 +4501,14 @@ mod tests
             for (name, input) in &cases
             {
                 let context = std::format!("{name}, {correction:?}");
-                let mut bridge = Bridge::<RING_FRAMES>::new(prefill);
-                assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO);
-
-                let mut output = start_on(&mut bridge, input, prefill);
-                let mut fed = prefill;
-                let mut openings: Vec<usize> = Vec::new();
-                let mut pcm = [0; BLOCK_FRAMES * PCM_FRAME_BYTES];
-
-                if bridge.segment.is_some()
-                {
-                    openings.push(0);
-                }
-
-                for _ in 1..BLOCKS
-                {
-                    push_span(&mut bridge, input, fed, BLOCK_FRAMES, BLOCK_FRAMES);
-                    fed += BLOCK_FRAMES;
-                    let running = bridge.segment.is_some();
-                    let at = output.len() / PCM_FRAME_BYTES;
-                    assert_eq!(bridge.drain_into(&mut pcm), pcm.len(), "{context}");
-                    output.extend_from_slice(&pcm);
-
-                    if !running && bridge.segment.is_some()
-                    {
-                        openings.push(at);
-                    }
-                }
+                let (output, openings, stats) = run_corrections(input, prefill, BLOCKS, &context);
 
                 let samples_in = samples_of(input);
                 let samples_out = samples_of(&output);
                 assert!(openings.len() >= 3, "{context}: corrections started at {openings:?}");
                 let reference = faded_in(reference_stream(&samples_in, correction, &openings, samples_out.len()));
+                assert_follows_reference(&samples_out, &reference, name.starts_with("sine"), &context);
 
-                for (n, (got, (want, slack))) in samples_out.iter().zip(&reference).enumerate()
-                {
-                    for channel in 0..2
-                    {
-                        assert!
-                        (
-                            (f64::from(got[channel]) - want[channel]).abs() <= slack + 1e-9,
-                            "{context}: frame {n} channel {channel} gives {} for {} within {slack}",
-                            got[channel],
-                            want[channel]
-                        );
-                    }
-
-                    if name.starts_with("sine")
-                    {
-                        assert!((i32::from(got[0]) + i32::from(got[1])).abs() <= 1, "{context}: frame {n} lost its pairing");
-                    }
-                }
-
-                let stats = bridge.take_stats();
                 let spacing = openings.windows(2).map(|pair| pair[1] - pair[0]).min().unwrap_or(0);
                 assert!(spacing >= CROSSFADE_FRAMES, "{context}: {openings:?}");
                 let done = match correction
@@ -4873,6 +5017,89 @@ mod tests
         const { assert!(TRACK_STEP_FRAMES as u64 * CORRECTION_SPACING as u64 > 1 << WINDOW_SHIFT) };
     }
 
+    /// Returns sample `n` of a square of 100 frames at `i16::MAX` and
+    /// `-i16::MAX`, constant in magnitude.
+    fn magnitude_square(n: usize) -> i16
+    {
+        if n % 100 < 50 { i16::MAX } else { -i16::MAX }
+    }
+
+    /// Returns the chunks of 1920 frames that land before drain `drain`.
+    fn gap_trim_and_drop_chunks(drain: usize) -> usize
+    {
+        match drain
+        {
+            0 | 120 | 400 => 3,
+            100..=119 => 0,
+            _ => usize::from(drain.is_multiple_of(8)),
+        }
+    }
+
+    /// Plays `input` through 500 drains fed as `gap_trim_and_drop_chunks`
+    /// says, silence filling each short drain.
+    ///
+    /// Returns the output, the number of starts, and the statistics.
+    fn play_gaps_trims_and_drops(input: &[u8]) -> (Vec<u8>, usize, BridgeStats)
+    {
+        let mut bridge = Bridge::<RING_FRAMES>::new(PREFILL_FRAMES);
+        assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO);
+        let mut output: Vec<u8> = Vec::new();
+        let mut fed = 0;
+        let mut pcm = [0; BLOCK_FRAMES * PCM_FRAME_BYTES];
+        let mut openings = 0;
+
+        for drain in 0..500_usize
+        {
+            for _ in 0..gap_trim_and_drop_chunks(drain)
+            {
+                let _ = bridge.push(&input[fed * PCM_FRAME_BYTES..(fed + 1_920) * PCM_FRAME_BYTES]);
+                fed += 1_920;
+            }
+
+            let waiting = bridge.drift.is_none();
+            let written = bridge.drain_into(&mut pcm);
+            openings += usize::from(waiting && written > 0);
+            pcm[written..].fill(0);
+            output.extend_from_slice(&pcm);
+        }
+
+        (output, openings, bridge.take_stats())
+    }
+
+    /// Returns how far a sample steps from `before` to `after`.
+    fn sample_step(before: i32, after: i32) -> i32
+    {
+        (after - before).abs()
+    }
+
+    /// Returns how far the magnitude of a sample steps from `before` to
+    /// `after`.
+    fn magnitude_step(before: i32, after: i32) -> i32
+    {
+        (after.abs() - before.abs()).abs()
+    }
+
+    /// Asserts that no channel of `got` steps by more than `bound` from one
+    /// frame to the next, the step read by `step`.
+    fn assert_steps_within
+    (
+        got: &[[i16; 2]],
+        bound: i32,
+        step: fn(i32, i32) -> i32,
+        label: &str
+    )
+    {
+        for (n, pair) in got.windows(2).enumerate()
+        {
+            for (channel, (&before, &after)) in pair[0].iter().zip(&pair[1]).enumerate()
+            {
+                let (before, after) = (i32::from(before), i32::from(after));
+                let moved = step(before, after);
+                assert!(moved <= bound, "{label}: frame {n} channel {channel} steps {before} to {after}, over {bound}");
+            }
+        }
+    }
+
     #[test]
     fn every_gap_trim_and_drop_steps_no_further_than_the_fade_allows_on_a_full_scale_sine_and_square()
     {
@@ -4883,60 +5110,28 @@ mod tests
         // A square of constant magnitude keeps `D` out of its magnitude.
         const LENGTH: usize = 140_000;
         let sine = |n: usize| (f64::from(i16::MAX) * (2.0 * core::f64::consts::PI * 441.0 * n as f64 / 44_100.0).sin()).round() as i16;
-        let square = |n: usize| if n % 100 < 50 { i16::MAX } else { -i16::MAX };
         let gain_step = 32_768 / FADE_FRAMES as i32 + 1;
         let sine_step = (f64::from(i16::MAX) * 2.0 * core::f64::consts::PI * 441.0 / 44_100.0).ceil() as i32 + 1;
 
-        for (name, input) in [("sine", signal(LENGTH, sine, |n| sine(n).saturating_neg())), ("square", signal(LENGTH, square, square))]
+        for (name, input) in [("sine", signal(LENGTH, sine, |n| sine(n).saturating_neg())), ("square", signal(LENGTH, magnitude_square, magnitude_square))]
         {
-            let mut bridge = Bridge::<RING_FRAMES>::new(PREFILL_FRAMES);
-            assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO);
-            let mut output: Vec<u8> = Vec::new();
-            let mut fed = 0;
-            let mut pcm = [0; BLOCK_FRAMES * PCM_FRAME_BYTES];
-            let mut openings = 0;
-
             // Chunks of 1920 frames, one every 8 drains: a backlog of three
             // trims at the start, a stall of 20 drains runs the ring dry, the
             // backlog after it trims again, and a surplus of two chunks on the
             // started ring drops frames.
-            for drain in 0..500_usize
-            {
-                let chunks = match drain
-                {
-                    0 | 120 | 400 => 3,
-                    100..=119 => 0,
-                    _ => usize::from(drain % 8 == 0),
-                };
-
-                for _ in 0..chunks
-                {
-                    let _ = bridge.push(&input[fed * PCM_FRAME_BYTES..(fed + 1_920) * PCM_FRAME_BYTES]);
-                    fed += 1_920;
-                }
-
-                let waiting = bridge.drift.is_none();
-                let written = bridge.drain_into(&mut pcm);
-                openings += usize::from(waiting && written > 0);
-                pcm[written..].fill(0);
-                output.extend_from_slice(&pcm);
-            }
-
-            let stats = bridge.take_stats();
+            let (output, openings, stats) = play_gaps_trims_and_drops(&input);
             assert!(stats.trimmed > 0 && stats.dropped > 0, "{name}: {stats:?}");
             assert_eq!((stats.underruns, openings, stats.inserted + stats.removed), (1, 2, 0), "{name}: {stats:?}");
             let got = samples_of(&output);
-
-            for (n, pair) in got.windows(2).enumerate()
+            let (bound, step): (i32, fn(i32, i32) -> i32) = if name == "sine"
             {
-                for (channel, (&before, &after)) in pair[0].iter().zip(&pair[1]).enumerate()
-                {
-                    let (before, after) = (i32::from(before), i32::from(after));
-                    let step = if name == "sine" { (after - before).abs() } else { (after.abs() - before.abs()).abs() };
-                    let bound = if name == "sine" { sine_step + gain_step } else { gain_step };
-                    assert!(step <= bound, "{name}: frame {n} channel {channel} steps {before} to {after}, over {bound}");
-                }
+                (sine_step + gain_step, sample_step)
             }
+            else
+            {
+                (gain_step, magnitude_step)
+            };
+            assert_steps_within(&got, bound, step, name);
         }
     }
 
@@ -5329,6 +5524,88 @@ mod tests
         }
     }
 
+    /// Plays `drains` drains of `bridge` fed a block of `steady` each,
+    /// appending the output to `output`.
+    fn play_fed
+    (
+        bridge: &mut Bridge<RING_FRAMES>,
+        steady: &[u8],
+        output: &mut Vec<u8>,
+        drains: usize
+    )
+    {
+        let mut pcm = [0; BLOCK_FRAMES * PCM_FRAME_BYTES];
+
+        for _ in 0..drains
+        {
+            assert_eq!(bridge.drain_into(&mut pcm), pcm.len());
+            output.extend_from_slice(&pcm);
+            assert_eq!(bridge.push(&steady[..BLOCK_FRAMES * PCM_FRAME_BYTES]).dropped, 0);
+        }
+    }
+
+    /// Starts `bridge` on `steady`, overfills it, then drops again 480 frames
+    /// later.
+    ///
+    /// Returns the output so far and the stream frame after each drop.
+    fn two_drops(bridge: &mut Bridge<RING_FRAMES>, steady: &[u8]) -> (Vec<u8>, usize, usize)
+    {
+        let mut pcm = [0; BLOCK_FRAMES * PCM_FRAME_BYTES];
+        let mut output = start_on(bridge, steady, PREFILL_FRAMES);
+        let room = RING_FRAMES - bridge.ring.len;
+        assert_eq!(bridge.push(&steady[..(room + 300) * PCM_FRAME_BYTES]).dropped, 300);
+
+        for _ in 0..2
+        {
+            assert_eq!(bridge.drain_into(&mut pcm), pcm.len());
+            output.extend_from_slice(&pcm);
+        }
+
+        assert_eq!(bridge.push(&steady[..530 * PCM_FRAME_BYTES]).dropped, 50);
+        (output, PREFILL_FRAMES + room, PREFILL_FRAMES + room + 480)
+    }
+
+    /// Leaves `bridge` where the flush of `case` lands: `drains + 2` drains
+    /// past a single drop for "before a drop", right after a single drop for
+    /// "after the drop", and `drains` drains past two drops otherwise.
+    fn drop_before_flush
+    (
+        bridge: &mut Bridge<RING_FRAMES>,
+        steady: &[u8],
+        case: &str,
+        drains: usize
+    )
+    {
+        let mut pcm = [0; BLOCK_FRAMES * PCM_FRAME_BYTES];
+
+        if case == "before a drop"
+        {
+            let _ = start_on(bridge, steady, PREFILL_FRAMES);
+            let room = RING_FRAMES - bridge.ring.len;
+            assert_eq!(bridge.push(&steady[..(room + 300) * PCM_FRAME_BYTES]).dropped, 300);
+
+            for _ in 0..drains + 2
+            {
+                assert_eq!(bridge.drain_into(&mut pcm), pcm.len());
+            }
+        }
+        else if case == "after the drop"
+        {
+            let _ = start_on(bridge, steady, PREFILL_FRAMES);
+            let room = RING_FRAMES - bridge.ring.len;
+            assert_eq!(bridge.push(&steady[..(room + 300) * PCM_FRAME_BYTES]).dropped, 300);
+        }
+        else
+        {
+            let _ = two_drops(bridge, steady);
+
+            for _ in 0..drains
+            {
+                assert_eq!(bridge.drain_into(&mut pcm), pcm.len());
+            }
+        }
+    }
+
     #[test]
     fn drops_close_together_fade_as_one_and_a_flush_forgets_the_drops_past_its_tail()
     {
@@ -5336,46 +5613,13 @@ mod tests
         let steady = signal(3 * RING_FRAMES, |_| LEVEL, |_| LEVEL);
         let gain_of = |frame: &[i16; 2]| i32::from(frame[0]);
         let at_gain = |gain: usize| (i32::from(LEVEL) * gain.min(FADE_FRAMES) as i32) >> FADE_SHIFT;
-        let mut pcm = [0; BLOCK_FRAMES * PCM_FRAME_BYTES];
-
-        // Plays `drains` drains fed a block each, appending the output.
-        let play = |bridge: &mut Bridge<RING_FRAMES>, output: &mut Vec<u8>, drains: usize|
-        {
-            let mut pcm = [0; BLOCK_FRAMES * PCM_FRAME_BYTES];
-
-            for _ in 0..drains
-            {
-                assert_eq!(bridge.drain_into(&mut pcm), pcm.len());
-                output.extend_from_slice(&pcm);
-                assert_eq!(bridge.push(&steady[..BLOCK_FRAMES * PCM_FRAME_BYTES]).dropped, 0);
-            }
-        };
-
-        // Overfills a started ring, then drops again 480 frames later. Returns
-        // the output so far and the stream frame after each drop.
-        let two_drops = |bridge: &mut Bridge<RING_FRAMES>| -> (Vec<u8>, usize, usize)
-        {
-            let mut pcm = [0; BLOCK_FRAMES * PCM_FRAME_BYTES];
-            let mut output = start_on(bridge, &steady, PREFILL_FRAMES);
-            let room = RING_FRAMES - bridge.ring.len;
-            assert_eq!(bridge.push(&steady[..(room + 300) * PCM_FRAME_BYTES]).dropped, 300);
-
-            for _ in 0..2
-            {
-                assert_eq!(bridge.drain_into(&mut pcm), pcm.len());
-                output.extend_from_slice(&pcm);
-            }
-
-            assert_eq!(bridge.push(&steady[..530 * PCM_FRAME_BYTES]).dropped, 50);
-            (output, PREFILL_FRAMES + room, PREFILL_FRAMES + room + 480)
-        };
 
         // Two drops 480 frames apart play as one silence from the frame before
         // the first to the frame after the second.
         let mut bridge = Bridge::<RING_FRAMES>::new(PREFILL_FRAMES);
         assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO);
-        let (mut output, first, last) = two_drops(&mut bridge);
-        play(&mut bridge, &mut output, RING_FRAMES / BLOCK_FRAMES + 6);
+        let (mut output, first, last) = two_drops(&mut bridge, &steady);
+        play_fed(&mut bridge, &steady, &mut output, RING_FRAMES / BLOCK_FRAMES + 6);
         let got = samples_of(&output);
         assert!(got.len() > last + FADE_FRAMES);
 
@@ -5392,46 +5636,78 @@ mod tests
         {
             let mut bridge = Bridge::<RING_FRAMES>::new(PREFILL_FRAMES);
             assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO);
-
-            if case == "before a drop"
-            {
-                let _ = start_on(&mut bridge, &steady, PREFILL_FRAMES);
-                let room = RING_FRAMES - bridge.ring.len;
-                assert_eq!(bridge.push(&steady[..(room + 300) * PCM_FRAME_BYTES]).dropped, 300);
-
-                for _ in 0..drains + 2
-                {
-                    assert_eq!(bridge.drain_into(&mut pcm), pcm.len());
-                }
-            }
-            else if case == "after the drop"
-            {
-                let _ = start_on(&mut bridge, &steady, PREFILL_FRAMES);
-                let room = RING_FRAMES - bridge.ring.len;
-                assert_eq!(bridge.push(&steady[..(room + 300) * PCM_FRAME_BYTES]).dropped, 300);
-            }
-            else
-            {
-                let _ = two_drops(&mut bridge);
-
-                for _ in 0..drains
-                {
-                    assert_eq!(bridge.drain_into(&mut pcm), pcm.len());
-                }
-            }
+            drop_before_flush(&mut bridge, &steady, case, drains);
 
             bridge.flush();
             assert_eq!(bridge.tail, tail, "{case}");
             let _ = play_out_tail(&mut bridge);
             let level = bridge.start_level();
             let mut output = start_on(&mut bridge, &steady, level);
-            play(&mut bridge, &mut output, RING_FRAMES / BLOCK_FRAMES + 4);
+            play_fed(&mut bridge, &steady, &mut output, RING_FRAMES / BLOCK_FRAMES + 4);
 
             for (n, frame) in samples_of(&output).iter().enumerate()
             {
                 assert_eq!(gain_of(frame), at_gain(n + 1), "{case}: frame {n}");
             }
         }
+    }
+
+    /// Restarts `bridge` as `restart` names: a flush, a close, or a new
+    /// stream.
+    fn restart_stream(bridge: &mut Bridge<RING_FRAMES>, restart: &str)
+    {
+        match restart
+        {
+            "flush" => bridge.flush(),
+            "close" => bridge.close(),
+            _ => assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO),
+        }
+    }
+
+    /// Plays `input` through 60 drains, a chunk of 1920 frames every 8, and
+    /// restarts the stream as `restart` names at drain `cut`, silence filling
+    /// each short drain.
+    ///
+    /// Returns the output.
+    fn play_through_restart(input: &[u8], restart: &str, cut: usize) -> Vec<u8>
+    {
+        let mut bridge = Bridge::<RING_FRAMES>::new(PREFILL_FRAMES);
+        assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO);
+        let mut output: Vec<u8> = Vec::new();
+        let mut pcm = [0; BLOCK_FRAMES * PCM_FRAME_BYTES];
+        let mut fed = 0;
+
+        for drain in 0..60_usize
+        {
+            if drain == cut
+            {
+                assert!(bridge.ring.len > FADE_FRAMES && bridge.fade.gain == 256, "{restart}");
+                restart_stream(&mut bridge, restart);
+                assert_eq!(bridge.tail, FADE_FRAMES, "{restart}");
+            }
+
+            // A push after a flush waits behind the tail.
+            if drain % 8 == 0
+            {
+                let _ = bridge.push(&input[fed * PCM_FRAME_BYTES..(fed + 1_920) * PCM_FRAME_BYTES]);
+                fed += 1_920;
+            }
+
+            let written = bridge.drain_into(&mut pcm);
+            pcm[written..].fill(0);
+            output.extend_from_slice(&pcm);
+
+            if drain == cut
+            {
+                assert_eq!(written, pcm.len(), "{restart}");
+            }
+            else if drain == cut + 1
+            {
+                assert_eq!((written, bridge.tail), ((FADE_FRAMES - BLOCK_FRAMES) * PCM_FRAME_BYTES, 0), "{restart}");
+            }
+        }
+
+        output
     }
 
     #[test]
@@ -5446,58 +5722,9 @@ mod tests
 
         for (index, restart) in ["flush", "close", "open"].into_iter().enumerate()
         {
-            let mut bridge = Bridge::<RING_FRAMES>::new(PREFILL_FRAMES);
-            assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO);
-            let mut output: Vec<u8> = Vec::new();
-            let mut pcm = [0; BLOCK_FRAMES * PCM_FRAME_BYTES];
-            let mut fed = 0;
             let cut = 40 + index;
-
-            for drain in 0..60_usize
-            {
-                if drain == cut
-                {
-                    assert!(bridge.ring.len > FADE_FRAMES && bridge.fade.gain == 256, "{restart}");
-                    match restart
-                    {
-                        "flush" => bridge.flush(),
-                        "close" => bridge.close(),
-                        _ => assert_eq!(bridge.open(JOINT_STEREO_44_1), STEREO),
-                    }
-                    assert_eq!(bridge.tail, FADE_FRAMES, "{restart}");
-                }
-
-                // A push after a flush waits behind the tail.
-                if drain % 8 == 0
-                {
-                    let _ = bridge.push(&input[fed * PCM_FRAME_BYTES..(fed + 1_920) * PCM_FRAME_BYTES]);
-                    fed += 1_920;
-                }
-
-                let written = bridge.drain_into(&mut pcm);
-                pcm[written..].fill(0);
-                output.extend_from_slice(&pcm);
-
-                if drain == cut
-                {
-                    assert_eq!(written, pcm.len(), "{restart}");
-                }
-                else if drain == cut + 1
-                {
-                    assert_eq!((written, bridge.tail), ((FADE_FRAMES - BLOCK_FRAMES) * PCM_FRAME_BYTES, 0), "{restart}");
-                }
-            }
-
-            let got = samples_of(&output);
-
-            for (n, pair) in got.windows(2).enumerate()
-            {
-                for (channel, (&before, &after)) in pair[0].iter().zip(&pair[1]).enumerate()
-                {
-                    let step = (i32::from(after) - i32::from(before)).abs();
-                    assert!(step <= bound, "{restart}: frame {n} channel {channel} steps {before} to {after}, over {bound}");
-                }
-            }
+            let got = samples_of(&play_through_restart(&input, restart, cut));
+            assert_steps_within(&got, bound, sample_step, restart);
 
             // Past the tail, only a new start plays again.
             let after_tail = (cut + 2) * BLOCK_FRAMES;

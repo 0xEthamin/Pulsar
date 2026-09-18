@@ -625,6 +625,50 @@ mod tests
         }
     }
 
+    /// Returns every single step of the volume as a pair of settings, in the
+    /// order the ramp test walks them: every step of the coarse control at
+    /// every fine value, then every fine move of one to nine values at every
+    /// coarse step.
+    fn single_steps() -> Vec<(Volume, Volume)>
+    {
+        let coarse_steps = (1..=FINE_MAX).flat_map(|fine|
+        {
+            (1..=COARSE_MAX).map(move |coarse| (volume(coarse, fine), volume(coarse.saturating_sub(1), fine)))
+        });
+        let fine_moves = (1..=COARSE_MAX).flat_map(|coarse|
+        {
+            (1..=FINE_MAX).flat_map(move |fine|
+            {
+                (1..=9_u8.min(fine)).map(move |moved| (volume(coarse, fine), volume(coarse, fine.saturating_sub(moved))))
+            })
+        });
+        coarse_steps.chain(fine_moves).collect()
+    }
+
+    /// Asserts that `from` to `to` and back each ramp over `GAIN_RAMP_MS` to
+    /// `ceiling_ms`, starting from a gain settled on `from`.
+    fn assert_step_ramps_within
+    (
+        state: &mut ControlState,
+        caller: &mut Caller,
+        from: Volume,
+        to: Volume,
+        ceiling_ms: u32
+    )
+    {
+        let _ = ramp_ms(state, caller, from);
+        for (start, end) in [(from, to), (to, from)]
+        {
+            let took_ms = ramp_ms(state, caller, end);
+            assert!
+            (
+                (GAIN_RAMP_MS..=ceiling_ms).contains(&took_ms),
+                "{start:?} to {end:?} took {took_ms} ms with {} samples",
+                caller.samples
+            );
+        }
+    }
+
     #[test]
     fn every_single_step_ramps_between_the_shortest_and_the_longest_ramp()
     {
@@ -634,42 +678,17 @@ mod tests
         // the ramp out a buffer at a time, so its end lands on the first
         // buffer boundary past the ramp and the ceiling grows by one buffer
         // less a millisecond.
+        let steps = single_steps();
+        assert_eq!(steps.len(), 16_042, "the ramp sweep no longer covers 16042 single steps");
         for samples in [44_u32, 220, FIXTURE_BUFFER_SAMPLES, 441]
         {
             let mut caller = Caller::new(samples);
             let ceiling_ms = GAIN_STEP_RAMP_MAX_MS + caller.buffer_ms() - 1;
             let mut state = ControlState::new(0);
 
-            let mut check = |state: &mut ControlState, from: Volume, to: Volume|
+            for &(from, to) in &steps
             {
-                let _ = ramp_ms(state, &mut caller, from);
-                for (start, end) in [(from, to), (to, from)]
-                {
-                    let took_ms = ramp_ms(state, &mut caller, end);
-                    assert!
-                    (
-                        (GAIN_RAMP_MS..=ceiling_ms).contains(&took_ms),
-                        "{start:?} to {end:?} took {took_ms} ms with {samples} samples"
-                    );
-                }
-            };
-
-            for fine in 1..=FINE_MAX
-            {
-                for coarse in 1..=COARSE_MAX
-                {
-                    check(&mut state, volume(coarse, fine), volume(coarse - 1, fine));
-                }
-            }
-            for coarse in 1..=COARSE_MAX
-            {
-                for fine in 1..=FINE_MAX
-                {
-                    for moved in 1..=9_u8.min(fine)
-                    {
-                        check(&mut state, volume(coarse, fine), volume(coarse, fine - moved));
-                    }
-                }
+                assert_step_ramps_within(&mut state, &mut caller, from, to, ceiling_ms);
             }
         }
     }
@@ -858,6 +877,77 @@ mod tests
         widest
     }
 
+    /// Returns the half periods of the paced sender, in microseconds: from
+    /// 0.3 ms, faster than any buffer, each 15 percent and 131 us past the one
+    /// before, up to the largest value not above 120 ms.
+    fn sender_half_periods_us() -> Vec<u64>
+    {
+        core::iter::successors(Some(300_u64), |&half_us| Some(half_us.saturating_mul(23).div_euclid(20).saturating_add(131)))
+            .take_while(|&half_us| half_us <= 120_000)
+            .collect()
+    }
+
+    /// Returns what the sender requests at `sender_us` on its own clock:
+    /// full scale in the first half of each period, silence in the second.
+    fn sender_level(sender_us: u64, half_us: u64) -> Volume
+    {
+        if sender_us.div_euclid(half_us).is_multiple_of(2)
+        {
+            full()
+        }
+        else
+        {
+            Volume::MUTED
+        }
+    }
+
+    /// Returns how many samples past `position` the count of poll `polls`
+    /// reads, a lateness below one buffer changing on every poll when `late`
+    /// holds and none otherwise.
+    fn caller_lag(polls: u64, samples: u32, late: bool) -> u64
+    {
+        if late
+        {
+            (polls.wrapping_mul(2_654_435_761) >> 7).rem_euclid(u64::from(samples))
+        }
+        else
+        {
+            0
+        }
+    }
+
+    /// Returns the gain at every buffer end over one second of a sender
+    /// reversing every `half_us` us from `phase_us`, polled every `samples`
+    /// samples at a count `late` or on time.
+    fn paced_sender_ends(samples: u32, half_us: u64, phase_us: u64, late: bool) -> Vec<f32>
+    {
+        let rate = u64::from(SAMPLE_RATE_HZ);
+        let declared_ms = samples.saturating_mul(1_000).div_ceil(SAMPLE_RATE_HZ);
+        let mut state = ControlState::new(0);
+        let mut ends: Vec<f32> = Vec::new();
+        let mut polls = 0_u64;
+        while polls.saturating_mul(u64::from(samples)) <= rate
+        {
+            let position = polls.saturating_mul(u64::from(samples));
+            let lag = caller_lag(polls, samples, late);
+            let sender_us = position.saturating_mul(1_000_000).div_euclid(rate).saturating_add(phase_us);
+            state.request(ToDsp::SetVolume(sender_level(sender_us, half_us)));
+            let now_ms = match u32::try_from(position.saturating_add(lag).saturating_mul(1_000).div_euclid(rate))
+            {
+                Ok(now_ms) => now_ms,
+                Err(error) => panic!("the caller count overflowed: {error:?}"),
+            };
+            let applied = state.poll(now_ms, declared_ms);
+            if polls == 0
+            {
+                ends.push(applied.gain_start());
+            }
+            ends.push(applied.gain_end());
+            polls = polls.saturating_add(1);
+        }
+        ends
+    }
+
     #[test]
     fn a_paced_sender_swings_the_gain_no_wider_than_the_slew_allows()
     {
@@ -870,74 +960,34 @@ mod tests
         // swing over `W` ms by `W + 1` ms at the slew limit. A count read up to
         // one buffer late, at a lateness changing on every poll, widens it by
         // that buffer.
-        let rate = u64::from(SAMPLE_RATE_HZ);
-        for samples in [128_u32, 240, 250, 255, FIXTURE_BUFFER_SAMPLES, 257, 265, 272, 384, 512]
+        let half_periods_us = sender_half_periods_us();
+        assert_eq!(half_periods_us.len(), 34, "the sender sweep no longer covers 34 half periods");
+        assert_eq!(half_periods_us.first(), Some(&300), "the sender sweep no longer starts at 300 us");
+        assert_eq!(half_periods_us.last(), Some(&116_981), "the sender sweep no longer ends at 116981 us");
+        let cases = [128_u32, 240, 250, 255, FIXTURE_BUFFER_SAMPLES, 257, 265, 272, 384, 512]
+            .into_iter()
+            .flat_map(|samples| half_periods_us.iter().map(move |&half_us| (samples, half_us)))
+            .flat_map(|(samples, half_us)| (0..3_u64).map(move |phase| (samples, half_us, phase)))
+            .flat_map(|(samples, half_us, phase)| [false, true].map(|late| (samples, half_us, phase, late)));
+        for (samples, half_us, phase, late) in cases
         {
-            let declared_ms = samples.saturating_mul(1_000).div_ceil(SAMPLE_RATE_HZ);
+            let phase_us = phase * half_us / 3 + 17;
             let buffer_ms = samples as f32 * 1_000.0 / SAMPLE_RATE_HZ as f32;
-            let mut half_us = 300_u64;
-            while half_us <= 120_000
-            {
-                for phase in 0..3_u64
-                {
-                    let phase_us = phase * half_us / 3 + 17;
-                    for late in [false, true]
-                    {
-                        let mut state = ControlState::new(0);
-                        let mut ends: Vec<f32> = Vec::new();
-                        let mut polls = 0_u64;
-                        while polls * u64::from(samples) <= rate
-                        {
-                            let position = polls * u64::from(samples);
-                            let lag = if late
-                            {
-                                (polls.wrapping_mul(2_654_435_761) >> 7) % u64::from(samples)
-                            }
-                            else
-                            {
-                                0
-                            };
-                            let sender_us = position * 1_000_000 / rate + phase_us;
-                            let level = if (sender_us / half_us).is_multiple_of(2)
-                            {
-                                full()
-                            }
-                            else
-                            {
-                                Volume::MUTED
-                            };
-                            state.request(ToDsp::SetVolume(level));
-                            let now_ms = match u32::try_from((position + lag) * 1_000 / rate)
-                            {
-                                Ok(now_ms) => now_ms,
-                                Err(error) => panic!("the caller count overflowed: {error:?}"),
-                            };
-                            let applied = state.poll(now_ms, declared_ms);
-                            if polls == 0
-                            {
-                                ends.push(applied.gain_start());
-                            }
-                            ends.push(applied.gain_end());
-                            polls += 1;
-                        }
+            let widened_ms = if late { buffer_ms } else { 0.0 };
+            let ends = paced_sender_ends(samples, half_us, phase_us, late);
 
-                        for window_ms in [10_u32, 20, 40, 100]
-                        {
-                            let width = (window_ms * SAMPLE_RATE_HZ / 1_000) as usize;
-                            let widened_ms = if late { buffer_ms } else { 0.0 };
-                            let bound = SLEW_PER_MS * (window_ms as f32 + widened_ms + 1.0) + EPSILON;
-                            let swing = widest_swing(&ends, samples as usize, width);
-                            assert!
-                            (
-                                swing <= bound,
-                                "a sender at {half_us} us, phase {phase_us} us, swung the gain by \
-                                 {swing} over {window_ms} ms against {bound}, with {samples} \
-                                 samples, late {late}"
-                            );
-                        }
-                    }
-                }
-                half_us = half_us * 23 / 20 + 131;
+            for window_ms in [10_u32, 20, 40, 100]
+            {
+                let width = (window_ms * SAMPLE_RATE_HZ / 1_000) as usize;
+                let bound = SLEW_PER_MS * (window_ms as f32 + widened_ms + 1.0) + EPSILON;
+                let swing = widest_swing(&ends, samples as usize, width);
+                assert!
+                (
+                    swing <= bound,
+                    "a sender at {half_us} us, phase {phase_us} us, swung the gain by \
+                     {swing} over {window_ms} ms against {bound}, with {samples} \
+                     samples, late {late}"
+                );
             }
         }
     }
@@ -996,6 +1046,42 @@ mod tests
         assert!(previous.abs() < EPSILON);
     }
 
+    /// Settles `state` on `start`, then, when `in_flight` holds, requests a
+    /// volume away from it and polls two buffers into that ramp.
+    ///
+    /// Returns the volume the gain settles on and the gain the last buffer
+    /// ended on.
+    fn settle_before_preset
+    (
+        state: &mut ControlState,
+        caller: &mut Caller,
+        start: Volume,
+        in_flight: bool
+    ) -> (Volume, f32)
+    {
+        let _ = ramp_ms(state, caller, start);
+        let mut settled = start;
+        let mut previous_end = start.linear_gain();
+        if in_flight
+        {
+            settled = if start == full()
+            {
+                volume(COARSE_DEFAULT, FINE_MAX)
+            }
+            else
+            {
+                full()
+            };
+            state.request(ToDsp::SetVolume(settled));
+            for _ in 0..2
+            {
+                let (_, applied) = caller.poll(state);
+                previous_end = applied.gain_end();
+            }
+        }
+        (settled, previous_end)
+    }
+
     #[test]
     fn a_preset_change_is_never_applied_as_a_step()
     {
@@ -1005,13 +1091,12 @@ mod tests
         // bit. The preset lands on a settled gain, and on a volume ramp in
         // flight two buffers after its request.
         let mut starts: Vec<Volume> = (1..=COARSE_MAX).map(|coarse| volume(coarse, FINE_MAX)).collect();
-        for coarse in [1_u8, COARSE_DEFAULT, COARSE_MAX]
-        {
-            for fine in [1_u8, 2, 8, 0x20, 0x40, 0x60]
-            {
-                starts.push(volume(coarse, fine));
-            }
-        }
+        starts.extend
+        (
+            [1_u8, COARSE_DEFAULT, COARSE_MAX]
+                .into_iter()
+                .flat_map(|coarse| [1_u8, 2, 8, 0x20, 0x40, 0x60].map(|fine| volume(coarse, fine)))
+        );
 
         let cases = [44_u32, 220, FIXTURE_BUFFER_SAMPLES, 441]
             .into_iter()
@@ -1021,26 +1106,7 @@ mod tests
         {
             let mut caller = Caller::new(samples);
             let mut state = ControlState::new(0);
-            let _ = ramp_ms(&mut state, &mut caller, start);
-            let mut settled = start;
-            let mut previous_end = start.linear_gain();
-            if in_flight
-            {
-                settled = if start == full()
-                {
-                    volume(COARSE_DEFAULT, FINE_MAX)
-                }
-                else
-                {
-                    full()
-                };
-                state.request(ToDsp::SetVolume(settled));
-                for _ in 0..2
-                {
-                    let (_, applied) = caller.poll(&mut state);
-                    previous_end = applied.gain_end();
-                }
-            }
+            let (settled, mut previous_end) = settle_before_preset(&mut state, &mut caller, start, in_flight);
 
             state.request(ToDsp::SelectPreset(Preset::Garden));
             let bound = rate_bound(caller.buffer_ms());

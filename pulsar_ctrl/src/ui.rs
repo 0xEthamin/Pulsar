@@ -37,7 +37,7 @@ use esp_idf_svc::hal::uart::{Uart, UartDriver};
 use esp_idf_svc::hal::units::Hertz;
 use esp_idf_svc::sys::EspError;
 use pulsar_lib::link::LINK_BAUD;
-use pulsar_lib::panel::{CoarseControl, Uplink, volume_of};
+use pulsar_lib::panel::{CoarseControl, PhoneVolume, Uplink, volume_of};
 use pulsar_lib::protocol::{MAX_FRAME_LEN, Message, ToDsp};
 
 use crate::StartError;
@@ -201,10 +201,13 @@ fn run(link: UartDriver<'static>, encoder: PcntUnitDriver<'static>) -> !
     let mut coarse = CoarseControl::at_power_up(encoder.get_count().unwrap_or(0));
     let mut uplink = Uplink::at_power_up();
     let mut frame = [0_u8; MAX_FRAME_LEN];
-    let mut failing = false;
     let mut last = Instant::now();
-    let mut reported = avrcp::phone_volume();
-    let mut reported_coarse = coarse.coarse();
+    let mut console = Console
+    {
+        phone: avrcp::phone_volume(),
+        coarse: coarse.coarse(),
+        failing: false,
+    };
 
     loop
     {
@@ -220,47 +223,80 @@ fn run(link: UartDriver<'static>, encoder: PcntUnitDriver<'static>) -> !
         // detent of the knob really produces.
         if let Ok(count) = encoder.get_count()
         {
-            let step = coarse.read(count);
-            if step != reported_coarse
-            {
-                reported_coarse = step;
-                println!("coarse step {step}, counter {count}");
-            }
+            console.report_coarse(coarse.read(count), count);
         }
 
         // The radio task folds the AVRCP events into one word and writes no
         // line of its own, so the console never paces the task the bridge is
         // fed from. This is where a phone state reaches the log.
         let phone = avrcp::phone_volume();
-        if phone != reported
-        {
-            reported = phone;
-            println!("phone volume {phone:?}, fine {}", phone.fine());
-        }
+        console.report_phone(phone);
 
         let volume = volume_of(coarse.coarse(), phone);
-        let Some(message) = uplink.poll(elapsed_ms, volume)
+        if let Some(message) = uplink.poll(elapsed_ms, volume)
+        {
+            console.report_send(send(&link, &mut frame, message));
+        }
+    }
+}
+
+/// What the interface thread last printed, so that each line appears once per
+/// change.
+struct Console
+{
+    /// Phone state of the last `phone volume` line.
+    phone: PhoneVolume,
+    /// Coarse step of the last `coarse step` line.
+    coarse: u8,
+    /// Whether the last write on the link failed. Only the first failure of
+    /// a run of failed writes prints.
+    failing: bool,
+}
+
+impl Console
+{
+    /// Prints the coarse step `step` and the counter reading `count` behind
+    /// it, when `step` differs from the last step printed.
+    fn report_coarse(&mut self, step: u8, count: i32)
+    {
+        if step != self.coarse
+        {
+            self.coarse = step;
+            println!("coarse step {step}, counter {count}");
+        }
+    }
+
+    /// Prints the phone state `phone` when it differs from the last one
+    /// printed.
+    fn report_phone(&mut self, phone: PhoneVolume)
+    {
+        if phone != self.phone
+        {
+            self.phone = phone;
+            println!("phone volume {phone:?}, fine {}", phone.fine());
+        }
+    }
+
+    /// Prints the error of `outcome` when it opens a run of failed writes.
+    /// Later failures in the run print nothing, and a success ends the run.
+    fn report_send(&mut self, outcome: Result<(), SendError>)
+    {
+        let Err(error) = outcome
         else
         {
-            continue;
+            self.failing = false;
+            return;
         };
 
-        match send(&link, &mut frame, message)
+        if !self.failing
         {
-            Ok(()) => failing = false,
-            Err(error) =>
+            match error
             {
-                if !failing
-                {
-                    match error
-                    {
-                        SendError::Esp(error) => println!("control link write failed: {error}"),
-                        SendError::Frame => println!("a control message outgrew its frame buffer"),
-                    }
-                }
-                failing = true;
+                SendError::Esp(error) => println!("control link write failed: {error}"),
+                SendError::Frame => println!("a control message outgrew its frame buffer"),
             }
         }
+        self.failing = true;
     }
 }
 

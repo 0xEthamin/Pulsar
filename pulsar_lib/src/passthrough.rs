@@ -5819,6 +5819,74 @@ mod tests
         assert!(carried == walked, "the chain and the walk left different states");
     }
 
+    /// Returns word `index` of lap `lap` for a sender driving slot `driven`
+    /// alone, the other slot silent.
+    fn one_slot_word(lap: u32, index: u32, driven: u32) -> u32
+    {
+        if index % WORDS_PER_FRAME == driven
+        {
+            sine_word(lap, index, 7, SWEEP_AMPLITUDE)
+        }
+        else
+        {
+            0
+        }
+    }
+
+    /// Asserts that every way word of the last of `laps` laps in `master` and
+    /// `slave` is the word a walk of the chain answers on half the sample of
+    /// slot `driven`.
+    fn assert_one_slot_arrives_at_half
+    (
+        master: &[u32; TEST_WORDS as usize],
+        slave: &[u32; TEST_WORDS as usize],
+        laps: u32,
+        driven: u32
+    )
+    {
+        let mut walked = chain();
+
+        for lap in 0..laps
+        {
+            for frame in 0..LAP_FRAMES
+            {
+                let index = frame * WORDS_PER_FRAME;
+                let whole = frame_of(sine_word(lap, index, 7, SWEEP_AMPLITUDE).cast_signed());
+                let half = (f64::from(whole) * 0.5) as f32;
+                let want = WayWords::of
+                (
+                    WaySamples
+                    {
+                        low: walked.low.step(half),
+                        mid: walked.mid.step(half),
+                        high: walked.high.step(half),
+                    },
+                    &mut walked.limiter
+                );
+
+                if lap + 1 < laps
+                {
+                    continue;
+                }
+
+                for (buffer, slot, word) in
+                [
+                    (master, LOW_SLOT, want.low()),
+                    (master, MID_SLOT, want.mid()),
+                    (slave, HIGH_SLOT, want.high()),
+                ]
+                {
+                    assert_eq!
+                    (
+                        carried_word(buffer, index + slot),
+                        word,
+                        "slot {slot} of frame {frame} with slot {driven} alone driven"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn two_channels_in_opposition_answer_silence_and_one_channel_arrives_at_half()
     {
@@ -5863,59 +5931,12 @@ mod tests
             (
                 &mut chain(),
                 LAPS,
-                |lap, index| if index % WORDS_PER_FRAME == driven
-                {
-                    sine_word(lap, index, 7, SWEEP_AMPLITUDE)
-                }
-                else
-                {
-                    0
-                },
+                |lap, index| one_slot_word(lap, index, driven),
                 &mut master,
                 &mut slave
             );
 
-            let mut walked = chain();
-
-            for lap in 0..LAPS
-            {
-                for frame in 0..LAP_FRAMES
-                {
-                    let index = frame * WORDS_PER_FRAME;
-                    let whole = frame_of(sine_word(lap, index, 7, SWEEP_AMPLITUDE).cast_signed());
-                    let half = (f64::from(whole) * 0.5) as f32;
-                    let want = WayWords::of
-                    (
-                        WaySamples
-                        {
-                            low: walked.low.step(half),
-                            mid: walked.mid.step(half),
-                            high: walked.high.step(half),
-                        },
-                        &mut walked.limiter
-                    );
-
-                    if lap + 1 < LAPS
-                    {
-                        continue;
-                    }
-
-                    for (buffer, slot, word) in
-                    [
-                        (&master, LOW_SLOT, want.low()),
-                        (&master, MID_SLOT, want.mid()),
-                        (&slave, HIGH_SLOT, want.high()),
-                    ]
-                    {
-                        assert_eq!
-                        (
-                            carried_word(buffer, index + slot),
-                            word,
-                            "slot {slot} of frame {frame} with slot {driven} alone driven"
-                        );
-                    }
-                }
-            }
+            assert_one_slot_arrives_at_half(&master, &slave, LAPS, driven);
 
             assert!
             (
