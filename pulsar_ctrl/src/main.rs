@@ -16,8 +16,16 @@
 //! mutex with priority inheritance. The pump thread logs the statistics of the
 //! bridge every `STATS_PERIOD_BLOCKS` blocks, and the callback task logs none.
 //!
+//! A third thread carries the user interface: it reads the encoder of the
+//! cabinet through the pulse counter, takes the fine volume the phone sets
+//! over AVRCP, and sends both to the processing board on the control link. It
+//! runs below the pump, and the callback of the radio only writes one word.
+//!
 //! Nothing here writes non-volatile storage. Bluedroid starts without NVS and
 //! keeps no bond across a reset, so a phone pairs again after each boot.
+
+mod avrcp;
+mod ui;
 
 use std::convert::Infallible;
 use std::sync::Mutex;
@@ -84,7 +92,7 @@ enum StartError
 {
     /// An ESP-IDF call failed.
     Esp(EspError),
-    /// The pump thread did not start.
+    /// A thread did not start.
     Spawn(std::io::Error),
 }
 
@@ -182,6 +190,11 @@ fn on_a2dp(event: A2dpEvent<'_>) -> usize
         A2dpEvent::ConnectionState { status: ConnectionStatus::Disconnected, .. } =>
         {
             with_bridge(Bridge::close);
+            avrcp::forget_phone();
+        }
+        A2dpEvent::ConnectionState { status: ConnectionStatus::Connected, .. } =>
+        {
+            avrcp::note_media_connection();
         }
         _ => {}
     }
@@ -313,7 +326,7 @@ fn main()
     match run()
     {
         Err(StartError::Esp(error)) => println!("start failed: {error}"),
-        Err(StartError::Spawn(error)) => println!("pump thread failed to start: {error}"),
+        Err(StartError::Spawn(error)) => println!("a thread failed to start: {error}"),
     }
 }
 
@@ -347,9 +360,21 @@ fn run() -> Result<Infallible, StartError>
     channel.tx_enable()?;
     spawn_pump(Link(channel))?;
 
+    ui::start
+    (
+        peripherals.uart2,
+        peripherals.pins.gpio17,
+        peripherals.pins.gpio16,
+        peripherals.pins.gpio34,
+        peripherals.pins.gpio35,
+    )?;
+
     let driver = BtDriver::<BtClassic>::new(peripherals.modem, None)?;
     let gap = EspGap::new(&driver)?;
     gap.subscribe(|event| on_gap(&event))?;
+    // Bluedroid couples the two profiles: the remote control target has to be
+    // up before the sink, or its initialisation is refused.
+    avrcp::start_target()?;
     let a2dp = EspA2dp::new_sink(&driver)?;
     a2dp.subscribe(on_a2dp)?;
     gap.set_device_name(DEVICE_NAME)?;

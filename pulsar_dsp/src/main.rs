@@ -122,6 +122,7 @@
 #![no_main]
 
 mod clock;
+mod link;
 mod passthrough;
 mod release;
 mod transport;
@@ -327,6 +328,12 @@ fn keep_core_visible_in_sleep()
 /// returns is what the tone write needs, so nothing non-zero can reach the
 /// converters ahead of it.
 ///
+/// The control link comes up after the tone. It configures USART3 on PB10 and
+/// PB11 and refuses nothing: the input bring-up parked the link state at a
+/// gain of zero, so a receiver that never delivers a volume leaves the carry
+/// silent. The served handler polls that receiver once per block, and no
+/// interrupt serves it.
+///
 /// The arming runs last and takes that permit by value. It waits for the tone
 /// to travel a whole lap of the receiving buffer, then enables the two transfer
 /// events, which is the one door the block structure comes through. Nothing in
@@ -436,6 +443,8 @@ fn main() -> !
     };
 
     transport::write_tone(&permit);
+
+    link::start(&part.RCC, &part.USART3, &part.GPIOB);
 
     let armed = passthrough::start_blocks(&audio_clock, &mut input, permit, BOOT_CORE_CLOCK_HZ);
 
