@@ -17,9 +17,9 @@
 //! # What the carry does to a frame
 //!
 //! It reads the two slots of the frame, the left and the right channel of the
-//! sender, and takes their mean, since one loudspeaker plays both. It runs that
-//! sample through the three cascades of the crossover and through the output
-//! stage, and writes the
+//! sender, and takes their mean, since one loudspeaker plays both. It scales
+//! that mean by the volume gain the block walks, runs the sample through the
+//! three cascades of the crossover and through the output stage, and writes the
 //! three words that stage answers plus one silent word across the four
 //! converter channels: the low way and the mid way into the two slots of the
 //! master frame, the high way and the channel no way drives into the two slots
@@ -107,22 +107,35 @@
 //! 22.68 microseconds, a block of 441 words is 5.000 milliseconds, and a new
 //! event lands every 5.000 milliseconds. The carry runs once a block and its
 //! loop once a frame. COUNTED on the text of the loop in the linked image, a
-//! frame holds 331 instructions, 83 accesses to the memory the buffers and the
-//! cascades sit in, 13 reads of the literal pool of the code, and 59 accesses to
+//! frame holds 354 instructions, 83 accesses to the memory the buffers and the
+//! cascades sit in, 13 reads of the literal pool of the code, and 63 accesses to
 //! the stack. A frame whose high sample stands inside the wall runs 12 of those
 //! reads, and the thirteenth runs on a high sample under the negative side of
-//! it.
+//! it. One of the instructions is the division that places the frame on the
+//! gain ramp, which the count takes at one cycle like the rest.
 //!
 //! ESTIMATED from those counts, since no cycle counter has read this image. An
 //! instruction is taken at one core cycle, an access to the stack at one more,
 //! the stack sitting in the data memory coupled to the core, and an access to
 //! the memory the buffers and the cascades sit in, or a read of the literal
-//! pool, at `c` cycles. A frame is then `331 + 96 * c + 59` cycles at 64 MHz.
-//! At a `c` of 3.9 that is 764 cycles, about 169000 for an entry of 221 frames,
-//! 2.64 milliseconds and 53 per cent of the period. That is 11.9 microseconds a
-//! frame, and it leaves the carry 1.9 times faster than the streams it has to
-//! stay ahead of. It would take 11.1 cycles an access to bring the carry down
+//! pool, at `c` cycles. A frame is then `354 + 96 * c + 63` cycles at 64 MHz.
+//! At a `c` of 3.9 that is 791 cycles, about 175000 for an entry of 221 frames,
+//! 2.73 milliseconds and 55 per cent of the period. That is 12.4 microseconds a
+//! frame, and it leaves the carry 1.8 times faster than the streams it has to
+//! stay ahead of. It would take 10.8 cycles an access to bring the carry down
 //! to the speed of the streams, 2.8 times that `c`.
+//!
+//! Ahead of the loop, once a block, the entry reads the control link: up to
+//! 34 characters off its receiver, and one step of the volume ramp. That work
+//! does not grow with the frames and is not in the count above. A character
+//! can force more than one decode, since the reader decodes again after every
+//! resynchronisation, so the worst stream is not the one with the most
+//! characters. SEARCHED over the rules of the reader, the worst 34 characters
+//! are a start byte and a length of three repeated, which force 52 decodes and
+//! 59 bytes of checksum. Charging every one of those decodes at the deepest
+//! path through the decoder gives about 26000 cycles, 0.41 milliseconds and
+//! 8 per cent of the period, and charging only the decodes that reach the
+//! checksum gives about 17000 cycles, 0.27 milliseconds and 5 per cent.
 //!
 //! `c` is a CALIBRATION taken off the part and not a reading of this image. The
 //! cycle counter of the data watchpoint unit, read on the clock the part boots
@@ -224,6 +237,7 @@
 
 use crate::clock::wait_polls;
 use crate::constants::{MICROSECONDS_PER_SECOND, SAMPLE_RATE_HZ};
+use crate::control::Applied;
 use crate::filter::{FilterError, Way, WayCascade, way_sections};
 use crate::output::{ThermalLimiter, WaySamples, WayWords};
 use crate::readback::refuse_unless;
@@ -1991,14 +2005,23 @@ impl FilterChain
     }
 
     /// Runs the two words of one source frame through the three ways and the
-    /// output stage.
+    /// output stage, at `gain`.
     ///
-    /// The mean of the two channels crosses each way once, so the three answers
-    /// come off one sample rather than three. What each way answers then
-    /// crosses the output stage, which carries the alignment of the three ways,
-    /// the peak reserve, the limiter and the ceiling of the high way and the
-    /// conversion back to a word. The limiter is the one this chain holds, so
-    /// its average runs on into the next frame.
+    /// The mean of the two channels, times `gain`, crosses each way once, so
+    /// the three answers come off one sample rather than three. What each way
+    /// answers then crosses the output stage, which carries the alignment of
+    /// the three ways, the peak reserve, the limiter and the ceiling of the
+    /// high way and the conversion back to a word. The limiter is the one this
+    /// chain holds, so its average runs on into the next frame.
+    ///
+    /// # Where the gain applies
+    ///
+    /// Ahead of every section, which is what lets a gain of zero stop the
+    /// signal before it reaches a history: `Applied::preset` moves the
+    /// coefficients only under such a gain. `gain` stands in `[0, 1]`, see
+    /// `carry_block`, so the product stands at full scale or under like the
+    /// mean it scales, and the limiter and the ceiling behind the ways see no
+    /// sample louder than one slot carries on its own.
     ///
     /// # Where the mean forms, and what bounds it
     ///
@@ -2026,9 +2049,10 @@ impl FilterChain
                   a guard on both magnitudes and a read of the literal pool that \
                   those operands never need, once a frame"
     )]
-    fn carry(&mut self, left: u32, right: u32) -> WayWords
+    fn carry(&mut self, left: u32, right: u32, gain: f32) -> WayWords
     {
-        let sample = (left.cast_signed() as f32 + right.cast_signed() as f32) * 0.5;
+        let mean = (left.cast_signed() as f32 + right.cast_signed() as f32) * 0.5;
+        let sample = mean * gain;
 
         WayWords::of
         (
@@ -2107,6 +2131,21 @@ impl FilterChain
 /// opposition cancel, and the mean never stands past full scale, so the chain
 /// sees nothing louder than one channel carries on its own.
 ///
+/// # The gain
+///
+/// `applied` is the volume the block carries, as a pair of gains at its two
+/// ends. Frame `n` of the block takes `applied.gain_at(n, frames)`, so a ramp
+/// moves a step per frame rather than a step per block, and the next block
+/// opens on the gain this one ends on.
+///
+/// That gain stands in `[0, 1]`. `ControlState` hands out ends in that range,
+/// and `gain_at` walks `s + (e - s) x f` with `f` in `[0, 1]`. Rounding to
+/// nearest is monotone, so the walked value stands between the values the
+/// same expression takes at `e = 0` and at `e = 1`, `f = 1`, and those round
+/// to exactly 0 and exactly 1. The test
+/// `a_walked_gain_never_leaves_the_unit_range` sweeps the ends and every frame
+/// of both block lengths against that bound.
+///
 /// # Where the loop lives
 ///
 /// Here rather than behind the trait, so that a host test walks it, the fan-out
@@ -2142,7 +2181,8 @@ pub(crate) fn carry_block<I>
     plan: &InputPlan,
     half: Half,
     shift: CarryShift,
-    chain: &mut FilterChain
+    chain: &mut FilterChain,
+    applied: Applied
 )
 where
     I: InputInterface,
@@ -2159,7 +2199,8 @@ where
         let ways = chain.carry
         (
             interface.read_word(index.saturating_add(LEFT_SLOT)),
-            interface.read_word(index.saturating_add(RIGHT_SLOT))
+            interface.read_word(index.saturating_add(RIGHT_SLOT)),
+            applied.gain_at(step as usize, frames as usize)
         );
 
         interface.write_word(BlockRole::Master, at.saturating_add(LOW_SLOT), ways.low());
@@ -2570,27 +2611,50 @@ fn check_event_state(seen: &Event) -> Result<(), EventFault>
 /// the carry is served on the next entry rather than merged into this one,
 /// which is what `EventFault::BothHalvesPending` reports.
 ///
+/// The gain is asked for once the entry is accepted and the flag is down, for
+/// the frame count of the block about to be carried, so `gain` sees one call
+/// per block carried and none for an entry refused.
+///
 /// # Errors
 ///
 /// `Event`, carrying what the entry refused with. Nothing has been written when
-/// one comes back and `chain` has not moved, so the caller answers by silencing
-/// the machine.
-pub fn serve<I>
+/// one comes back, and neither `chain` nor `gain` has moved, so the caller
+/// answers by silencing the machine.
+pub fn serve<I, G>
 (
     interface: &mut I,
     plan: &InputPlan,
     shift: CarryShift,
-    chain: &mut FilterChain
+    chain: &mut FilterChain,
+    gain: &mut G
 ) -> Result<(), PassthroughFault>
 where
     I: InputInterface,
+    G: BlockGain,
 {
     let half = next_block(&interface.event(), plan, shift)?;
 
     interface.clear_event(half);
-    carry_block(interface, plan, half, shift, chain);
+
+    let applied = gain.block(plan.carry_frames(half));
+
+    carry_block(interface, plan, half, shift, chain, applied);
 
     Ok(())
+}
+
+/// The source of the gain one served block carries.
+///
+/// `crate::link::LinkedGain` is the one the firmware serves with: it reads the
+/// control link and advances the volume ramp. A test hands `serve` a gain that
+/// holds still instead.
+pub trait BlockGain
+{
+    /// Returns the gain a block of `frames` frames walks.
+    ///
+    /// `serve` calls this once per block it carries, ahead of the carry, so an
+    /// implementation that counts time counts `frames` of audio per call.
+    fn block(&mut self, frames: u32) -> Applied;
 }
 
 /// Returns whether the transmitting read pointer stands in the arming window.
@@ -2992,6 +3056,26 @@ mod tests
     fn transparent_chain() -> FilterChain
     {
         FilterChain::transparent()
+    }
+
+    /// Returns a gain of exactly 1 across a whole block.
+    ///
+    /// A sample times 1 is that sample, so a test driving the carry at this
+    /// gain reads the same words it read before the gain existed.
+    fn unity() -> Applied
+    {
+        Applied::between_for_test(1.0, 1.0)
+    }
+
+    /// A gain source that hands out `unity` for every block.
+    struct Steady;
+
+    impl BlockGain for Steady
+    {
+        fn block(&mut self, _frames: u32) -> Applied
+        {
+            unity()
+        }
     }
 
     /// Returns the word `word` becomes once it has crossed a transparent chain.
@@ -3822,7 +3906,7 @@ mod tests
         {
             let mut interface = MockInput::healthy();
 
-            carry_block(&mut interface, &plan, half, shift(), &mut transparent_chain());
+            carry_block(&mut interface, &plan, half, shift(), &mut transparent_chain(), unity());
 
             let mut written = 0_u32;
             let mut refused = 0_u32;
@@ -4641,7 +4725,7 @@ mod tests
             let mut interface = MockInput::healthy();
             seed_source(&mut interface);
 
-            carry_block(&mut interface, &plan(), half, shift(), &mut transparent_chain());
+            carry_block(&mut interface, &plan(), half, shift(), &mut transparent_chain(), unity());
 
             let frames = plan().carry_frames(half);
 
@@ -4669,6 +4753,191 @@ mod tests
         }
     }
 
+    /// A gain source that records what `serve` asked it for, and hands out
+    /// `unity`.
+    #[derive(Default)]
+    struct Recording
+    {
+        calls: u32,
+        frames: [u32; 2],
+    }
+
+    impl BlockGain for Recording
+    {
+        fn block(&mut self, frames: u32) -> Applied
+        {
+            if let Some(slot) = self.frames.get_mut(self.calls as usize)
+            {
+                *slot = frames;
+            }
+            self.calls += 1;
+            unity()
+        }
+    }
+
+    #[test]
+    fn a_carry_scales_each_frame_by_the_gain_it_walks()
+    {
+        // The gain walks from one end to the other across the block, so a
+        // carry that applied either end to the whole block, or that walked the
+        // frames one place off, leaves a different word on every frame. The
+        // expectation takes the sample by the route `carry_into_image` takes,
+        // and scales it by the gain of ITS frame index.
+        let pairs = [(0.0, 1.0), (1.0, 0.0), (0.25, 0.75), (0.5, 0.5), (0.0, 0.0)];
+
+        for half in [Half::First, Half::Second]
+        {
+            for (start, end) in pairs
+            {
+                let applied = Applied::between_for_test(start, end);
+                let mut interface = MockInput::healthy();
+                seed_source(&mut interface);
+
+                carry_block(&mut interface, &plan(), half, shift(), &mut transparent_chain(), applied);
+
+                let plan = plan();
+                let frames = plan.carry_frames(half);
+                let mut master = [0_u32; TEST_WORDS as usize];
+                let mut slave = [0_u32; TEST_WORDS as usize];
+
+                for frame in 0..frames
+                {
+                    let index = plan.carry_start(half) + frame * WORDS_PER_FRAME;
+                    let at = (index + plan.arming_position() - PIPELINE_WORDS) % TEST_WORDS;
+                    let sample = source_sample(0xC0DE_0000 | index, 0xC0DE_0000 | (index + RIGHT_SLOT));
+                    let gain = applied.gain_at(frame as usize, frames as usize);
+                    let ways = staged_sample(sample * gain);
+
+                    place(&mut master, at + LOW_SLOT, ways.low());
+                    place(&mut master, at + MID_SLOT, ways.mid());
+                    place(&mut slave, at + HIGH_SLOT, ways.high());
+                    place(&mut slave, at + SPARE_SLOT, SILENT_WORD);
+                }
+
+                assert_buffers(&interface, &master, &slave, carry_case(half));
+
+                if start.to_bits() != end.to_bits()
+                {
+                    let first = (plan.carry_start(half) + plan.arming_position()
+                        - PIPELINE_WORDS) % TEST_WORDS;
+                    let last = (first + (frames - 1) * WORDS_PER_FRAME) % TEST_WORDS;
+
+                    assert_ne!
+                    (
+                        interface.master.get(first as usize),
+                        interface.master.get(last as usize),
+                        "a ramp from {start} to {end} left the first and the last \
+                         frame alike"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_silent_gain_keeps_every_history_of_the_chain_at_rest()
+    {
+        // `Applied::preset` moves coefficients only under a gain of zero at both
+        // ends of a buffer, on the ground that no signal then enters a section.
+        // Two full laps of a full scale tone at that gain have to leave every
+        // history, and the limiter, exactly where a built chain opens.
+        let plan = plan();
+        let mut served = chain();
+        let mut interface = MockInput::healthy();
+        let silent = Applied::between_for_test(0.0, 0.0);
+
+        for lap in 0..2
+        {
+            for index in 0..TEST_WORDS
+            {
+                place(&mut interface.source, index, sine_word(lap, index, 30, f64::from(i32::MAX)));
+            }
+
+            for half in [Half::First, Half::Second]
+            {
+                carry_block(&mut interface, &plan, half, shift(), &mut served, silent);
+            }
+        }
+
+        assert!(served == chain(), "a silent gain let the tone into the chain");
+        assert!(interface.master.iter().all(|word| *word == 0), "a silent gain left a word");
+        assert!(interface.slave.iter().all(|word| *word == 0), "a silent gain left a word");
+    }
+
+    #[test]
+    fn serving_asks_the_gain_once_for_the_frames_of_the_block_it_carries()
+    {
+        for half in [Half::First, Half::Second]
+        {
+            let mut interface = MockInput::healthy();
+            interface.next_event = half;
+            let mut asked = Recording::default();
+
+            assert_eq!(bring_up(&mut interface, &plan(), &waits()), Ok(shift()));
+            assert_eq!
+            (
+                serve(&mut interface, &plan(), shift(), &mut transparent_chain(), &mut asked),
+                Ok(())
+            );
+            assert_eq!(asked.calls, 1, "the {half:?} block asked the gain {} times", asked.calls);
+            assert_eq!(asked.frames.first().copied(), Some(plan().carry_frames(half)));
+        }
+    }
+
+    #[test]
+    fn a_walked_gain_never_leaves_the_unit_range()
+    {
+        // `carry_block` states the walked gain stands in [0, 1] whenever its
+        // two ends do. This drives the ends over the edges of the range, the
+        // values next to them, and a spread of values in between, and reads
+        // every frame of both block lengths the served plan carries.
+        let mut ends = std::vec![
+            0.0_f32,
+            1.0,
+            f32::MIN_POSITIVE,
+            f32::from_bits(1),
+            1.0_f32.next_down(),
+            0.5,
+            0.5_f32.next_down(),
+            0.5_f32.next_up(),
+            1e-7,
+        ];
+        let mut seed = 0x2545_F491_u32;
+
+        for _ in 0..200
+        {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            ends.push(f32::from(u16::try_from(seed >> 16).unwrap_or(0)) / 65_536.0);
+        }
+
+        let lengths = [plan().carry_frames(Half::First), plan().carry_frames(Half::Second)];
+
+        for &start in &ends
+        {
+            for &end in &ends
+            {
+                let applied = Applied::between_for_test(start, end);
+
+                for frames in lengths
+                {
+                    for frame in 0..=frames
+                    {
+                        let gain = applied.gain_at(frame as usize, frames as usize);
+
+                        assert!
+                        (
+                            (0.0..=1.0).contains(&gain),
+                            "ends {start} and {end} walked to {gain} at frame {frame} \
+                             of {frames}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_carry_writes_nothing_outside_the_span_it_was_given()
     {
@@ -4681,7 +4950,7 @@ mod tests
         let mut interface = MockInput::healthy();
         seed_source(&mut interface);
 
-        carry_block(&mut interface, &plan(), Half::Second, shift(), &mut transparent_chain());
+        carry_block(&mut interface, &plan(), Half::Second, shift(), &mut transparent_chain(), unity());
 
         let plan = plan();
         let first = (plan.carry_start(Half::First) + plan.arming_position()
@@ -4711,8 +4980,8 @@ mod tests
         // the first left.
         let mut running = transparent_chain();
 
-        carry_block(&mut interface, &plan(), Half::First, shift(), &mut running);
-        carry_block(&mut interface, &plan(), Half::Second, shift(), &mut running);
+        carry_block(&mut interface, &plan(), Half::First, shift(), &mut running, unity());
+        carry_block(&mut interface, &plan(), Half::Second, shift(), &mut running, unity());
 
         assert_eq!
         (
@@ -4781,7 +5050,7 @@ mod tests
 
             for half in [Half::First, Half::Second]
             {
-                carry_block(&mut interface, &plan, half, shift(), &mut chain);
+                carry_block(&mut interface, &plan, half, shift(), &mut chain, unity());
 
                 let frames = plan.carry_frames(half);
 
@@ -4903,7 +5172,7 @@ mod tests
 
                 assert_eq!
                 (
-                    serve(&mut interface, &plan, shift(), &mut served),
+                    serve(&mut interface, &plan, shift(), &mut served, &mut Steady),
                     Ok(()),
                     "the {half:?} event of lap {lap} was refused"
                 );
@@ -5076,7 +5345,7 @@ mod tests
 
         for word in [i32::MAX, i32::MIN, 0x4000_0000, -0x4000_0000, 1]
         {
-            let ways = stopped.carry(word.cast_unsigned(), word.cast_unsigned());
+            let ways = stopped.carry(word.cast_unsigned(), word.cast_unsigned(), 1.0);
 
             assert_eq!(ways.high(), 0, "a silent limiter let {word} through");
             assert_eq!(ways.low(), staged(word.cast_unsigned(), word.cast_unsigned()).low());
@@ -5268,7 +5537,7 @@ mod tests
                     }
                 }
 
-                carry_block(&mut interface, &plan, half, shift(), chain);
+                carry_block(&mut interface, &plan, half, shift(), chain, unity());
 
                 for step in 0..plan.carry_words(half)
                 {
@@ -5535,7 +5804,7 @@ mod tests
 
                     assert_eq!
                     (
-                        carried.carry(word, word),
+                        carried.carry(word, word, 1.0),
                         want,
                         "a frame holding {word:#010x} twice parted from the word alone \
                          at frame {frame} of lap {lap}"
@@ -5683,7 +5952,7 @@ mod tests
             place(&mut interface.source, index + RIGHT_SLOT, right.cast_unsigned());
         }
 
-        carry_block(&mut interface, &plan, Half::First, shift(), &mut transparent_chain());
+        carry_block(&mut interface, &plan, Half::First, shift(), &mut transparent_chain(), unity());
 
         for frame in 0..plan.carry_frames(Half::First)
         {
@@ -5938,7 +6207,8 @@ mod tests
                 let ways = straight.carry
                 (
                     sine_word(lap, index + LEFT_SLOT, 7, SWEEP_AMPLITUDE),
-                    sine_word(lap, index + RIGHT_SLOT, 7, SWEEP_AMPLITUDE)
+                    sine_word(lap, index + RIGHT_SLOT, 7, SWEEP_AMPLITUDE),
+                    1.0
                 );
 
                 place(&mut want_master, index + LOW_SLOT, ways.low());
@@ -6501,7 +6771,7 @@ mod tests
         let mut interface = MockInput::healthy();
 
         assert_eq!(bring_up(&mut interface, &plan(), &waits()), Ok(shift()));
-        assert_eq!(serve(&mut interface, &plan(), shift(), &mut chain()), Ok(()));
+        assert_eq!(serve(&mut interface, &plan(), shift(), &mut chain(), &mut Steady), Ok(()));
 
         let (cleared, cleared_at) = interface.cleared.unwrap_or((Half::Second, 0));
         let (carried, carried_at) = interface.carried.unwrap_or((Half::Second, 0));
@@ -6530,7 +6800,7 @@ mod tests
             assert_eq!(bring_up(&mut interface, &plan(), &waits()), Ok(shift()));
             assert_eq!
             (
-                serve(&mut interface, &plan(), shift(), &mut transparent_chain()),
+                serve(&mut interface, &plan(), shift(), &mut transparent_chain(), &mut Steady),
                 Ok(())
             );
 
@@ -6570,7 +6840,7 @@ mod tests
 
             for half in [Half::First, Half::Second]
             {
-                carry_block(&mut warm, &plan, half, shift(), &mut served);
+                carry_block(&mut warm, &plan, half, shift(), &mut served, unity());
             }
         }
 
@@ -6584,14 +6854,17 @@ mod tests
         assert_eq!(bring_up(&mut interface, &plan, &waits()), Ok(shift()));
         interface.image.block.overrun = true;
 
+        let mut asked = Recording::default();
+
         assert_eq!
         (
-            serve(&mut interface, &plan, shift(), &mut served),
+            serve(&mut interface, &plan, shift(), &mut served, &mut asked),
             Err(PassthroughFault::Event(EventFault::Overrun))
         );
         assert_eq!(interface.carried, None);
         assert_eq!(interface.cleared, None);
         assert!(served == before, "the refused entry moved the chain");
+        assert_eq!(asked.calls, 0, "the refused entry advanced the gain");
     }
 
     #[test]
@@ -6840,7 +7113,7 @@ mod tests
 
             interface.next_event = filled;
             interface.written = 0;
-            serve(interface, &plan, shift, chain)?;
+            serve(interface, &plan, shift, chain, &mut Steady)?;
         }
 
         Ok(())

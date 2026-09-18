@@ -124,6 +124,22 @@ impl Applied
     {
         self.preset
     }
+
+    /// Returns a pair walking from `gain_start` to `gain_end`, on the flat
+    /// preset.
+    ///
+    /// A test of the carry drives a gain of its choosing, where a
+    /// `ControlState` would take a ramp of many buffers to reach it.
+    #[cfg(test)]
+    pub(crate) const fn between_for_test(gain_start: f32, gain_end: f32) -> Self
+    {
+        Self
+        {
+            gain_start,
+            gain_end,
+            preset: Preset::Flat,
+        }
+    }
 }
 
 /// A linear move between two gains, at a speed bounded by

@@ -86,6 +86,7 @@ use stm32h7::stm32h743v::sai1::ch::cr1::{MODE, SYNCEN};
 use stm32h7::stm32h743v::{DMA1, DMAMUX1, GPIOD, Interrupt, RCC, SAI2};
 
 use crate::clock::AudioClock;
+use crate::link;
 use crate::transport::{self, BUFFER_WORDS};
 
 // Every value the plan names for a field this module writes is pinned here
@@ -144,10 +145,10 @@ const OUTPUT_STREAM: usize = 0;
 const DATA_PIN_FUNCTION: u8 = 10;
 
 /// `MODER` value putting a pin on its alternate function. RM0433 section 11.4.1.
-const PIN_ALTERNATE: u8 = 0b10;
+pub(crate) const PIN_ALTERNATE: u8 = 0b10;
 
 /// `PUPDR` value leaving a pin with neither pull. RM0433 section 11.4.4.
-const PIN_NO_PULL: u8 = 0b00;
+pub(crate) const PIN_NO_PULL: u8 = 0b00;
 
 // The pin is written and read back by nothing, here or in the plan, so a wrong
 // value in it produces a verified path fed from no pad. These assertions are
@@ -1138,7 +1139,8 @@ pub(crate) fn plan(clock: &AudioClock) -> InputPlan
 /// path comes up, so the memory the carry would read holds cascades that stop
 /// the signal, and the built one replaces it once the path is up. Both writes
 /// stand ahead of the call that unmasks the line, so no entry can find a chain
-/// that was never written.
+/// that was never written. The control link is parked beside the silent chain,
+/// at a gain of zero, for the same reason.
 ///
 /// Once this returns, PD11 carries the data line of a receiver following the
 /// frame the transmitter emits, one transfer stream fills the buffer, and the
@@ -1179,6 +1181,7 @@ pub(crate) fn start
     fill_silence();
 
     let parked = chain::park_silent();
+    link::park();
 
     let plan = plan(clock);
     let shift = bring_up(input, &plan, &InputWaits::for_plan(&plan, core_clock_hz))?;
@@ -1274,5 +1277,5 @@ pub(crate) fn serve_event() -> Result<(), PassthroughFault>
         return Err(PassthroughFault::Event(EventFault::CarryShiftUnpublished));
     };
 
-    pulsar_lib::passthrough::serve(&mut input, &plan, shift, chain)
+    link::with_gain(|gain| pulsar_lib::passthrough::serve(&mut input, &plan, shift, chain, gain))
 }
